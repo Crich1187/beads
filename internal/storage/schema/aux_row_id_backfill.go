@@ -4,6 +4,8 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"log"
+	"slices"
 	"sort"
 	"strings"
 
@@ -56,29 +58,89 @@ var auxRekeyPassDerivedInsert = auxRekeyPass{
 // them.
 var auxRekeyPasses = []auxRekeyPass{auxRekeyPassInitial, auxRekeyPassDerivedInsert}
 
-// auxRekeyResumePending reports whether a previous run of this re-key pass on
-// this clone recorded the in-progress sentinel and never cleared it. A missing
-// local_metadata table means no sentinel: the table is dolt-ignored and
-// therefore clone-local, so a fresh clone lacks it until something recreates
-// it — setAuxRekeyInProgress creates it on demand.
-func auxRekeyResumePending(ctx context.Context, db DBConn, sentinelKey string) (bool, error) {
+// auxRowRekeyDriftedKey is the clone-local record (local_metadata,
+// dolt-ignored) of tables the re-key had to skip because their storage carries
+// dolthub/dolt#11131 encoding drift (#4380): a comma-separated table list,
+// absent when there is nothing skipped.
+//
+// It exists because the skip completes the pass, so MigrateUp records the
+// clone-local marker in that same pass and the marker gate can never re-admit
+// the re-key again. This record is what re-admits it — and it names the
+// affected tables so the resumed pass touches only those, leaving tables that
+// already converged alone.
+//
+// The record is clone-local because each clone has to discover, retry and
+// retire its own skip; the drift itself is not necessarily clone-local, since
+// both halves of it (the column's storage-encoding tag and the row chunks it
+// disagrees with) are committed data that travels on push/pull — migration 0057
+// documents bd's own 0048 as one way a lineage acquires it.
+const auxRowRekeyDriftedKey = "aux_row_rekey_drifted"
+
+// auxRekeyState is what this clone still owes the re-key: a rewrite that was in
+// flight and never finished, and tables skipped for storage drift. Both live in
+// local_metadata, which is dolt-ignored and therefore clone-local — and, per
+// migration 0030, ephemeral: it is recreated empty by a working-set reset, so
+// "no record" is always a legitimate reading.
+type auxRekeyState struct {
+	resume  bool
+	drifted []string
+}
+
+func (s auxRekeyState) pending() bool { return s.resume || len(s.drifted) > 0 }
+
+// readAuxRekeyState reads both records for one pass in one round trip. A missing
+// local_metadata table means neither is set: a fresh clone lacks the table
+// until something recreates it — setAuxRekeyInProgress creates it on demand.
+func readAuxRekeyState(ctx context.Context, db DBConn, sentinelKey string) (auxRekeyState, error) {
+	var state auxRekeyState
 	var tableCount int
 	if err := db.QueryRowContext(ctx,
 		`SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES
 		 WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'local_metadata'`,
 	).Scan(&tableCount); err != nil {
-		return false, err
+		return state, err
 	}
 	if tableCount == 0 {
-		return false, nil
+		return state, nil
 	}
-	var n int
-	if err := db.QueryRowContext(ctx,
-		"SELECT COUNT(*) FROM local_metadata WHERE `key` = ?",
-		sentinelKey).Scan(&n); err != nil {
-		return false, err
+	rows, err := db.QueryContext(ctx,
+		"SELECT `key`, value FROM local_metadata WHERE `key` IN (?, ?)",
+		sentinelKey, auxRowRekeyDriftedKey)
+	if err != nil {
+		// This is the one place the re-key reads a TEXT cell of local_metadata,
+		// so it is the one place a drifted local_metadata could panic the very
+		// function meant to survive drift. No migration re-encodes that table
+		// today, but degrade to "nothing recorded" rather than re-break the
+		// open path if that ever changes.
+		if isSchemaEncodingDriftErr(err) {
+			return state, nil
+		}
+		return state, err
 	}
-	return n > 0, nil
+	defer rows.Close()
+	for rows.Next() {
+		var key, value string
+		if err := rows.Scan(&key, &value); err != nil {
+			return auxRekeyState{}, err
+		}
+		switch key {
+		case sentinelKey:
+			state.resume = true
+		case auxRowRekeyDriftedKey:
+			for _, name := range strings.Split(value, ",") {
+				if name = strings.TrimSpace(name); name != "" {
+					state.drifted = append(state.drifted, name)
+				}
+			}
+		}
+	}
+	if err := rows.Err(); err != nil {
+		if isSchemaEncodingDriftErr(err) {
+			return auxRekeyState{}, nil
+		}
+		return auxRekeyState{}, err
+	}
+	return state, nil
 }
 
 // anyAuxRekeyResumePending reports whether ANY pass's crash sentinel is still
@@ -111,6 +173,71 @@ func anyAuxRekeyResumePending(ctx context.Context, db DBConn) (bool, error) {
 	return n > 0, nil
 }
 
+// auxRekeyPreMigrationState probes local_metadata for both crash sentinels
+// and drift records in a single table probe and query, feeding MigrateUp's
+// dirty-table exemptions.
+func auxRekeyPreMigrationState(ctx context.Context, db DBConn) (bool, []string, error) {
+	var tableCount int
+	if err := db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES
+		 WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'local_metadata'`,
+	).Scan(&tableCount); err != nil {
+		return false, nil, err
+	}
+	if tableCount == 0 {
+		return false, nil, nil
+	}
+	placeholders := make([]string, len(auxRekeyPasses)+1)
+	keys := make([]any, len(auxRekeyPasses)+1)
+	for i, pass := range auxRekeyPasses {
+		placeholders[i] = "?"
+		keys[i] = pass.sentinelKey
+	}
+	placeholders[len(auxRekeyPasses)] = "?"
+	keys[len(auxRekeyPasses)] = auxRowRekeyDriftedKey
+
+	rows, err := db.QueryContext(ctx,
+		fmt.Sprintf("SELECT `key`, value FROM local_metadata WHERE `key` IN (%s)", strings.Join(placeholders, ", ")),
+		keys...)
+	if err != nil {
+		if isSchemaEncodingDriftErr(err) {
+			return false, nil, nil
+		}
+		return false, nil, err
+	}
+	defer rows.Close()
+
+	sentinelSet := make(map[string]bool, len(auxRekeyPasses))
+	for _, pass := range auxRekeyPasses {
+		sentinelSet[pass.sentinelKey] = true
+	}
+
+	resuming := false
+	var drifted []string
+	for rows.Next() {
+		var key, value string
+		if err := rows.Scan(&key, &value); err != nil {
+			return false, nil, err
+		}
+		if sentinelSet[key] {
+			resuming = true
+		} else if key == auxRowRekeyDriftedKey {
+			for _, name := range strings.Split(value, ",") {
+				if name = strings.TrimSpace(name); name != "" {
+					drifted = append(drifted, name)
+				}
+			}
+		}
+	}
+	if err := rows.Err(); err != nil {
+		if isSchemaEncodingDriftErr(err) {
+			return false, nil, nil
+		}
+		return false, nil, err
+	}
+	return resuming, drifted, nil
+}
+
 func setAuxRekeyInProgress(ctx context.Context, db DBConn, sentinelKey string) error {
 	// local_metadata is dolt-ignored, hence clone-local: a fresh clone whose
 	// main cursor is already past 0029 does not have the table (the migration
@@ -130,6 +257,25 @@ func clearAuxRekeyInProgress(ctx context.Context, db DBConn, sentinelKey string)
 	_, err := db.ExecContext(ctx,
 		"DELETE FROM local_metadata WHERE `key` = ?",
 		sentinelKey)
+	return err
+}
+
+func setAuxRekeyDrifted(ctx context.Context, db DBConn, tables []string) error {
+	// Same on-demand create as the sentinel: local_metadata is dolt-ignored, so
+	// a clone that arrived past 0029 may not have it yet.
+	if _, err := db.ExecContext(ctx, "CREATE TABLE IF NOT EXISTS local_metadata (`key` VARCHAR(255) PRIMARY KEY, value TEXT NOT NULL DEFAULT '')"); err != nil {
+		return fmt.Errorf("ensuring local_metadata: %w", err)
+	}
+	_, err := db.ExecContext(ctx,
+		"REPLACE INTO local_metadata (`key`, value) VALUES (?, ?)",
+		auxRowRekeyDriftedKey, strings.Join(tables, ","))
+	return err
+}
+
+func clearAuxRekeyDrifted(ctx context.Context, db DBConn) error {
+	_, err := db.ExecContext(ctx,
+		"DELETE FROM local_metadata WHERE `key` = ?",
+		auxRowRekeyDriftedKey)
 	return err
 }
 
@@ -191,6 +337,14 @@ var auxRekeyTables = []auxRekeyTable{
 // mainVersionBefore is the main-source cursor as it stood before this pass's
 // migrations ran; at or past auxRowRekeyShippedMainVersion the rewrite is
 // skipped (see that constant).
+//
+// A table whose storage carries dolthub/dolt#11131 encoding drift cannot be
+// scanned at all, so it is skipped and recorded (auxRowRekeyDriftedKey) rather
+// than failing the pass; a later pass re-keys just that table, and succeeds
+// once the drift is repaired. Like the crash-resume path it re-keys the whole
+// table, including rows minted since the skip, so the sooner the retry lands
+// the fewer of those there are — which is why it is re-attempted on every
+// subsequent migration pass rather than waiting to be asked.
 func rekeyAuxRowIDs(ctx context.Context, db DBConn, mainVersionBefore int, pass auxRekeyPass) (bool, error) {
 	pending, err := ignoredSource.pendingVersions(ctx, db)
 	if err != nil {
@@ -225,19 +379,45 @@ func rekeyAuxRowIDsPending(ctx context.Context, db DBConn, mainVersionBefore int
 			break
 		}
 	}
-	if !markerPending {
-		return false, nil
-	}
-	resume, err := auxRekeyResumePending(ctx, db, pass.sentinelKey)
+	state, err := readAuxRekeyState(ctx, db, pass.sentinelKey)
 	if err != nil {
-		return false, fmt.Errorf("reading aux rekey sentinel: %w", err)
+		return false, fmt.Errorf("reading aux rekey state: %w", err)
+	}
+	// The marker gate is "once per clone" only for a pass that actually
+	// converged every table. A pass that skipped one for #11131 drift completed
+	// — so the marker was recorded in that same MigrateUp — and the marker
+	// alone would then bar re-entry forever, making the skip permanent. The
+	// drift record re-admits the pass so it can finish once the storage is
+	// repaired.
+	if !markerPending && !state.pending() {
+		return false, nil
 	}
 	// The fresh-clone skip must not fire on a lineage whose previous pass
 	// crashed mid-rekey: that pass already advanced the main cursor past the
 	// shipped version, but its sentinel proves the rewrite never finished
-	// (bd-578h9.16).
-	if mainVersionBefore >= pass.shippedMainVersion && !resume {
+	// (bd-578h9.16). A recorded drift skip says the same thing.
+	if mainVersionBefore >= pass.shippedMainVersion && !state.pending() {
 		return false, nil
+	}
+
+	// Once the marker is recorded, the one-time pass has completed: MigrateUp
+	// records it (ignoredSource.migrate) only after this function returns
+	// without error, so a clone that still owes work past that point owes it for
+	// exactly the tables the drift record names. Re-keying any other table there
+	// would be wrong — those converged in the completed pass, and rows minted
+	// since carry app-minted ids that are already consistent across clones (see
+	// above), so rewriting them on this clone alone manufactures the divergence
+	// the re-key exists to remove. Note this covers a drift-resume pass that
+	// itself died on some unrelated error and left the sentinel set: it is still
+	// a post-marker pass, so it still touches only the recorded tables.
+	tables := auxRekeyTables
+	if !markerPending {
+		tables = nil
+		for _, t := range auxRekeyTables {
+			if slices.Contains(state.drifted, t.name) {
+				tables = append(tables, t)
+			}
+		}
 	}
 
 	// Sentinel before the first UPDATE: a crash anywhere in the rewrite
@@ -248,17 +428,91 @@ func rekeyAuxRowIDsPending(ctx context.Context, db DBConn, mainVersionBefore int
 	}
 
 	wrote := false
-	for _, t := range auxRekeyTables {
+	var skipped []string
+	for _, t := range tables {
 		w, err := rekeyAuxRowTable(ctx, db, t)
 		wrote = wrote || w
 		if err != nil {
+			// #4380: a table carrying dolthub/dolt#11131 schema-encoding drift
+			// cannot be re-keyed at all — every read of an affected cell panics
+			// server-side, and no SQL write can repair or remove the row. Before
+			// this, that aborted the whole MigrateUp pass, which also made the
+			// database unopenable by any rekey-aware binary: the migration is
+			// re-attempted on open, so the panic recurred on every start and the
+			// only build that could read the data was the pre-re-key one. Skip
+			// the table loudly and let the rest of the pass complete instead.
+			if isSchemaEncodingDriftErr(err) {
+				skipped = append(skipped, t.name)
+				// log, not the TTY-gated progress writer: a piped or CI caller
+				// discards that writer, and these three lines are the only
+				// notice that a table's ids stayed divergent.
+				log.Printf("schema migration: aux row id re-key skipped %q — the table holds rows Dolt cannot decode (schema-encoding drift, gastownhall/beads#4380): %v",
+					t.name, err)
+				continue
+			}
 			return wrote, fmt.Errorf("%s: %w", t.name, err)
+		}
+	}
+	// The tables this pass covered are exactly the ones the record should now
+	// name: a full pass covered all four, a post-marker pass covered precisely
+	// the previously-recorded ones, so in both cases what is still skipped is
+	// what failed just now.
+	switch {
+	case len(skipped) > 0:
+		if err := setAuxRekeyDrifted(ctx, db, skipped); err != nil {
+			return wrote, fmt.Errorf("recording aux rekey drift: %w", err)
+		}
+		log.Printf("schema migration: %d table(s) kept their old row ids: %s — merges with other clones of this database may duplicate those rows",
+			len(skipped), strings.Join(skipped, ", "))
+		log.Printf("schema migration: repair the storage drift (see gastownhall/beads#4380); the re-key is re-attempted on each later pass that applies schema migrations")
+	case len(state.drifted) > 0:
+		if err := clearAuxRekeyDrifted(ctx, db); err != nil {
+			return wrote, fmt.Errorf("clearing aux rekey drift record: %w", err)
+		}
+		// Names what this pass actually covered, which is the recorded set
+		// minus any entry no longer in auxRekeyTables — a stale name is dropped
+		// by clearing the record, not by claiming it converged.
+		if len(tables) > 0 {
+			covered := make([]string, 0, len(tables))
+			for _, t := range tables {
+				covered = append(covered, t.name)
+			}
+			log.Printf("schema migration: aux row id re-key completed for previously skipped table(s): %s",
+				strings.Join(covered, ", "))
 		}
 	}
 	if err := clearAuxRekeyInProgress(ctx, db, pass.sentinelKey); err != nil {
 		return wrote, fmt.Errorf("clearing aux rekey sentinel: %w", err)
 	}
 	return wrote, nil
+}
+
+// isSchemaEncodingDriftErr reports whether err carries the dolthub/dolt#11131
+// schema-encoding-drift signature: a TEXT/LONGTEXT column whose on-disk
+// storage-encoding tag was re-derived without rewriting rows, so decoding a
+// cell reads an address of the wrong width and panics inside the storage
+// engine. The engine recovers it per query and surfaces
+// "Error 1105 (HY000): panic recovered: invalid hash length: 19". Only this
+// class is tolerated by the re-key; every other failure still aborts the pass.
+//
+// Deliberately matched on the bare hash-length phrase, not on ": 19" and not
+// on the "panic recovered" wrapper:
+//
+//   - the width varies with the direction of the tag flip — migration 0057
+//     documents this same drift from bd's own side (0048 re-widening an
+//     already-LONGTEXT column under a pre-#11126 embedded engine) and records
+//     both ": 19" on read and ": 1" on insert/merge;
+//   - the "panic recovered" prefix is added by the SQL engine wrapper, which is
+//     not guaranteed on every driver or interface;
+//
+// so both narrower matches risk falling through to the abort that leaves the
+// database unopenable.
+func isSchemaEncodingDriftErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "invalid hash length")
 }
 
 // rekeyAuxRowTable re-derives the ids of one table. The whole table is grouped

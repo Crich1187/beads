@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"regexp"
+	"strings"
 	"testing"
 
 	"github.com/DATA-DOG/go-sqlmock"
@@ -117,12 +118,13 @@ func TestRekeyAuxRowTableKeepsHeldTargetsStable(t *testing.T) {
 	expectColumnExists(mock, true)
 	expectCommentsSelect(mock).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "issue_id", "author", "text", "created_at"}).
-			AddRow(held, "bd-1", "steve", "same text", "2026-06-09 12:00:00").
-			AddRow("random-x", "bd-1", "steve", "same text", "2026-06-09 12:00:00"))
+			AddRow("free-random", "bd-1", "steve", "same text", "2026-06-09 12:00:00").
+			AddRow(held, "bd-1", "steve", "same text", "2026-06-09 12:00:00"))
 
-	// The held row is untouched; the random row takes the remaining ordinal 0.
+	// Ordinal 1 is held by the second row, so only ordinal 0 needs to be
+	// assigned to the free row.
 	mock.ExpectExec(regexp.QuoteMeta("UPDATE comments SET id = ? WHERE id = ?")).
-		WithArgs(rowid.New("comments", 0, digest), "random-x").
+		WithArgs(rowid.New("comments", 0, digest), "free-random").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	wrote, err := rekeyAuxRowTable(context.Background(), db, commentsTable)
@@ -130,45 +132,48 @@ func TestRekeyAuxRowTableKeepsHeldTargetsStable(t *testing.T) {
 		t.Fatalf("rekeyAuxRowTable: %v", err)
 	}
 	if !wrote {
-		t.Error("expected wrote=true when one row was re-keyed")
+		t.Error("expected wrote=true when a free row was re-keyed")
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("unmet sql expectations: %v", err)
 	}
 }
 
-// TestRekeyAuxRowTableIdempotent verifies that when every row already carries a
-// deterministic id, no UPDATE is issued.
-func TestRekeyAuxRowTableIdempotent(t *testing.T) {
+// TestRekeyAuxRowTableNoopsWhenAllRowsHoldDeterministicIDs verifies an
+// already-converged table issues NO updates.
+func TestRekeyAuxRowTableNoopsWhenAllRowsHoldDeterministicIDs(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	if err != nil {
 		t.Fatalf("sqlmock.New: %v", err)
 	}
 	defer db.Close()
 
-	digest := commentDigest("bd-1", "steve", "hello", "2026-06-09 12:00:00")
+	digest := commentDigest("bd-1", "steve", "same text", "2026-06-09 12:00:00")
 
 	expectColumnExists(mock, true)
 	expectCommentsSelect(mock).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "issue_id", "author", "text", "created_at"}).
-			AddRow(rowid.New("comments", 0, digest), "bd-1", "steve", "hello", "2026-06-09 12:00:00"))
-	// No ExpectExec: zero UPDATEs expected.
+			AddRow(rowid.New("comments", 0, digest), "bd-1", "steve", "same text", "2026-06-09 12:00:00").
+			AddRow(rowid.New("comments", 1, digest), "bd-1", "steve", "same text", "2026-06-09 12:00:00"))
+
+	// No UPDATE expectation — any ExecContext would fail the test.
 
 	wrote, err := rekeyAuxRowTable(context.Background(), db, commentsTable)
 	if err != nil {
 		t.Fatalf("rekeyAuxRowTable: %v", err)
 	}
 	if wrote {
-		t.Error("expected wrote=false when all rows already deterministic")
+		t.Error("expected wrote=false for an already-converged table")
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("unmet sql expectations: %v", err)
 	}
 }
 
-// TestRekeyAuxRowTableSkipsMissingTable verifies the backfill no-ops cleanly
-// when the table/id column is absent (older or partial schema).
-func TestRekeyAuxRowTableSkipsMissingTable(t *testing.T) {
+// TestRekeyAuxRowTableSkipsWhenTableOrIDMissing: on a partial schema where the
+// table or its id column does not exist yet, the function returns cleanly
+// without attempting queries against non-existent tables.
+func TestRekeyAuxRowTableSkipsWhenTableOrIDMissing(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	if err != nil {
 		t.Fatalf("sqlmock.New: %v", err)
@@ -182,17 +187,17 @@ func TestRekeyAuxRowTableSkipsMissingTable(t *testing.T) {
 		t.Fatalf("rekeyAuxRowTable: %v", err)
 	}
 	if wrote {
-		t.Error("expected wrote=false when the id column is absent")
+		t.Error("expected wrote=false when the table or column is missing")
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("unmet sql expectations: %v", err)
 	}
 }
 
-// TestRekeyAuxRowIDsSkipsWhenMarkerRecorded verifies the clone-local gate: once
-// the ignored marker migration is recorded, the re-key never scans a table
-// again, so steady-state opens do not churn synced rows.
-func TestRekeyAuxRowIDsSkipsWhenMarkerRecorded(t *testing.T) {
+// TestRekeyAuxRowIDsSkipsWhenMarkerAlreadyRecorded verifies the one-time gate:
+// once the clone-local marker is recorded, the re-key must not probe or touch
+// any table on later migration passes.
+func TestRekeyAuxRowIDsSkipsWhenMarkerAlreadyRecorded(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	if err != nil {
 		t.Fatalf("sqlmock.New: %v", err)
@@ -203,6 +208,7 @@ func TestRekeyAuxRowIDsSkipsWhenMarkerRecorded(t *testing.T) {
 	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM ignored_schema_migrations",
 		"version", auxRekeyPassInitial.markerVersion)
 	expectIgnoredSentinelProbes(mock, true)
+	expectAuxRekeyState(mock, false)
 	// No further expectations: no table may be probed or scanned.
 
 	wrote, err := rekeyAuxRowIDs(context.Background(), db, auxRekeyPassInitial.shippedMainVersion-1, auxRekeyPassInitial)
@@ -230,7 +236,7 @@ func TestRekeyAuxRowIDsRunsAllTablesWhenMarkerPending(t *testing.T) {
 	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM ignored_schema_migrations",
 		"version", auxRekeyPassInitial.markerVersion-1)
 	expectIgnoredSentinelProbes(mock, true)
-	expectAuxRekeySentinel(mock, false)
+	expectAuxRekeyState(mock, false)
 	expectSetAuxRekeySentinel(mock)
 	// Each of the four tables is probed; this mocked world has none of them,
 	// so each probe returns 0 and the loop completes without scanning.
@@ -251,18 +257,36 @@ func TestRekeyAuxRowIDsRunsAllTablesWhenMarkerPending(t *testing.T) {
 	}
 }
 
-// expectAuxRekeySentinel mocks auxRekeyResumePending: the local_metadata
-// table-existence probe, then (when the table exists) the sentinel-row count.
-func expectAuxRekeySentinel(mock sqlmock.Sqlmock, pending bool) {
+// expectAuxRekeyState mocks readAuxRekeyState: the local_metadata
+// table-existence probe, then (when the table exists) the one row-read that
+// returns both the in-flight sentinel and the #4380 drift record.
+func expectAuxRekeyState(mock sqlmock.Sqlmock, resume bool, drifted ...string) {
 	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM INFORMATION_SCHEMA\.TABLES`).
 		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
-	n := 0
-	if pending {
-		n = 1
+	rows := sqlmock.NewRows([]string{"key", "value"})
+	if resume {
+		rows.AddRow(auxRekeyPassInitial.sentinelKey, "1")
 	}
-	mock.ExpectQuery(regexp.QuoteMeta("SELECT COUNT(*) FROM local_metadata WHERE `key` = ?")).
-		WithArgs(auxRekeyPassInitial.sentinelKey).
-		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(n))
+	if len(drifted) > 0 {
+		rows.AddRow(auxRowRekeyDriftedKey, strings.Join(drifted, ","))
+	}
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT `key`, value FROM local_metadata WHERE `key` IN (?, ?)")).
+		WithArgs(auxRekeyPassInitial.sentinelKey, auxRowRekeyDriftedKey).
+		WillReturnRows(rows)
+}
+
+func expectSetAuxRekeyDrifted(mock sqlmock.Sqlmock, tables ...string) {
+	mock.ExpectExec(`CREATE TABLE IF NOT EXISTS local_metadata`).
+		WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec(regexp.QuoteMeta("REPLACE INTO local_metadata (`key`, value) VALUES (?, ?)")).
+		WithArgs(auxRowRekeyDriftedKey, strings.Join(tables, ",")).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+}
+
+func expectClearAuxRekeyDrifted(mock sqlmock.Sqlmock) {
+	mock.ExpectExec(regexp.QuoteMeta("DELETE FROM local_metadata WHERE `key` = ?")).
+		WithArgs(auxRowRekeyDriftedKey).
+		WillReturnResult(sqlmock.NewResult(0, 1))
 }
 
 func expectSetAuxRekeySentinel(mock sqlmock.Sqlmock) {
@@ -297,7 +321,7 @@ func TestRekeyAuxRowIDsSkipsConvergedLineage(t *testing.T) {
 	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM ignored_schema_migrations",
 		"version", auxRekeyPassInitial.markerVersion-1)
 	expectIgnoredSentinelProbes(mock, true)
-	expectAuxRekeySentinel(mock, false)
+	expectAuxRekeyState(mock, false)
 	// No further expectations: marker is pending, but the pre-pass main
 	// cursor at the watershed and no crash sentinel means no table may be
 	// probed or scanned.
@@ -331,7 +355,7 @@ func TestRekeyAuxRowIDsResumesAfterCrash(t *testing.T) {
 	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM ignored_schema_migrations",
 		"version", auxRekeyPassInitial.markerVersion-1)
 	expectIgnoredSentinelProbes(mock, true)
-	expectAuxRekeySentinel(mock, true)
+	expectAuxRekeyState(mock, true)
 	expectSetAuxRekeySentinel(mock)
 	for range auxRekeyTables {
 		expectColumnExists(mock, false)
@@ -362,7 +386,7 @@ func TestRekeyAuxRowIDsKeepsSentinelOnFailure(t *testing.T) {
 	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM ignored_schema_migrations",
 		"version", auxRekeyPassInitial.markerVersion-1)
 	expectIgnoredSentinelProbes(mock, true)
-	expectAuxRekeySentinel(mock, false)
+	expectAuxRekeyState(mock, false)
 	expectSetAuxRekeySentinel(mock)
 	// First table probe fails; no DELETE of the sentinel may follow.
 	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM INFORMATION_SCHEMA\.COLUMNS`).
