@@ -328,6 +328,18 @@ func (s *DoltStore) demoteToWispInTx(ctx context.Context, tx *sql.Tx, id string,
 	return s.doltAddAndCommitInTx(ctx, tx, permanentIssueAuxTables, fmt.Sprintf("bd: demote %s to wisp", id))
 }
 
+// doltAddAndCommitInTx stages and Dolt-commits INSIDE a still-open SQL
+// transaction.
+//
+// HAZARD (LatentLabsSpace/NEXUS#92): DOLT_ADD stages the whole table from
+// this session's BEGIN-time root, and DOLT_COMMIT here runs before the
+// transaction's commit-time merge — so under concurrent writers the produced
+// Dolt commit writes every concurrently-changed row in the staged tables
+// back to its BEGIN-time value (lost update). The main issue-mutation path
+// (runIssueOperationTxWithMessage) no longer uses this; it commits the SQL
+// transaction first and then calls doltAddAndCommitPostTx. Remaining callers
+// (wisp promote/demote, legacy reopen, branch transaction wrapper) accept
+// the hazard for now and should migrate to the post-tx ordering.
 func (s *DoltStore) doltAddAndCommitInTx(ctx context.Context, tx *sql.Tx, tables []string, commitMsg string) error {
 	// Batch/off auto-commit (bd-4wamg): leave the writes in the working set
 	// for a later explicit commit point (bd dolt commit / CommitPending)
@@ -364,6 +376,30 @@ func (s *DoltStore) doltAddAndCommitInTx(ctx context.Context, tx *sql.Tx, tables
 	if err := schema.DrainCall(ctx, tx, "CALL DOLT_COMMIT('-m', ?, '--author', ?)",
 		commitMsg, s.commitAuthorString()); err != nil && !isDoltNothingToCommit(err) {
 		return wrapSQLCommitError("dolt commit", err)
+	}
+	return nil
+}
+
+// doltAddAndCommitPostTx stages and Dolt-commits tables OUTSIDE any open SQL
+// transaction, against the session's current — post-merge — root. This is
+// the safe ordering for operations whose data transaction has already
+// committed: staging whole tables here cannot resurrect pre-transaction row
+// states, because the working set already reflects the commit-time merge
+// with concurrent writers (see runIssueOperationTxWithMessage).
+//
+// If this fails, the data change has still landed: it remains in the branch
+// working set and is carried into the next Dolt commit on the branch. The
+// error wrapping states that explicitly so callers and users do not retry
+// the mutation itself.
+func (s *DoltStore) doltAddAndCommitPostTx(ctx context.Context, tables []string, commitMsg string) error {
+	for _, table := range tables {
+		if err := schema.DrainCall(ctx, s.db, "CALL DOLT_ADD(?)", table); err != nil {
+			return fmt.Errorf("dolt add %s (post-tx; data already committed, change rides the next dolt commit): %w", table, err)
+		}
+	}
+	if err := schema.DrainCall(ctx, s.db, "CALL DOLT_COMMIT('-m', ?, '--author', ?)",
+		commitMsg, s.commitAuthorString()); err != nil && !isDoltNothingToCommit(err) {
+		return fmt.Errorf("dolt commit (post-tx; data already committed, change rides the next dolt commit): %w", err)
 	}
 	return nil
 }
