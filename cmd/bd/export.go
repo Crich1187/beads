@@ -202,6 +202,27 @@ func runExportFromSource(ctx context.Context, src exportSource) error {
 		return HandleErrorRespectJSON("failed to load relational data: %v", err)
 	}
 
+	// Explicit plane markers (bd-r9uce): a no_history=true row is either an
+	// unpromoted no-history wisp (wisps table) or a promoted one (durable
+	// issues-table row still carrying the stray flag) — only table membership
+	// can tell them apart, and import routes by the "wisp_plane" marker
+	// stamped here. Ephemeral rows are unambiguous (ephemeral=true only ever lives in
+	// the wisps table) and are deliberately NOT stamped, keeping their export
+	// bytes unchanged.
+	var noHistoryIDs []string
+	for _, issue := range issues {
+		if issue.NoHistory && !issue.Ephemeral {
+			noHistoryIDs = append(noHistoryIDs, issue.ID)
+		}
+	}
+	wispPlane := map[string]bool{}
+	if len(noHistoryIDs) > 0 {
+		wispPlane, err = src.WispPlaneIDs(ctx, noHistoryIDs)
+		if err != nil {
+			return HandleErrorRespectJSON("failed to classify wisp-plane rows: %v", err)
+		}
+	}
+
 	// Populate relational data on each issue
 	for _, issue := range issues {
 		issue.Labels = rel.labels[issue.ID]
@@ -230,6 +251,7 @@ func runExportFromSource(ctx context.Context, src exportSource) error {
 				DependentCount:  counts.DependentCount,
 				CommentCount:    rel.commentCounts[issue.ID],
 			},
+			WispPlane: wispPlane[issue.ID],
 		}
 
 		data, err := json.Marshal(record)
@@ -312,6 +334,18 @@ func runExportFromSource(ctx context.Context, src exportSource) error {
 type exportIssueRecord struct {
 	RecordType string `json:"_type"`
 	*types.IssueWithCounts
+	// WispPlane is the explicit wisps-plane marker (bd-r9uce): true when the
+	// row lives in the WISPS table AND its flags alone cannot prove it (the
+	// no_history shape; ephemeral rows are self-describing and stay
+	// unstamped). Import routes by this marker — never by no_history — so a
+	// promoted no-history wisp (durable issues-table row still carrying the
+	// stray flag) round-trips to the durable plane instead of being silently
+	// re-planed. Declared after the embedded struct so it serializes last.
+	// Deliberately a FRESH key, not the legacy "wisp" alias key: pre-fix
+	// binaries' alias branch would import a marked no-history wisp as
+	// ephemeral (purge-eligible, export-excluded), so an unknown-to-them key
+	// that degrades to flag routing is the data-safe choice (lion, #5368).
+	WispPlane bool `json:"wisp_plane,omitempty"`
 }
 
 // sanitizeZeroTime replaces Go zero-value time.Time fields with Unix epoch.

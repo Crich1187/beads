@@ -34,6 +34,7 @@ func runKVSetProxiedServer(ctx context.Context, key, value string) error {
 	if err != nil {
 		return HandleErrorRespectJSON("setting key: %v", err)
 	}
+	commandDidWrite.Store(true)
 
 	return printKVSetResult(key, value)
 }
@@ -69,6 +70,7 @@ func runKVClearProxiedServer(ctx context.Context, key string) error {
 	if err != nil {
 		return HandleErrorRespectJSON("deleting key: %v", err)
 	}
+	commandDidWrite.Store(true)
 
 	return printKVClearResult(key)
 }

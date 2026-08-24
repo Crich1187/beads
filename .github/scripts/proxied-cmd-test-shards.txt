@@ -42,11 +42,13 @@
 15 3 TestProxiedServerUpdate2
 15 3 TestProxiedServerUpdateConcurrentMetadata
 
+15 4 TestProxiedServerCascadeParity
 15 4 TestProxiedServerClose2
 15 4 TestProxiedServerDeleteConcurrent
 15 4 TestProxiedServerDuplicates
 15 4 TestProxiedServerMolBond
 15 4 TestProxiedServerQuery
+15 4 TestProxiedServerUnclaimIfAssigneeParity
 15 4 TestProxiedServerWispCreate
 
 15 5 TestProxiedServerCreate2
@@ -60,6 +62,7 @@
 15 6 TestProxiedServerCleanDatabases
 15 6 TestProxiedServerEdit
 15 6 TestProxiedServerLink
+15 6 TestProxiedServerPrime
 15 6 TestProxiedServerReady2
 15 6 TestProxiedServerReadyConcurrent
 15 6 TestProxiedServerState
@@ -83,6 +86,7 @@
 15 8 TestProxiedServerServeClaim
 15 8 TestProxiedServerServeReadParity
 
+15 9 TestProxiedServerBatchParity
 15 9 TestProxiedServerDep2
 15 9 TestProxiedServerGraph
 15 9 TestProxiedServerMolProgress
@@ -134,6 +138,7 @@
 
 15 15 TestProxiedServerMolShow
 15 15 TestProxiedServerOrphans
+15 15 TestProxiedServerRecomputeBlocked
 15 15 TestProxiedServerShow2
 15 15 TestProxiedServerUnclaim
 15 15 TestProxiedServerUpdate3

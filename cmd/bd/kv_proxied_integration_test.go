@@ -52,6 +52,13 @@ func kvListJSONRaw(t *testing.T, bd, dir string) (string, map[string]string) {
 	if err := json.Unmarshal([]byte(raw), &parsed); err != nil {
 		t.Fatalf("kv list --json did not parse: %v\n%s", err, raw)
 	}
+	sv, ok := parsed["schema_version"]
+	if !ok {
+		t.Fatalf("kv list --json missing schema_version (shape drift): %s", raw)
+	}
+	if _, isNum := sv.(float64); !isNum {
+		t.Fatalf("kv list --json schema_version is not numeric (shape drift): %T %v\n%s", sv, sv, raw)
+	}
 	m := make(map[string]string, len(parsed))
 	for k, v := range parsed {
 		if k == "schema_version" {

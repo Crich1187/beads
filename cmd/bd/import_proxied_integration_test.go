@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -113,6 +114,45 @@ func TestProxiedServerImport(t *testing.T) {
 		}
 	}
 
+	// A workspace WITH hooks is the case that broke: proxied mode wraps its
+	// provider so writes fire the workspace's hook scripts, and the import role
+	// asks the unit of work for its raw statement runner (importer.go) — an
+	// assertion on the concrete type, which the wrapper is not. Every import in
+	// a hooks-enabled proxied workspace failed on it.
+	//
+	// The import itself still fires no hook, on either plumbing: both run the
+	// shared batch-upsert engine rather than the per-issue verbs.
+	t.Run("import_runs_in_a_workspace_with_hooks", func(t *testing.T) {
+		t.Parallel()
+		if runtime.GOOS == "windows" {
+			t.Skip("hook script form is POSIX shell")
+		}
+		marker := filepath.Join(t.TempDir(), "any_hook_marker")
+		script := "#!/bin/sh\nprintf '%s\\n' \"$1\" >> " + shellQuote(marker) + "\n"
+		p := newSharedProxiedProjectWithHooks(t, bd, "imph", map[string]string{
+			"on_create": script,
+			"on_update": script,
+			"on_close":  script,
+		})
+		db := openProxiedDB(t, p)
+
+		path := filepath.Join(p.dir, "hooked.jsonl")
+		if err := os.WriteFile(path, []byte(importFixtureJSONL(t, fixtureIssues("imph"))), 0o644); err != nil {
+			t.Fatalf("write fixture: %v", err)
+		}
+
+		report := bdProxiedImport(t, bd, p.dir, path)
+		if !strings.Contains(report, "Imported 3 issues") {
+			t.Errorf("import report = %q, want 'Imported 3 issues'", report)
+		}
+		if got := proxiedImportQueryInt(t, db, "SELECT COUNT(*) FROM issues WHERE id LIKE 'imph-r%'"); got != 3 {
+			t.Errorf("issue rows = %d, want 3", got)
+		}
+		if data, err := os.ReadFile(marker); err == nil {
+			t.Errorf("import fired hooks: %q", string(data))
+		}
+	})
+
 	t.Run("roundtrip_one_commit_with_content", func(t *testing.T) {
 		t.Parallel()
 		p := newSharedProxiedProject(t, bd, "impa")
@@ -182,6 +222,67 @@ func TestProxiedServerImport(t *testing.T) {
 		}
 		if n := proxiedDoltCommitCountSince(t, db, headBeforeReimport); n != 0 {
 			t.Errorf("re-import of an identical snapshot made %d commits, want 0 (working-set no-op)", n)
+		}
+	})
+
+	// bd-r9uce: import routes the storage plane by the export stream's
+	// explicit "wisp_plane" marker, never by the no_history flag. A no_history=true
+	// record WITHOUT the marker is a promoted no-history wisp — a durable
+	// issues-table row whose stray flag must not re-plane it into the wisps
+	// table (which would drop its cross-plane relations as "cross-bucket");
+	// WITH the marker it is a genuine unpromoted no-history wisp and keeps
+	// its wisps-plane home. Same marker contract as the classic route
+	// (TestEmbeddedImportPromotedWispRoundtrip), through the shared parse
+	// loop and the shared issueops batch engine.
+	t.Run("promoted_no_history_routes_durable", func(t *testing.T) {
+		t.Parallel()
+		p := newSharedProxiedProject(t, bd, "impw")
+		db := openProxiedDB(t, p)
+
+		fixture := importFixtureJSONL(t, []*types.Issue{
+			{
+				ID: "impw-wisp-promo", Title: "Promoted no-history wisp", Status: types.StatusOpen,
+				IssueType: types.TypeTask, Priority: 2, NoHistory: true,
+				CreatedAt: when, UpdatedAt: when,
+			},
+			{
+				ID: "impw-frend", Title: "Durable friend", Status: types.StatusOpen,
+				IssueType: types.TypeTask, Priority: 2,
+				Dependencies: []*types.Dependency{{IssueID: "impw-frend", DependsOnID: "impw-wisp-promo", Type: types.DepBlocks}},
+				CreatedAt:    when, UpdatedAt: when,
+			},
+		},
+			// A genuine unpromoted no-history wisp: same flags, but carrying
+			// the explicit plane marker.
+			`{"id":"impw-wisp-real","title":"Real no-history wisp","status":"open","issue_type":"task","priority":2,"no_history":true,"wisp_plane":true,"created_at":"2026-08-01T12:00:00Z","updated_at":"2026-08-01T12:00:00Z"}`,
+		)
+		path := filepath.Join(p.dir, "planes.jsonl")
+		if err := os.WriteFile(path, []byte(fixture), 0o644); err != nil {
+			t.Fatalf("write fixture: %v", err)
+		}
+
+		report := bdProxiedImport(t, bd, p.dir, path)
+		if strings.Contains(report, "Skipped dependency") {
+			t.Errorf("import dropped a relation (promoted row re-planed into the wisps bucket?):\n%s", report)
+		}
+
+		// Marker absent => durable plane, flag preserved on the row.
+		if got := proxiedImportQueryInt(t, db, "SELECT COUNT(*) FROM issues WHERE id = 'impw-wisp-promo' AND no_history = 1"); got != 1 {
+			t.Errorf("promoted row in issues table with no_history intact = %d, want 1", got)
+		}
+		if got := proxiedImportQueryInt(t, db, "SELECT COUNT(*) FROM wisps WHERE id = 'impw-wisp-promo'"); got != 0 {
+			t.Errorf("promoted row re-planed into wisps table: %d rows, want 0", got)
+		}
+		if got := proxiedImportQueryInt(t, db, "SELECT COUNT(*) FROM dependencies WHERE issue_id = 'impw-frend' AND depends_on_issue_id = 'impw-wisp-promo' AND type = 'blocks'"); got != 1 {
+			t.Errorf("friend blocks edge onto promoted row = %d, want 1 (relation dropped?)", got)
+		}
+
+		// Marker present => wisps plane.
+		if got := proxiedImportQueryInt(t, db, "SELECT COUNT(*) FROM wisps WHERE id = 'impw-wisp-real' AND no_history = 1"); got != 1 {
+			t.Errorf("marked no-history wisp in wisps table = %d, want 1", got)
+		}
+		if got := proxiedImportQueryInt(t, db, "SELECT COUNT(*) FROM issues WHERE id = 'impw-wisp-real'"); got != 0 {
+			t.Errorf("marked no-history wisp leaked into issues table: %d rows, want 0", got)
 		}
 	})
 

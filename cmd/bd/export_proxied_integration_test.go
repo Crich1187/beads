@@ -16,7 +16,9 @@ import (
 // interchange fixture): priorities incl. P0, several types, a closed issue
 // with a reason, labels, comments, both dependency orientations
 // (parent-child and blocks), metadata, an assignee, an ephemeral wisp that
-// default export must EXCLUDE, an infra-type (message) bead, and memories.
+// default export must EXCLUDE, an infra-type (message) bead, a promoted
+// no-history wisp (durable issues-table row still carrying no_history=true —
+// the bd-r9uce plane-classification trap, with relations), and memories.
 type exportProxiedFixture struct {
 	critical string
 	epic     string
@@ -25,6 +27,14 @@ type exportProxiedFixture struct {
 	done     string
 	wisp     string
 	infraMsg string
+	// promoted is the promoted no-history wisp: a DURABLE issues-table row
+	// whose no_history flag is still set (wild pre-fix promote shape).
+	// promotedFriend is durable and blocked by it, so the round-trip oracle
+	// also pins that the relation survives — pre-fix, classic import
+	// re-planed the row into the wisps table by its flags and dropped this
+	// edge as a cross-bucket dependency.
+	promoted       string
+	promotedFriend string
 }
 
 func seedProxiedExportFixture(t *testing.T, bd string, p proxiedProject) exportProxiedFixture {
@@ -70,6 +80,29 @@ func seedProxiedExportFixture(t *testing.T, bd string, p proxiedProject) exportP
 	fx.done = bdProxiedCreateSilent(t, bd, p.dir, "Finished feature", "--type", "feature", "--priority", "4")
 	if out, err := bdProxiedRun(t, bd, p.dir, "close", fx.done, "--reason", "shipped in abc123"); err != nil {
 		t.Fatalf("close: %v\n%s", err, out)
+	}
+
+	// Promoted no-history wisp (bd-r9uce): a durable issues-table row still
+	// carrying no_history=true, with durable-plane relations. `bd promote` is
+	// not yet ported to proxied mode (bd-27bfd) — and the fixed promote now
+	// clears the flag — so produce the wild pre-fix shape directly: durable
+	// row, no_history flipped on. In the round trip below, classic import
+	// must route it by the (absent) explicit plane marker and keep it — and
+	// its inbound edge — in the durable plane.
+	fx.promoted = bdProxiedCreateSilent(t, bd, p.dir, "Promoted no-history wisp", "--type", "task", "--priority", "3")
+	if out, err := bdProxiedRun(t, bd, p.dir, "label", "add", fx.promoted, "keepme"); err != nil {
+		t.Fatalf("label add: %v\n%s", err, out)
+	}
+	if out, err := bdProxiedRun(t, bd, p.dir, "comment", fx.promoted, "survived promotion"); err != nil {
+		t.Fatalf("comment: %v\n%s", err, out)
+	}
+	fx.promotedFriend = bdProxiedCreateSilent(t, bd, p.dir, "Promoted wisp friend", "--type", "task", "--priority", "3")
+	if out, err := bdProxiedRun(t, bd, p.dir, "dep", "add", fx.promotedFriend, fx.promoted); err != nil {
+		t.Fatalf("dep add: %v\n%s", err, out)
+	}
+	db := openProxiedDB(t, p)
+	if _, err := db.Exec("UPDATE issues SET no_history = 1 WHERE id = ?", fx.promoted); err != nil {
+		t.Fatalf("flip no_history: %v", err)
 	}
 
 	// Ephemeral wisp: excluded from default export, included with --all.
@@ -297,39 +330,30 @@ func TestProxiedServerExport(t *testing.T) {
 	})
 
 	// The plane-classification trap from review: a promoted no-history wisp
-	// is a durable issues-table row that still carries no_history=true —
-	// promote clears only Ephemeral — and its labels/comments live in the
+	// is a durable issues-table row that still carries no_history=true — the
+	// wild pre-fix promote shape — and its labels/comments live in the
 	// DURABLE plane. Classifying by row flags looks them up in the wisp plane
 	// and silently drops them; classification must follow table membership.
-	// Runs in its own project: the shape is deliberately NOT in the
-	// round-trip fixture because classic *import* routes by the same flags
-	// (issueops.IsWisp), re-planing the row into the wisps table — a
-	// pre-existing export/import infidelity (bd-r9uce) that would break the
-	// byte-identity oracle for reasons unrelated to this seam.
+	// Since bd-r9uce the shape lives IN the round-trip fixture (fx.promoted):
+	// import now routes by the explicit "wisp_plane" marker instead of the
+	// flags, so the cross_mode_byte_identical oracle below covers it too.
+	// The export half pinned here: relations present, and NO plane marker on
+	// the record (it is durable — stamping it would re-plane it on import).
 	t.Run("promoted_no_history_relations", func(t *testing.T) {
-		pp := newSharedProxiedProject(t, bd, "pxp")
-		promoted := bdProxiedCreateSilent(t, bd, pp.dir, "Promoted no-history wisp", "--type", "task", "--priority", "3")
-		if out, err := bdProxiedRun(t, bd, pp.dir, "label", "add", promoted, "keepme"); err != nil {
-			t.Fatalf("label add: %v\n%s", err, out)
-		}
-		if out, err := bdProxiedRun(t, bd, pp.dir, "comment", promoted, "survived promotion"); err != nil {
-			t.Fatalf("comment: %v\n%s", err, out)
-		}
-		// `bd promote` is not yet ported to proxied mode (bd-27bfd); produce
-		// the promoted shape directly: durable row, no_history flipped on.
-		db := openProxiedDB(t, pp)
-		if _, err := db.Exec("UPDATE issues SET no_history = 1 WHERE id = ?", promoted); err != nil {
-			t.Fatalf("flip no_history: %v", err)
-		}
-
-		stdout, stderr, err := bdProxiedRunBuffers(t, bd, pp.dir, "export")
+		stdout, stderr, err := bdProxiedRunBuffers(t, bd, p.dir, "export")
 		if err != nil {
 			t.Fatalf("bd export: %v\nstdout:\n%s\nstderr:\n%s", err, stdout, stderr)
 		}
 		records := exportLines(t, stdout)
-		rec := exportIssueRecordByID(records, promoted)
+		rec := exportIssueRecordByID(records, fx.promoted)
 		if rec == nil {
-			t.Fatalf("export missing promoted no-history row %s (durable table membership must include it)", promoted)
+			t.Fatalf("export missing promoted no-history row %s (durable table membership must include it)", fx.promoted)
+		}
+		if noHist, _ := rec["no_history"].(bool); !noHist {
+			t.Fatalf("promoted row lost no_history in export: %v", rec)
+		}
+		if _, marked := rec["wisp_plane"]; marked {
+			t.Errorf("promoted row carries the wisps-plane marker; it is durable and must not be stamped: %v", rec)
 		}
 		if labels := exportStrings(rec["labels"]); len(labels) != 1 || labels[0] != "keepme" {
 			t.Errorf("promoted labels = %v, want [keepme] (durable-plane labels dropped?)", labels)
@@ -339,6 +363,20 @@ func TestProxiedServerExport(t *testing.T) {
 		}
 		if cc, _ := rec["comment_count"].(float64); int(cc) != 1 {
 			t.Errorf("promoted comment_count = %v, want 1", rec["comment_count"])
+		}
+		if dc, _ := rec["dependent_count"].(float64); int(dc) != 1 {
+			t.Errorf("promoted dependent_count = %v, want 1 (inbound edge from friend)", rec["dependent_count"])
+		}
+		friend := exportIssueRecordByID(records, fx.promotedFriend)
+		if friend == nil {
+			t.Fatalf("export missing %s", fx.promotedFriend)
+		}
+		deps, _ := friend["dependencies"].([]any)
+		if len(deps) != 1 {
+			t.Fatalf("friend dependencies = %v, want the one edge onto the promoted row", friend["dependencies"])
+		}
+		if edge, ok := deps[0].(map[string]any); !ok || edge["depends_on_id"] != fx.promoted {
+			t.Errorf("friend dependency edge = %v, want depends_on_id=%s", deps[0], fx.promoted)
 		}
 	})
 

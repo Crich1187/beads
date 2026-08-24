@@ -22,7 +22,22 @@ func PromoteFromEphemeralInTx(ctx context.Context, tx DBTX, id string, actor str
 		return fmt.Errorf("wisp %s not found", id)
 	}
 
+	// A promoted wisp is fully durable: clear BOTH wisp-plane flags, not just
+	// Ephemeral. A no-history wisp (Ephemeral=false, NoHistory=true) promoted
+	// with NoHistory intact lands in the issues table still flag-marked as
+	// wisp-plane state, and everything that infers the plane from flags —
+	// most damagingly import's table routing — silently re-planes it back
+	// into the (default-export-excluded) wisps table, dropping its relations
+	// on the way (bd-r9uce). Post-promotion the flag has no meaning.
 	issue.Ephemeral = false
+	issue.NoHistory = false
+	// Promotion clears an explicit ephemeral class marker to select normalized
+	// versioned storage (same rule as types.NormalizePersistenceMode); with
+	// both plane flags cleared, a lingering explicit ephemeral class would
+	// fail validation in PrepareIssueForInsert below.
+	if issue.StorageClass == types.StorageClassEphemeral {
+		issue.StorageClass = ""
+	}
 
 	// Read the custom-status/type config directly (NewBatchContext needs a
 	// *sql.Tx; promote only uses these two fields of it, and the DBTX forms
@@ -112,6 +127,13 @@ func PromoteFromEphemeralInTx(ctx context.Context, tx DBTX, id string, actor str
 	}
 	if err := RecomputeIsBlockedInTx(ctx, tx, affectedIssues, affectedWisps); err != nil {
 		return fmt.Errorf("recompute is_blocked after promote for %s: %w", id, err)
+	}
+
+	// The bead keeps its ID across promotion; only its plane changes. Journal
+	// one update carrying the now-durable snapshot, after derived blocked-state
+	// maintenance has settled.
+	if err := RecordEventInTx(ctx, tx, EventUpdate, id, actor); err != nil {
+		return err
 	}
 	return nil
 }

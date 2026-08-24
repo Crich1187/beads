@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/storage/dberrors"
 	"github.com/steveyegge/beads/internal/storage/uow"
 	"github.com/steveyegge/beads/internal/types"
@@ -42,6 +43,25 @@ type exportSource interface {
 	// LoadExportRelations bulk-loads labels, dependency records, comments,
 	// comment counts, and dependency counts for the searched issues.
 	LoadExportRelations(ctx context.Context, issues []*types.Issue) (exportRelations, error)
+	// WispPlaneIDs reports which of ids currently live in the WISPS table.
+	// Export uses it to stamp the explicit "wisp_plane" marker on records
+	// whose row flags are ambiguous: a no_history=true row is either an
+	// unpromoted no-history wisp (wisps table) or a promoted one (durable
+	// issues-table row that may still carry the stray flag), and only table
+	// membership can tell them apart — import routes by the marker, so
+	// mis-stamping a durable row would re-plane it and drop its relations
+	// (bd-r9uce). Implementations must classify by table membership, never
+	// by flags, and both modes must agree (byte-identity oracle).
+	WispPlaneIDs(ctx context.Context, ids []string) (map[string]bool, error)
+}
+
+// storeWispPartitioner is the optional store capability WispPlaneIDs uses in
+// classic mode. Both real stores (DoltStore, EmbeddedDoltStore) implement it;
+// a store that does not simply gets no plane markers, which degrades to the
+// data-safe side (import then routes bare no_history rows to the durable
+// plane, where nothing is ever excluded from export).
+type storeWispPartitioner interface {
+	PartitionWispIDs(ctx context.Context, ids []string) (wispIDs, permIDs []string, err error)
 }
 
 // exportRelations carries the bulk-loaded relational data for the export set,
@@ -107,6 +127,39 @@ func (storeExportSource) LoadExportRelations(ctx context.Context, issues []*type
 	}, nil
 }
 
+func (storeExportSource) WispPlaneIDs(ctx context.Context, ids []string) (map[string]bool, error) {
+	if len(ids) == 0 || store == nil {
+		return nil, nil
+	}
+	// The store global is decorator-wrapped (telemetry, hook firing); walk
+	// Unwrap() down to the store that carries the partition capability.
+	s := store
+	var p storeWispPartitioner
+	for {
+		if partitioner, ok := s.(storeWispPartitioner); ok {
+			p = partitioner
+			break
+		}
+		u, ok := s.(interface{ Unwrap() storage.DoltStorage })
+		if !ok {
+			return nil, nil
+		}
+		s = u.Unwrap()
+		if s == nil {
+			return nil, nil
+		}
+	}
+	wispIDs, _, err := p.PartitionWispIDs(ctx, ids)
+	if err != nil {
+		return nil, err
+	}
+	set := make(map[string]bool, len(wispIDs))
+	for _, id := range wispIDs {
+		set[id] = true
+	}
+	return set, nil
+}
+
 // uowExportSource is the proxied-server exportSource over a unit of work. All
 // reads run inside the single read transaction runExport opened, so the
 // export is one consistent snapshot.
@@ -153,7 +206,8 @@ func (s *uowExportSource) GetAllConfig(ctx context.Context) (map[string]string, 
 //   - Labels, comments, and comment counts: the classic loaders partition IDs
 //     by wisps-table membership (issueops.PartitionWispIDsInTx). Row flags are
 //     NOT a substitute for that partition — a promoted no-history wisp is a
-//     durable issues-table row that still carries NoHistory=true — so both
+//     durable issues-table row that (as wild data from the pre-bd-r9uce
+//     promote) still carries NoHistory=true — so both
 //     planes are queried with the FULL ID set and merged. The planes are
 //     ID-disjoint (GH#4455 cross-table guard), so at most one plane returns
 //     rows for any id and the merge cannot collide.
@@ -183,7 +237,13 @@ func (s *uowExportSource) LoadExportRelations(ctx context.Context, issues []*typ
 		return rel, nil
 	}
 
-	labels, err := s.uw.LabelUseCase().GetLabelsForIssues(ctx, allIDs)
+	// BATCH READS, and the batch is what keeps them here. Export hydrates every
+	// relation of N issues at once — labels, comments, dependencies, counts,
+	// both planes — and no role answers "the labels of these N ids": Reader.Get
+	// is one detail view per call, so a role-routed export would be N round
+	// trips over a whole workspace. A bulk relation reader is the follow-up
+	// (ga-2ltro.12). Every LabelUseCase call in this file is one of these.
+	labels, err := s.uw.LabelUseCase().GetLabelsForIssues(ctx, allIDs) //nolint:forbidigo // bulk relation load; no role answers labels-for-N-ids
 	if err != nil {
 		return exportRelations{}, fmt.Errorf("load labels: %w", err)
 	}
@@ -199,7 +259,7 @@ func (s *uowExportSource) LoadExportRelations(ctx context.Context, issues []*typ
 	}
 	mergeExportMap(rel.commentCounts, counts)
 
-	wispLabels, err := s.uw.LabelUseCase().GetLabelsForWisps(ctx, allIDs)
+	wispLabels, err := s.uw.LabelUseCase().GetLabelsForWisps(ctx, allIDs) //nolint:forbidigo // bulk relation load; see GetLabelsForIssues above
 	if err != nil {
 		if !dberrors.IsTableNotExist(err) {
 			return exportRelations{}, fmt.Errorf("load wisp labels: %w", err)
@@ -257,6 +317,28 @@ func (s *uowExportSource) LoadExportRelations(ctx context.Context, issues []*typ
 	}
 
 	return rel, nil
+}
+
+// WispPlaneIDs classifies by wisps-table membership through the plane-pinned
+// GetWispsByIDs read (row flags are NOT a substitute — see the exportSource
+// interface comment). A rig without the wisp tables has no wisp-plane rows,
+// mirroring the tolerance of the wisp-plane legs in LoadExportRelations.
+func (s *uowExportSource) WispPlaneIDs(ctx context.Context, ids []string) (map[string]bool, error) {
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	wisps, err := s.uw.IssueUseCase().GetWispsByIDs(ctx, ids)
+	if err != nil {
+		if dberrors.IsTableNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("wisp plane membership: %w", err)
+	}
+	set := make(map[string]bool, len(wisps))
+	for _, w := range wisps {
+		set[w.ID] = true
+	}
+	return set, nil
 }
 
 // mergeExportMap copies src entries into dst. The label/comment planes are
