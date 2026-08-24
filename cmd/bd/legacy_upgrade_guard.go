@@ -43,8 +43,8 @@ func guardLegacyUpgradeWorkspace(beadsDir string) error {
 	if embeddeddolt.HasRepository(beadsDir) && !serverMode {
 		return nil
 	}
-	version, ok := legacyUpgradeVersionWitness(beadsDir)
-	if serverMode && ok && legacyServerVersion(version) {
+	version, present := legacyUpgradeVersionWitness(beadsDir)
+	if serverMode && present && legacyServerVersion(version) {
 		return legacyUpgradeRefusal(fmt.Sprintf("legacy Dolt server workspace from bd %s", version))
 	}
 	hasLocalDoltRoot := hasLegacyDoltRoot(beadsDir)
@@ -56,13 +56,17 @@ func guardLegacyUpgradeWorkspace(beadsDir string) error {
 		case witnessEraCurrent:
 			return nil
 		case witnessEraUnknown:
-			// A witness that is present but unreadable is not evidence of a
-			// legacy workspace: every pre-1.0 bd wrote a plain X.Y.Z through
-			// the same best-effort writer, so no legacy release could have
-			// produced a string this parse rejects. Report the ambiguity and
-			// open the workspace instead of refusing every command over an
-			// advisory, gitignored file.
-			if ok {
+			// A witness that is present but unreadable — including one left
+			// blank or whitespace-only by an interrupted or disk-full
+			// best-effort write — is not evidence of a legacy workspace: every
+			// pre-1.0 bd wrote a plain X.Y.Z through the same writer, so no
+			// legacy release could have produced a witness this parse rejects.
+			// Report the ambiguity and open the workspace so the admitted
+			// command can self-heal the witness, instead of refusing every
+			// command over an advisory, gitignored file. A genuinely absent
+			// witness is not present and still refuses below, preserving the
+			// pre-1.0 guard invariant.
+			if present {
 				warnUnreadableVersionWitness(beadsDir, version)
 				return nil
 			}
@@ -71,11 +75,11 @@ func guardLegacyUpgradeWorkspace(beadsDir string) error {
 	}
 	if cfg == nil || cfg.DoltMode == "" ||
 		strings.EqualFold(cfg.DoltMode, configfile.DoltModeEmbedded) {
-		if doltserver.IsSharedServerMode() && !(ok && legacyServerVersion(version)) {
+		if doltserver.IsSharedServerMode() && !(present && legacyServerVersion(version)) {
 			return nil
 		}
 		reason := "legacy Dolt workspace"
-		if _, validVersion := legacyVersionMinor(version); ok && validVersion {
+		if _, validVersion := legacyVersionMinor(version); present && validVersion {
 			reason = fmt.Sprintf("legacy Dolt workspace from bd %s", version)
 		}
 		return legacyUpgradeRefusal(reason)
@@ -245,18 +249,26 @@ func isRegularFile(path string) bool {
 	return err == nil && info.Mode().IsRegular()
 }
 
+// legacyUpgradeVersionWitness reads the advisory local version witness beneath
+// beadsDir. The returned bool reports whether a witness file is present as a
+// bounded regular file, independent of whether its trimmed contents name a
+// version. A present but blank or whitespace-only witness — the shape an
+// interrupted or disk-full best-effort writeLocalVersion leaves behind — is
+// returned as ("", true) so guardLegacyUpgradeWorkspace can tell it apart from
+// a genuinely absent witness, which is ("", false). Only a present witness is
+// ever admitted as an unknown-era workspace; a missing, non-regular, or
+// oversized witness stays absent so the pre-1.0 refusal cannot relax.
 func legacyUpgradeVersionWitness(beadsDir string) (string, bool) {
 	path := filepath.Join(beadsDir, localVersionFile)
 	info, err := os.Lstat(path)
-	if err != nil || !info.Mode().IsRegular() || info.Size() <= 0 || info.Size() > 64 {
+	if err != nil || !info.Mode().IsRegular() || info.Size() > 64 {
 		return "", false
 	}
 	data, err := os.ReadFile(path) // #nosec G304 -- bounded file beneath selected workspace
 	if err != nil || int64(len(data)) != info.Size() {
 		return "", false
 	}
-	version := strings.TrimSpace(string(data))
-	return version, version != ""
+	return strings.TrimSpace(string(data)), true
 }
 
 func legacyServerVersion(version string) bool {

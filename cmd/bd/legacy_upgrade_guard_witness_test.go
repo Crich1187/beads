@@ -158,6 +158,95 @@ func TestLegacyUpgradeGuardRefusesWorkspaceWithoutAnyWitness(t *testing.T) {
 	}
 }
 
+// TestLegacyUpgradeGuardWarnsInsteadOfRefusingPresentButBlankWitness pins F1:
+// a witness file that exists but is blank or whitespace-only — the shape an
+// interrupted or disk-full best-effort writeLocalVersion leaves behind — must
+// be classified as an unknown-era (unreadable) witness and warned-and-opened,
+// not collapsed into the "genuinely missing" path and hard-refused. A truly
+// absent witness must still refuse so the pre-1.0 safety invariant does not
+// relax.
+func TestLegacyUpgradeGuardWarnsInsteadOfRefusingPresentButBlankWitness(t *testing.T) {
+	blankWitnesses := []struct {
+		name    string
+		content []byte
+	}{
+		{name: "zero byte", content: []byte("")},
+		{name: "newline only", content: []byte("\n")},
+		{name: "spaces and tabs", content: []byte("  \t\n")},
+	}
+
+	for _, tc := range blankWitnesses {
+		t.Run(tc.name, func(t *testing.T) {
+			warnings := captureLegacyUpgradeWarnings(t)
+			beadsDir := writeSelectedServerWorkspace(t, "")
+			// writeSelectedServerWorkspace skips the witness for an empty
+			// version, leaving a genuinely-missing witness; overwrite it with a
+			// present-but-blank file to exercise the failed-write shape.
+			if err := os.WriteFile(filepath.Join(beadsDir, localVersionFile), tc.content, 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			if err := guardLegacyUpgradeWorkspace(beadsDir); err != nil {
+				t.Fatalf("guardLegacyUpgradeWorkspace() = %v, want nil for a present-but-blank witness", err)
+			}
+			if warnings.Len() == 0 {
+				t.Fatal("guard admitted a present-but-blank witness without warning")
+			}
+			if !strings.Contains(warnings.String(), localVersionFile) {
+				t.Fatalf("guard warning = %q, want it to name the witness path", warnings.String())
+			}
+		})
+	}
+
+	t.Run("genuinely missing witness still refuses", func(t *testing.T) {
+		captureLegacyUpgradeWarnings(t)
+		// No .local_version is written at all: absence must keep refusing so the
+		// pre-1.0 guard invariant does not relax alongside the blank-witness fix.
+		beadsDir := writeSelectedServerWorkspace(t, "")
+
+		if err := guardLegacyUpgradeWorkspace(beadsDir); !isLegacyUpgradeRefusal(err) {
+			t.Fatalf("guardLegacyUpgradeWorkspace() = %v, want migration refusal for a missing witness", err)
+		}
+	})
+}
+
+// TestLegacyUpgradeVersionWitnessPresence pins the reader's present/absent
+// signal that guardLegacyUpgradeWorkspace relies on to tell a present-but-blank
+// witness (warn+open) apart from a missing one (refuse). Oversized and missing
+// witnesses must both report absent so the pre-1.0 refusal cannot relax.
+func TestLegacyUpgradeVersionWitnessPresence(t *testing.T) {
+	t.Run("present but blank reports present with empty version", func(t *testing.T) {
+		for _, content := range [][]byte{[]byte(""), []byte("\n"), []byte("  \t")} {
+			beadsDir := t.TempDir()
+			if err := os.WriteFile(filepath.Join(beadsDir, localVersionFile), content, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			version, present := legacyUpgradeVersionWitness(beadsDir)
+			if !present || version != "" {
+				t.Fatalf("legacyUpgradeVersionWitness() = (%q, %v), want (%q, true) for %q", version, present, "", content)
+			}
+		}
+	})
+
+	t.Run("missing witness reports absent", func(t *testing.T) {
+		beadsDir := t.TempDir()
+		if version, present := legacyUpgradeVersionWitness(beadsDir); present || version != "" {
+			t.Fatalf("legacyUpgradeVersionWitness() = (%q, %v), want (%q, false) for a missing witness", version, present, "")
+		}
+	})
+
+	t.Run("oversized witness reports absent", func(t *testing.T) {
+		beadsDir := t.TempDir()
+		oversized := bytes.Repeat([]byte("a"), 65)
+		if err := os.WriteFile(filepath.Join(beadsDir, localVersionFile), oversized, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if version, present := legacyUpgradeVersionWitness(beadsDir); present || version != "" {
+			t.Fatalf("legacyUpgradeVersionWitness() = (%q, %v), want (%q, false) for an oversized witness", version, present, "")
+		}
+	})
+}
+
 func TestLegacyUpgradeGuardWarnsInsteadOfRefusingUnreadableWitness(t *testing.T) {
 	warnings := captureLegacyUpgradeWarnings(t)
 	beadsDir := writeSelectedServerWorkspace(t, "not-a-version")
