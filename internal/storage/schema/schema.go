@@ -374,7 +374,7 @@ func missingDoltIgnorePatterns(ctx context.Context, db DBConn, candidates []stri
 			}
 			present[strings.ToLower(stored)] = true
 		}
-		rows.Close()
+		_ = rows.Close()
 	}
 	missing := make([]string, 0, len(candidates))
 	for _, pattern := range candidates {
