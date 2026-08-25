@@ -181,6 +181,27 @@ func MigrateUpWithLock(ctx context.Context, conn *sql.Conn, databaseName string,
 		opt(&o)
 	}
 
+	// Steady-state fast path. In the overwhelmingly common case the database
+	// is already at this binary's schema and the whole locked pass is a probe
+	// that finds nothing to do — but running that probe under the
+	// database-scoped GET_LOCK serialized every bd invocation on a shared Dolt
+	// server behind every other one (96.7% lock saturation on an 18-seat rig;
+	// see alreadyConverged). Answer the same question first, without the lock,
+	// and take the lock only on the path that can actually migrate.
+	//
+	// Skipped when the caller carries fresh-bootstrap heal authority: that
+	// capability is issued only to the init that just created the database, so
+	// there is nothing converged to detect and the bootstrap path stays
+	// exactly as it was. A caller's locked preparation is skipped only because
+	// alreadyConverged has proved the session is already on databaseName —
+	// preparation's CREATE DATABASE and USE have therefore already happened,
+	// and it captures no authority on a database it did not create.
+	if o.freshBootstrapHeal == nil {
+		if converged, convergedErr := alreadyConverged(ctx, conn, databaseName); convergedErr == nil && converged {
+			return 0, nil
+		}
+	}
+
 	lockName := MigrationLockName(databaseName)
 	if err := AcquireMigrationLock(ctx, conn, lockName); err != nil {
 		return 0, err
