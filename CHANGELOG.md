@@ -158,6 +158,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`bd prime` says when it could NOT read the memory plane**
+  ([#5877](https://github.com/gastownhall/beads/issues/5877)). A broken or
+  unreachable store made prime omit the memory section entirely, so a session
+  that woke with zero recall looked exactly like a workspace that simply has no
+  memories — same output, same exit 0, no way for a fleet operator to tell them
+  apart. Prime still never fails a session-start hook, but a memory read it
+  cannot serve now renders `Skipped: beads storage unavailable (<error>) —
+  persistent memories were NOT injected this session`, alongside the timeout
+  banner that already existed for a deadline. Both the classic and the
+  proxied-server route share the banner. A workspace-less directory, and a
+  healthy store with no memories, stay silent as before.
+
 - **Incremental auto-export now actually takes the incremental path**
   ([#5806](https://github.com/gastownhall/beads/pull/5806)). Change detection
   compared `GetStateHash()` values — a hash of the entire database plus
