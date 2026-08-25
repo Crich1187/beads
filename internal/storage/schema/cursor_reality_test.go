@@ -80,6 +80,13 @@ func TestCursorContradictedBySchema(t *testing.T) {
 			columns: map[string]bool{},
 			want:    true,
 		},
+		// These two cases document the two real-world shapes the stub seam
+		// collapses: an absent leases table and a present-but-column-less leases
+		// table both drive sentinelColumnExists to false
+		// (columns["leases.granted_node"] == false), because the real
+		// schemaColumnExists COUNT(*) is 0 for a missing table and a missing
+		// column alike. They deliberately exercise the same branch — the naming
+		// records intent, not a distinct seam path.
 		{
 			name:    "leases table absent",
 			present: map[string]bool{"wisps": true, "wisp_dependencies": true},
@@ -184,6 +191,44 @@ func TestSentinelTablesAreCreatedByTheSeries(t *testing.T) {
 	}
 }
 
+// TestSentinelColumnsAreCreatedByTheSeries is the column-sentinel analogue of
+// TestSentinelTablesAreCreatedByTheSeries: a sentinel column this series does
+// not add could never be repaired by re-running it, so an otherwise at-latest
+// cursor would be rejected on every open — turning a silent wrong answer into a
+// permanent re-migration loop in the field. Enforce the creating side in CI.
+func TestSentinelColumnsAreCreatedByTheSeries(t *testing.T) {
+	entries, err := ignoredSource.files.ReadDir(ignoredSource.dir)
+	if err != nil {
+		t.Fatalf("read %s: %v", ignoredSource.dir, err)
+	}
+	var all strings.Builder
+	for _, e := range entries {
+		blob, err := ignoredSource.files.ReadFile(ignoredSource.dir + "/" + e.Name())
+		if err != nil {
+			t.Fatalf("read %s: %v", e.Name(), err)
+		}
+		all.Write(blob)
+	}
+	body := all.String()
+
+	if len(ignoredSource.sentinelColumns) == 0 {
+		t.Fatal("ignoredSource has no sentinel columns; the granted_node guard is inert")
+	}
+	for _, sc := range ignoredSource.sentinelColumns {
+		// ignored/0016 adds the column with a guarded, idempotent
+		// `ALTER TABLE <table> ADD COLUMN <column>`, which is also why
+		// re-running the series repairs rather than clobbers. Bind the table so
+		// a sentinel naming a column the series only adds to some other table
+		// (or never adds at all) fails here rather than in the field.
+		re := regexp.MustCompile(`(?i)ALTER TABLE\s+` + regexp.QuoteMeta(sc.table) +
+			`\s+ADD COLUMN\s+` + regexp.QuoteMeta(sc.column))
+		if !re.MatchString(body) {
+			t.Errorf("sentinel column %s.%s is never added by the %s series; re-running it could not repair that column",
+				sc.table, sc.column, ignoredSource.dir)
+		}
+	}
+}
+
 // TestMigrationWorkNeededWhenWispTablesAbsent is gh 5033 end to end, through
 // the real short-circuit that caused it. Both cursors read at-latest, so
 // before this change migrationWorkNeeded returned false, MigrateUp did
@@ -230,7 +275,9 @@ func TestMigrationWorkNeededWhenLeaseGrantedNodeAbsent(t *testing.T) {
 	}
 	defer db.Close()
 
+	expectCursorProbe(mock, "schema_migrations", true)
 	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM schema_migrations", "version", LatestVersion())
+	expectCursorProbe(mock, "ignored_schema_migrations", true)
 	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM ignored_schema_migrations", "version", LatestIgnoredVersion())
 	for range ignoredSource.sentinelTables {
 		mock.ExpectQuery(regexp.QuoteMeta("FROM INFORMATION_SCHEMA.TABLES")).

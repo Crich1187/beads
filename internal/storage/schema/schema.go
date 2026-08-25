@@ -239,6 +239,13 @@ type migrationSource struct {
 	sentinelTables []string
 	// sentinelColumns are clone-local columns whose absence contradicts an
 	// otherwise at-latest cursor just as strongly as an absent sentinel table.
+	//
+	// INVARIANT: no future migration in this series may DROP or RENAME a
+	// sentinel column (or the table carrying it). Older binaries in the field
+	// check their own sentinel list against the live schema, so removing one
+	// would make every healthy newer database read as "contradicted" to them
+	// and re-run their whole series. TestSentinelColumnsAreCreatedByTheSeries
+	// enforces the creating side only; the dropping side is this comment.
 	sentinelColumns []schemaSentinelColumn
 }
 
