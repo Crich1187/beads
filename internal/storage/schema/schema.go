@@ -356,7 +356,9 @@ func doltIgnoreSeedCandidates(ctx context.Context, db DBConn) []string {
 // A read failure is not fatal: dolt_ignore does not exist on a never-migrated
 // database (the first INSERT creates it), and that path is privileged by
 // construction. Treat the probe as "nothing present" and let the writes run,
-// which is exactly the pre-read behavior.
+// which is exactly the pre-read behavior. A partial read (the query succeeds
+// but iteration fails partway) degrades identically: the half-filled result is
+// discarded so it can never misclassify a registered pattern as missing.
 func missingDoltIgnorePatterns(ctx context.Context, db DBConn, candidates []string) []string {
 	present := make(map[string]bool, len(candidates))
 	placeholders := make([]string, len(candidates))
@@ -367,14 +369,32 @@ func missingDoltIgnorePatterns(ctx context.Context, db DBConn, candidates []stri
 	}
 	query := "SELECT pattern FROM dolt_ignore WHERE pattern IN (" + strings.Join(placeholders, ", ") + ")"
 	if rows, err := db.QueryContext(ctx, query, args...); err == nil {
+		readErr := false
 		for rows.Next() {
 			var stored string
 			if err := rows.Scan(&stored); err != nil {
+				readErr = true
 				break
 			}
 			present[strings.ToLower(stored)] = true
 		}
+		// rows.Err() surfaces an iteration failure that rows.Next() swallowed;
+		// a Scan error above is tracked separately because rows.Err() does not
+		// report it. Either way the read did not complete.
+		if err := rows.Err(); err != nil {
+			readErr = true
+		}
 		_ = rows.Close()
+		// A partial read must not drive the write decision. If iteration failed
+		// partway, present is half-filled, so a genuinely-registered pattern
+		// would be misclassified as missing and draw a spurious INSERT IGNORE —
+		// the exact command-denied write this seed exists to avoid on a
+		// SELECT/DML-only fence. Discard the partial map so a partial read
+		// degrades to the same "nothing present" blind-write as a query-level
+		// failure, which only ever runs on the privileged opener.
+		if readErr {
+			present = nil
+		}
 	}
 	missing := make([]string, 0, len(candidates))
 	for _, pattern := range candidates {

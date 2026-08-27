@@ -148,6 +148,66 @@ func TestSeedDoltIgnorePatternsHonoursStoredCasing(t *testing.T) {
 	}
 }
 
+// A partial read must degrade to the documented blind write, not to "these
+// first patterns are present". If the presence probe SELECT succeeds but the
+// row stream errors partway (an iteration error only rows.Err() reveals), the
+// half-filled result cannot be trusted: on the very SELECT/DML-only fence this
+// seed supports, misclassifying an already-registered pattern as missing draws
+// a spurious INSERT IGNORE that is itself command-denied. The seed must discard
+// the partial read and re-assert every candidate on the privileged opener,
+// exactly as a query-level failure degrades.
+func TestSeedDoltIgnorePatternsDegradesToBlindWriteOnPartialRead(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("create sql mock: %v", err)
+	}
+	defer db.Close()
+
+	const mainVersion = 63
+	candidates := expectedIgnoreSeedCandidates(mainVersion)
+	const failAt = 2
+	if len(candidates) <= failAt {
+		t.Fatalf("expected more than %d seed candidates at v%d, got %d", failAt, mainVersion, len(candidates))
+	}
+
+	// The probe reports the cursor, the main version, then returns rows for the
+	// candidates but errors mid-stream: rows 0..failAt-1 scan cleanly, then the
+	// stream fails, leaving present partially populated.
+	expectCursorProbe(mock, "schema_migrations", true)
+	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM schema_migrations", "version", mainVersion)
+	args := make([]driver.Value, 0, len(candidates))
+	rows := sqlmock.NewRows([]string{"pattern"})
+	for _, pattern := range candidates {
+		args = append(args, pattern)
+		rows.AddRow(pattern)
+	}
+	rows.RowError(failAt, errors.New("connection reset mid-read"))
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT pattern FROM dolt_ignore WHERE pattern IN (")).
+		WithArgs(args...).
+		WillReturnRows(rows)
+
+	// Every candidate must be (re)asserted, in order: the partial map is
+	// discarded, so the seed blind-writes the full set. Under the unguarded
+	// loop only the post-error subset would be written, and ordered sqlmock
+	// would reject the first mismatched INSERT.
+	for _, pattern := range candidates {
+		mock.ExpectExec(regexp.QuoteMeta("INSERT IGNORE INTO dolt_ignore VALUES (?, true)")).
+			WithArgs(pattern).
+			WillReturnResult(sqlmock.NewResult(0, 1))
+	}
+
+	changed, err := seedDoltIgnorePatterns(context.Background(), db)
+	if err != nil {
+		t.Fatalf("seedDoltIgnorePatterns() error = %v", err)
+	}
+	if !changed {
+		t.Fatal("seedDoltIgnorePatterns() reported changed=false after a partial read forced a blind write")
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet SQL expectations (a partial read must discard the probe and re-assert every pattern): %v", err)
+	}
+}
+
 func upperASCII(s string) string {
 	b := []byte(s)
 	for i, c := range b {
