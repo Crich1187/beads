@@ -405,7 +405,6 @@ stopgap (`BD_IGNORE_SCHEMA_SKEW=1`).
   `go install github.com/steveyegge/beads/cmd/bd@latest` resolves to this
   release instead of the accidental one. (The retract block is also
   carried on main so future tags keep the retractions.)
-||||||| parent of c0ec0c720 (feat(httpapi): serve `bd list`'s order with `sort` on listIssues)
 - **`sort` on `GET /v0/beads/issues`.** The listing served one order —
   `(created_at DESC, id ASC)` — because the cursor is a keyset position in it,
   and the spec said so in its own words: "the sort order is welded to the cursor
