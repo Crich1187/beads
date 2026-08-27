@@ -76,7 +76,7 @@ func TestMigrateUpWithLockUsesDatabaseScopedLockOnly(t *testing.T) {
 	defer conn.Close()
 
 	lockName := MigrationLockName("testdb")
-	expectConvergedFastPathMiss(mock)
+	expectConvergedFastPathMiss(mock, "testdb")
 	mock.ExpectQuery(regexp.QuoteMeta("SELECT GET_LOCK(?, ?)")).
 		WithArgs(lockName, migrationLockAcquireTimeoutSeconds).
 		WillReturnRows(sqlmock.NewRows([]string{"locked"}).AddRow(1))
@@ -112,7 +112,7 @@ func TestMigrateUpWithLockPreparationErrorReleasesAndJoinsReleaseFailure(t *test
 	defer conn.Close()
 
 	lockName := MigrationLockName("testdb")
-	expectConvergedFastPathMiss(mock)
+	expectConvergedFastPathMiss(mock, "testdb")
 	preparationErr := errors.New("bootstrap preparation failed")
 	mock.ExpectQuery(regexp.QuoteMeta("SELECT GET_LOCK(?, ?)")).
 		WithArgs(lockName, migrationLockAcquireTimeoutSeconds).
@@ -166,7 +166,7 @@ func TestMigrateUpWithLockMigrationErrorNotMaskedByReleaseFailure(t *testing.T) 
 	defer conn.Close()
 
 	lockName := MigrationLockName("testdb")
-	expectConvergedFastPathMiss(mock)
+	expectConvergedFastPathMiss(mock, "testdb")
 	mock.ExpectQuery(regexp.QuoteMeta("SELECT GET_LOCK(?, ?)")).
 		WithArgs(lockName, migrationLockAcquireTimeoutSeconds).
 		WillReturnRows(sqlmock.NewRows([]string{"locked"}).AddRow(1))
@@ -560,7 +560,7 @@ func TestMigrateUpWithLockDirtyGuardStaysFatalWithoutHeal(t *testing.T) {
 	defer conn.Close()
 
 	lockName := MigrationLockName("testdb")
-	expectConvergedFastPathMiss(mock)
+	expectConvergedFastPathMiss(mock, "testdb")
 	mock.ExpectQuery(regexp.QuoteMeta("SELECT GET_LOCK(?, ?)")).
 		WithArgs(lockName, migrationLockAcquireTimeoutSeconds).
 		WillReturnRows(sqlmock.NewRows([]string{"locked"}).AddRow(1))

@@ -10,6 +10,8 @@ import (
 	"strings"
 	"sync/atomic"
 	"time"
+
+	"github.com/steveyegge/beads/internal/debug"
 )
 
 const (
@@ -192,12 +194,23 @@ func MigrateUpWithLock(ctx context.Context, conn *sql.Conn, databaseName string,
 	// Skipped when the caller carries fresh-bootstrap heal authority: that
 	// capability is issued only to the init that just created the database, so
 	// there is nothing converged to detect and the bootstrap path stays
-	// exactly as it was. A caller's locked preparation is skipped only because
-	// alreadyConverged has proved the session is already on databaseName —
-	// preparation's CREATE DATABASE and USE have therefore already happened,
-	// and it captures no authority on a database it did not create.
+	// exactly as it was. A caller's locked preparation is skipped only once
+	// alreadyConverged has proved the database already existed and put the
+	// session on it — preparation's CREATE DATABASE would then have failed
+	// with "database exists" and captured no authority, and its USE is the
+	// statement alreadyConverged itself issued.
 	if o.freshBootstrapHeal == nil {
-		if converged, convergedErr := alreadyConverged(ctx, conn, databaseName); convergedErr == nil && converged {
+		converged, convergedErr := alreadyConverged(ctx, conn, databaseName)
+		switch {
+		case convergedErr != nil:
+			// Advisory only: the probe fails closed onto the locked path
+			// below, so this is never fatal. But a silently discarded error is
+			// a fast path that has quietly stopped firing — the exact failure
+			// mode that leaves the GET_LOCK saturation this exists to remove
+			// looking like a mystery. Say so where BD_DEBUG/-v can see it.
+			debug.Logf("schema: convergence fast path unavailable for %q, taking the migration lock: %v\n",
+				databaseName, convergedErr)
+		case converged:
 			return 0, nil
 		}
 	}
