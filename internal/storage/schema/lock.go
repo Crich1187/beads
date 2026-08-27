@@ -57,6 +57,7 @@ type MigrateLockOption func(*migrateLockOptions)
 type migrateLockOptions struct {
 	freshBootstrapHeal *freshBootstrapHealRequest
 	lockedPreparation  *lockedPreparationRequest
+	databaseSelector   DatabaseSelector
 }
 
 type freshBootstrapHealRequest struct {
@@ -171,6 +172,38 @@ func WithLockedPreparation(endpoint string, fn LockedPreparation) MigrateLockOpt
 	}
 }
 
+// DatabaseSelector puts a pinned session on databaseName for the pre-lock
+// convergence probe and returns the identifier-quoted name the probe uses to
+// schema-qualify its reads. Returning an error, like everything else in the
+// probe, fails closed onto the locked path.
+//
+// It is injected rather than implemented here on purpose. Selecting a database
+// and quoting an identifier belong to the DDL repository in
+// internal/storage/domain/db — but that package's own test suite migrates a
+// scratch database with this package, so a schema -> domain/db import compiles
+// as a library and then fails the domain/db TEST build with "import cycle not
+// allowed in test". Inverting the dependency lets the one caller that needs
+// the probe to reach an unselected session hand in the repository's real
+// implementation, so the fast path still issues preparation's exact statement
+// without this package depending on it.
+type DatabaseSelector func(ctx context.Context, conn DBConn, databaseName string) (quotedName string, err error)
+
+// WithDatabaseSelector lets the convergence probe put the pinned session on
+// the target database itself.
+//
+// Without it the probe cannot issue USE, so it declines unless the session is
+// already on databaseName — correct for callers whose pool DSN already names
+// the database (internal/storage/dolt). The proxied CLI open is the caller
+// that needs it: it pins its schema-init pool with an EMPTY DSN database and
+// USEs only inside the locked preparation, so an uninjected probe would read
+// NULL from DATABASE() and decline on every single invocation, which is
+// exactly the defect this option exists to close.
+func WithDatabaseSelector(fn DatabaseSelector) MigrateLockOption {
+	return func(o *migrateLockOptions) {
+		o.databaseSelector = fn
+	}
+}
+
 // MigrateUpWithLock serializes schema migrations for a single Dolt sql-server
 // database. conn must be a pinned *sql.Conn because MySQL/Dolt named locks are
 // session-scoped; GET_LOCK, migrations, and RELEASE_LOCK must run on the same
@@ -200,7 +233,7 @@ func MigrateUpWithLock(ctx context.Context, conn *sql.Conn, databaseName string,
 	// with "database exists" and captured no authority, and its USE is the
 	// statement alreadyConverged itself issued.
 	if o.freshBootstrapHeal == nil {
-		converged, convergedErr := alreadyConverged(ctx, conn, databaseName)
+		converged, convergedErr := alreadyConverged(ctx, conn, databaseName, o.databaseSelector)
 		switch {
 		case convergedErr != nil:
 			// Advisory only: the probe fails closed onto the locked path

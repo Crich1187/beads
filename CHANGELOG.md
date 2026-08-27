@@ -197,7 +197,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   steady-state question first, without the lock — it puts the session on the
   target database (proving the database exists before issuing any statement
   that could fail, so a fresh bootstrap still falls through to the locked
-  `CREATE DATABASE`), then asks whether both migration cursors are at this
+  `CREATE DATABASE`; callers whose pool already names the database inject
+  nothing and the probe simply declines a session that is elsewhere), then
+  asks whether both migration cursors are at this
   binary's latest with the content-hash column and custom-status/type backfills
   done, whether all the canonical `dolt_ignore` patterns are present, and
   finally whether the migration lock is free — and takes `GET_LOCK` only on the

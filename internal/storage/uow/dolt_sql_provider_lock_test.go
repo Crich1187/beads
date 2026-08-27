@@ -201,3 +201,52 @@ func TestInitSchemaConvergenceProbeRunsWithNoSessionDatabase(t *testing.T) {
 		t.Fatalf("the convergence probe must reach the schema predicates on a session with no database selected: %v", err)
 	}
 }
+
+// TestSelectProbeDatabaseIssuesPreparationsUse pins the two properties the
+// convergence probe borrows from this injection site and cannot check for
+// itself: the statement is the DDL repository's own UseDatabase (identical to
+// what prepareBootstrap issues, which is why a converged probe may skip locked
+// preparation), and the name is validated and quoted by that same repository
+// BEFORE any statement goes out.
+func TestSelectProbeDatabaseIssuesPreparationsUse(t *testing.T) {
+	t.Run("valid name", func(t *testing.T) {
+		db, mock, err := sqlmock.New()
+		if err != nil {
+			t.Fatalf("create sql mock: %v", err)
+		}
+		defer db.Close()
+
+		mock.ExpectExec(regexp.QuoteMeta("USE `beads`")).
+			WillReturnResult(sqlmock.NewResult(0, 0))
+
+		quoted, err := selectProbeDatabase(context.Background(), db, "beads")
+		if err != nil {
+			t.Fatalf("selectProbeDatabase() error = %v", err)
+		}
+		if quoted != "`beads`" {
+			t.Fatalf("selectProbeDatabase() quoted = %q, want %q", quoted, "`beads`")
+		}
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Fatalf("unmet SQL expectations: %v", err)
+		}
+	})
+
+	t.Run("invalid name", func(t *testing.T) {
+		db, mock, err := sqlmock.New()
+		if err != nil {
+			t.Fatalf("create sql mock: %v", err)
+		}
+		defer db.Close()
+
+		quoted, err := selectProbeDatabase(context.Background(), db, "bad`name")
+		if err == nil {
+			t.Fatal("selectProbeDatabase() error = nil, want the identifier rejection")
+		}
+		if quoted != "" {
+			t.Fatalf("selectProbeDatabase() quoted = %q, want empty", quoted)
+		}
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Fatalf("unmet SQL expectations (an invalid name must be refused before any statement): %v", err)
+		}
+	})
+}

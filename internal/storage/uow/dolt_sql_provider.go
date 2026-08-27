@@ -163,6 +163,36 @@ func (p *doltSQLProvider) BeginTx(ctx context.Context) (Tx, error) {
 	}, nil
 }
 
+// selectProbeDatabase lets schema's pre-lock convergence probe reach the
+// database on a session that is not yet on one. openAndInitSchema pins its
+// schema-init pool with an EMPTY DSN database, so without this the probe reads
+// NULL from DATABASE(), declines, and every invocation queues on the
+// server-wide migration lock it exists to skip.
+//
+// The USE MUST remain the DDL repository's own UseDatabase — the exact
+// statement prepareBootstrap issues below. That identity is the reason the
+// probe may skip locked preparation when it reports converged: preparation's
+// contribution on an existing database is precisely this USE (its bare CREATE
+// DATABASE can only have failed with "database exists" and captured no heal
+// authority). Reimplementing the statement here, or letting the two quote
+// identifiers differently, would silently break that argument.
+//
+// It is injected rather than reached for from schema/: domain/db's own test
+// suite migrates a scratch database with schema, so a schema -> domain/db
+// import compiles as a library and then fails the domain/db TEST build with
+// "import cycle not allowed in test". uow already depends on both, so the
+// dependency is legal exactly here.
+func selectProbeDatabase(ctx context.Context, conn schema.DBConn, database string) (string, error) {
+	quoted, err := db.QuoteIdentifier(database)
+	if err != nil {
+		return "", err
+	}
+	if err := db.NewDDLSQLRepository(conn).UseDatabase(ctx, database); err != nil {
+		return "", err
+	}
+	return quoted, nil
+}
+
 func (p *doltSQLProvider) initSchema(ctx context.Context, database string) error {
 	bo := backoff.NewExponentialBackOff()
 	bo.InitialInterval = 25 * time.Millisecond
@@ -292,6 +322,7 @@ func (p *doltSQLProvider) initSchema(ctx context.Context, database string) error
 			return nil
 		}
 		if _, err := schema.MigrateUpWithLock(ctx, conn, database,
+			schema.WithDatabaseSelector(selectProbeDatabase),
 			schema.WithLockedPreparation(p.serverEndpoint, prepareBootstrap)); err != nil {
 			return classifyInitSchemaError(err)
 		}

@@ -6,7 +6,6 @@ import (
 	"fmt"
 
 	"github.com/steveyegge/beads/internal/storage/dberrors"
-	domaindb "github.com/steveyegge/beads/internal/storage/domain/db"
 )
 
 // alreadyConverged reports whether databaseName is already at this binary's
@@ -32,7 +31,7 @@ import (
 // check existed. A false negative costs one ordinary locked pass; false
 // positives are avoided by evaluating the same predicates MigrateUp itself
 // evaluates, on the same pinned session, with no writes of its own.
-func alreadyConverged(ctx context.Context, db DBConn, databaseName string) (bool, error) {
+func alreadyConverged(ctx context.Context, db DBConn, databaseName string, selector DatabaseSelector) (bool, error) {
 	if databaseName == "" {
 		return false, nil
 	}
@@ -43,7 +42,7 @@ func alreadyConverged(ctx context.Context, db DBConn, databaseName string) (bool
 	// that merely ASKED whether the session was already on databaseName read
 	// NULL from DATABASE() and declined on every single invocation: the fast
 	// path never fired where it was needed.
-	onTarget, err := selectTargetDatabase(ctx, db, databaseName)
+	onTarget, qualifier, err := selectTargetDatabase(ctx, db, databaseName, selector)
 	if err != nil {
 		return false, err
 	}
@@ -72,7 +71,7 @@ func alreadyConverged(ctx context.Context, db DBConn, databaseName string) (bool
 	// cursor is at or past mainSource.latest(); every version-gated pattern's
 	// flip migration is part of that embedded set, so the gate can be
 	// evaluated against latest() with no second cursor read.
-	seeded, err := doltIgnoreSeeded(ctx, db, databaseName, mainSource.latest())
+	seeded, err := doltIgnoreSeeded(ctx, db, qualifier, mainSource.latest())
 	if err != nil {
 		return false, err
 	}
@@ -96,29 +95,44 @@ func alreadyConverged(ctx context.Context, db DBConn, databaseName string) (bool
 }
 
 // selectTargetDatabase puts the pinned session on databaseName, reporting
-// whether it is now provably there. A database that does not exist yet is a
-// fresh bootstrap: report false so the caller falls through to the locked
-// path, whose CREATE DATABASE arbitrates creation and issues the #5012
-// fresh-bootstrap heal capability.
+// whether it is now provably there and — when a selector had to be used to get
+// there — the identifier-quoted name to schema-qualify later reads with.
 //
-// This is what makes skipping a caller's locked bootstrap preparation safe:
-// preparation creates the database and USEs it, and both have provably
-// happened here — the database existed before we touched it (so preparation's
-// bare CREATE DATABASE could only have failed with "database exists" and
-// captured no heal authority), and the USE below is the same statement
-// preparation would issue.
+// A session already on databaseName needs nothing: it is provably on the
+// target because DATABASE() was just read and matched, and later reads may
+// therefore run unqualified against it. An empty qualifier means exactly that.
+//
+// Without a selector the probe may not issue USE at all, so a session on any
+// other database (or on none) is declined. That is the whole behavior for
+// callers whose pool DSN already names the database (internal/storage/dolt),
+// and it keeps this package free of the DDL repository it would otherwise need
+// (see DatabaseSelector for why that import cannot exist).
+//
+// A database that does not exist yet is a fresh bootstrap: report false so the
+// caller falls through to the locked path, whose CREATE DATABASE arbitrates
+// creation and issues the #5012 fresh-bootstrap heal capability.
+//
+// Selecting is also what makes skipping a caller's locked bootstrap
+// preparation safe: preparation creates the database and USEs it, and both
+// have provably happened here — the database existed before we touched it (so
+// preparation's bare CREATE DATABASE could only have failed with "database
+// exists" and captured no heal authority), and the selector issues the same
+// USE preparation would.
 //
 // The existence probe is not decoration. A Dolt session that issues a FAILING
 // statement stays pinned to its pre-statement catalog snapshot, so a USE of a
 // not-yet-created database would poison this pooled connection for the rest of
 // its life (be-bv7x). Probe with a query that always succeeds, then act.
-func selectTargetDatabase(ctx context.Context, db DBConn, databaseName string) (bool, error) {
+func selectTargetDatabase(ctx context.Context, db DBConn, databaseName string, selector DatabaseSelector) (bool, string, error) {
 	var current sql.NullString
 	if err := db.QueryRowContext(ctx, "SELECT DATABASE()").Scan(&current); err != nil {
-		return false, fmt.Errorf("reading current database: %w", err)
+		return false, "", fmt.Errorf("reading current database: %w", err)
 	}
 	if current.Valid && current.String == databaseName {
-		return true, nil
+		return true, "", nil
+	}
+	if selector == nil {
+		return false, "", nil
 	}
 
 	var exists int
@@ -126,18 +140,20 @@ func selectTargetDatabase(ctx context.Context, db DBConn, databaseName string) (
 		"SELECT COUNT(*) FROM information_schema.schemata WHERE schema_name = ?",
 		databaseName,
 	).Scan(&exists); err != nil {
-		return false, fmt.Errorf("probing database %q existence: %w", databaseName, err)
+		return false, "", fmt.Errorf("probing database %q existence: %w", databaseName, err)
 	}
 	if exists == 0 {
-		return false, nil
+		return false, "", nil
 	}
 
-	// Same repository, same validation, same statement text as the bootstrap
-	// preparation's own USE, so the fast path cannot drift from it.
-	if err := domaindb.NewDDLSQLRepository(db).UseDatabase(ctx, databaseName); err != nil {
-		return false, fmt.Errorf("selecting database %q: %w", databaseName, err)
+	quoted, err := selector(ctx, db, databaseName)
+	if err != nil {
+		return false, "", fmt.Errorf("selecting database %q: %w", databaseName, err)
 	}
-	return true, nil
+	if quoted == "" {
+		return false, "", fmt.Errorf("selecting database %q: selector returned no quoted name", databaseName)
+	}
+	return true, quoted, nil
 }
 
 // migrationLockFree reports whether the database-scoped migration lock is
@@ -171,21 +187,26 @@ func migrationLockFree(ctx context.Context, db DBConn, lockName string) (bool, e
 // with ignored=false) untouched. Reporting such a row as missing would send
 // every invocation down the locked path forever.
 //
-// The read is schema-qualified. dolt_ignore is a Dolt system table: it is NOT
+// qualifier is the identifier-quoted database name selectTargetDatabase
+// returned, or empty when the session was already on the target database and
+// nothing needed selecting. dolt_ignore is a Dolt system table: it is NOT
 // listed in information_schema.tables (verified against a live dolt sql-server
 // — the cursor-table existence probe pattern from migrationSource.currentVersion
 // would report it absent and disable the fast path permanently), so this read
 // cannot get the full be-bv7x probe-before-act treatment at table granularity.
-// What it has instead: the schemata probe in selectTargetDatabase has already
-// proved the DATABASE exists, Dolt materializes dolt_ignore on every real
-// database (live-verified), the name is validated and stated explicitly
-// instead of depending on session state, and IsTableNotExist below fails
-// closed onto the locked path should that materialization assumption break.
-func doltIgnoreSeeded(ctx context.Context, db DBConn, databaseName string, mainVersionAtLeast int) (bool, error) {
-	if err := domaindb.ValidateIdentifier(databaseName); err != nil {
-		return false, fmt.Errorf("reading dolt_ignore: %w", err)
+// What it has instead: selectTargetDatabase has already proved this session is
+// on the target database (by reading DATABASE(), or by probing
+// information_schema.schemata and selecting it), Dolt materializes dolt_ignore
+// on every real database (live-verified), the name is stated explicitly
+// whenever one was quoted for us rather than re-derived here, and
+// IsTableNotExist below fails closed onto the locked path should that
+// materialization assumption break.
+func doltIgnoreSeeded(ctx context.Context, db DBConn, qualifier string, mainVersionAtLeast int) (bool, error) {
+	table := "dolt_ignore"
+	if qualifier != "" {
+		table = qualifier + ".dolt_ignore"
 	}
-	rows, err := db.QueryContext(ctx, "SELECT pattern FROM `"+databaseName+"`.dolt_ignore")
+	rows, err := db.QueryContext(ctx, "SELECT pattern FROM "+table)
 	if err != nil {
 		if dberrors.IsTableNotExist(err) {
 			return false, nil

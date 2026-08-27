@@ -32,6 +32,26 @@ func expectConvergedFastPathMiss(mock sqlmock.Sqlmock, database string) {
 	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM schema_migrations", "version", LatestVersion()-1)
 }
 
+// testDatabaseSelector stands in for the selector uow injects: it issues the
+// same USE through the same connection and returns the same quoted name, so
+// the mocked statement stream matches production byte for byte.
+var testDatabaseSelector DatabaseSelector = func(ctx context.Context, conn DBConn, database string) (string, error) {
+	quoted := "`" + database + "`"
+	if _, err := conn.ExecContext(ctx, "USE "+quoted); err != nil {
+		return "", err
+	}
+	return quoted, nil
+}
+
+// qualifiedDoltIgnore is the table expression the probe reads after a selector
+// put the session on database; unqualifiedDoltIgnore is what it reads when the
+// session was already there and nothing had to be selected.
+func qualifiedDoltIgnore(database string) string {
+	return "`" + database + "`.dolt_ignore"
+}
+
+const unqualifiedDoltIgnore = "dolt_ignore"
+
 // expectCurrentDatabase mocks the fast path's opening question: which database
 // is this pinned session actually on?
 func expectCurrentDatabase(mock sqlmock.Sqlmock, name any) {
@@ -88,12 +108,12 @@ func expectNoMigrationWorkNeededAtVersion(mock sqlmock.Sqlmock, mainVersion int)
 // cannot carry the cursor tables' existence probe) and takes no cursor read of
 // its own: migrationWorkNeeded has already proved the main cursor is at or
 // past this binary's latest, which settles every version gate.
-func expectDoltIgnoreRead(mock sqlmock.Sqlmock, database string, patterns []string) {
+func expectDoltIgnoreRead(mock sqlmock.Sqlmock, table string, patterns []string) {
 	rows := sqlmock.NewRows([]string{"pattern"})
 	for _, pattern := range patterns {
 		rows.AddRow(pattern)
 	}
-	mock.ExpectQuery(regexp.QuoteMeta("SELECT pattern FROM `" + database + "`.dolt_ignore")).
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT pattern FROM " + table)).
 		WillReturnRows(rows)
 }
 
@@ -118,11 +138,12 @@ func seededIgnorePatterns(mainVersion int) []string {
 }
 
 // expectConvergedProbe mocks the whole fast path on a converged database whose
-// session is already on it.
+// session is already on it: nothing is selected, so the dolt_ignore read runs
+// unqualified against the session database DATABASE() just confirmed.
 func expectConvergedProbe(mock sqlmock.Sqlmock, database string) {
 	expectCurrentDatabase(mock, database)
 	expectNoMigrationWorkNeeded(mock)
-	expectDoltIgnoreRead(mock, database, seededIgnorePatterns(LatestVersion()))
+	expectDoltIgnoreRead(mock, unqualifiedDoltIgnore, seededIgnorePatterns(LatestVersion()))
 	expectMigrationLockProbe(mock, database, 1)
 }
 
@@ -194,19 +215,22 @@ func TestMigrateUpWithLockSkipsLockWhenAlreadyConverged(t *testing.T) {
 // database therefore declined every single time and the lock was taken exactly
 // as before — the whole change was a no-op on the only path that mattered.
 //
-// The probe must instead establish the database: prove it exists with a query
-// that cannot fail, USE it, and only then evaluate the schema predicates.
+// The probe must instead establish the database through the injected
+// selector: prove it exists with a query that cannot fail, USE it, and only
+// then evaluate the schema predicates — reading dolt_ignore under the name the
+// selector quoted.
 func TestMigrateUpWithLockSkipsLockOnAnUnselectedSession(t *testing.T) {
 	conn, mock, cleanup := newMockConn(t)
 	defer cleanup()
 
 	expectSessionPutOnDatabase(mock, "testdb")
 	expectNoMigrationWorkNeeded(mock)
-	expectDoltIgnoreRead(mock, "testdb", seededIgnorePatterns(LatestVersion()))
+	expectDoltIgnoreRead(mock, qualifiedDoltIgnore("testdb"), seededIgnorePatterns(LatestVersion()))
 	expectMigrationLockProbe(mock, "testdb", 1)
 
 	prepared := 0
 	applied, err := MigrateUpWithLock(context.Background(), conn, "testdb",
+		WithDatabaseSelector(testDatabaseSelector),
 		WithLockedPreparation("tcp:test", func(context.Context, *sql.Conn) (*FreshBootstrapHealCapability, error) {
 			prepared++
 			return nil, nil
@@ -305,7 +329,7 @@ func TestAlreadyConvergedFallsThroughOnAMissingDatabase(t *testing.T) {
 	expectCurrentDatabase(mock, nil)
 	expectDatabaseExistsProbe(mock, "testdb", false)
 
-	converged, err := alreadyConverged(context.Background(), db, "testdb")
+	converged, err := alreadyConverged(context.Background(), db, "testdb", testDatabaseSelector)
 	if err != nil {
 		t.Fatalf("alreadyConverged() error = %v", err)
 	}
@@ -317,14 +341,50 @@ func TestAlreadyConvergedFallsThroughOnAMissingDatabase(t *testing.T) {
 	}
 }
 
-// TestAlreadyConvergedFailsClosedOnDatabaseSelection covers the two ways
-// putting the session on the target database can go wrong. Both must surface
-// as "not converged" so MigrateUpWithLock takes the lock.
+// TestAlreadyConvergedWithoutASelectorNeverSelects pins the default for
+// callers that inject nothing. The probe has no legal way to issue USE on its
+// own — selecting a database and quoting an identifier belong to the DDL
+// repository, which this package cannot import without breaking that package's
+// test build — so a session that is not already on the target is simply
+// declined, exactly as it was before the selector existed. That is the whole
+// behavior for internal/storage/dolt, whose pool DSN already names the
+// database; the mock is primed with nothing after DATABASE(), so an existence
+// probe or a USE would surface as an unexpected statement.
+func TestAlreadyConvergedWithoutASelectorNeverSelects(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		current any
+	}{
+		{name: "no database selected", current: nil},
+		{name: "different database", current: "otherdb"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			db, mock := newMockDB(t)
+
+			expectCurrentDatabase(mock, tt.current)
+
+			converged, err := alreadyConverged(context.Background(), db, "testdb", nil)
+			if err != nil {
+				t.Fatalf("alreadyConverged() error = %v", err)
+			}
+			if converged {
+				t.Fatal("alreadyConverged() = true without a selector and off the target database, want false")
+			}
+			if err := mock.ExpectationsWereMet(); err != nil {
+				t.Fatalf("unmet SQL expectations (an uninjected probe must not probe or select): %v", err)
+			}
+		})
+	}
+}
+
+// TestAlreadyConvergedFailsClosedOnDatabaseSelection covers the ways putting
+// the session on the target database can go wrong. All must surface as "not
+// converged" so MigrateUpWithLock takes the lock.
 func TestAlreadyConvergedFailsClosedOnDatabaseSelection(t *testing.T) {
 	t.Run("empty database name", func(t *testing.T) {
 		db, mock := newMockDB(t)
 
-		converged, err := alreadyConverged(context.Background(), db, "")
+		converged, err := alreadyConverged(context.Background(), db, "", nil)
 		if err != nil {
 			t.Fatalf("alreadyConverged() error = %v", err)
 		}
@@ -342,7 +402,7 @@ func TestAlreadyConvergedFailsClosedOnDatabaseSelection(t *testing.T) {
 		mock.ExpectQuery(regexp.QuoteMeta("SELECT DATABASE()")).
 			WillReturnError(sql.ErrConnDone)
 
-		converged, err := alreadyConverged(context.Background(), db, "testdb")
+		converged, err := alreadyConverged(context.Background(), db, "testdb", nil)
 		if err == nil {
 			t.Fatal("alreadyConverged() error = nil, want the DATABASE() read failure")
 		}
@@ -351,7 +411,7 @@ func TestAlreadyConvergedFailsClosedOnDatabaseSelection(t *testing.T) {
 		}
 	})
 
-	t.Run("use fails", func(t *testing.T) {
+	t.Run("selector's use fails", func(t *testing.T) {
 		db, mock := newMockDB(t)
 
 		expectCurrentDatabase(mock, nil)
@@ -359,12 +419,57 @@ func TestAlreadyConvergedFailsClosedOnDatabaseSelection(t *testing.T) {
 		mock.ExpectExec(regexp.QuoteMeta("USE `testdb`")).
 			WillReturnError(errors.New("database dropped underneath us"))
 
-		converged, err := alreadyConverged(context.Background(), db, "testdb")
+		converged, err := alreadyConverged(context.Background(), db, "testdb", testDatabaseSelector)
 		if err == nil {
 			t.Fatal("alreadyConverged() error = nil, want the USE failure")
 		}
 		if converged {
 			t.Fatal("alreadyConverged() = true after a failed USE, want false")
+		}
+	})
+
+	t.Run("selector rejects the name", func(t *testing.T) {
+		db, mock := newMockDB(t)
+
+		expectCurrentDatabase(mock, nil)
+		expectDatabaseExistsProbe(mock, "bad`name", true)
+		rejecting := DatabaseSelector(func(context.Context, DBConn, string) (string, error) {
+			return "", errors.New("invalid identifier")
+		})
+
+		converged, err := alreadyConverged(context.Background(), db, "bad`name", rejecting)
+		if err == nil {
+			t.Fatal("alreadyConverged() error = nil, want the identifier rejection")
+		}
+		if converged {
+			t.Fatal("alreadyConverged() = true on a name the selector refused, want false")
+		}
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Fatalf("unmet SQL expectations (a refused name must issue no USE): %v", err)
+		}
+	})
+
+	// A selector that reports success without handing back a quoted name would
+	// leave the dolt_ignore read to guess at qualification. Nothing downstream
+	// may run on that: refuse it here.
+	t.Run("selector returns no quoted name", func(t *testing.T) {
+		db, mock := newMockDB(t)
+
+		expectCurrentDatabase(mock, nil)
+		expectDatabaseExistsProbe(mock, "testdb", true)
+		silent := DatabaseSelector(func(context.Context, DBConn, string) (string, error) {
+			return "", nil
+		})
+
+		converged, err := alreadyConverged(context.Background(), db, "testdb", silent)
+		if err == nil {
+			t.Fatal("alreadyConverged() error = nil, want the empty-name refusal")
+		}
+		if converged {
+			t.Fatal("alreadyConverged() = true on a selector that quoted nothing, want false")
+		}
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Fatalf("unmet SQL expectations: %v", err)
 		}
 	})
 }
@@ -390,10 +495,10 @@ func TestAlreadyConvergedDeclinesWhileTheMigrationLockIsHeld(t *testing.T) {
 
 			expectCurrentDatabase(mock, "testdb")
 			expectNoMigrationWorkNeeded(mock)
-			expectDoltIgnoreRead(mock, "testdb", seededIgnorePatterns(LatestVersion()))
+			expectDoltIgnoreRead(mock, unqualifiedDoltIgnore, seededIgnorePatterns(LatestVersion()))
 			expectMigrationLockProbe(mock, "testdb", tt.free)
 
-			converged, err := alreadyConverged(context.Background(), db, "testdb")
+			converged, err := alreadyConverged(context.Background(), db, "testdb", nil)
 			if err != nil {
 				t.Fatalf("alreadyConverged() error = %v", err)
 			}
@@ -419,7 +524,7 @@ func TestAlreadyConvergedProbesTheLockLast(t *testing.T) {
 	expectCursorProbe(mock, "schema_migrations", true)
 	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM schema_migrations", "version", LatestVersion()-1)
 
-	converged, err := alreadyConverged(context.Background(), db, "testdb")
+	converged, err := alreadyConverged(context.Background(), db, "testdb", nil)
 	if err != nil {
 		t.Fatalf("alreadyConverged() error = %v", err)
 	}
@@ -448,14 +553,47 @@ func TestAlreadyConvergedRejectsUnderSeededDoltIgnore(t *testing.T) {
 			}
 			expectCurrentDatabase(mock, "testdb")
 			expectNoMigrationWorkNeeded(mock)
-			expectDoltIgnoreRead(mock, "testdb", present)
+			expectDoltIgnoreRead(mock, unqualifiedDoltIgnore, present)
 
-			converged, err := alreadyConverged(context.Background(), db, "testdb")
+			converged, err := alreadyConverged(context.Background(), db, "testdb", nil)
 			if err != nil {
 				t.Fatalf("alreadyConverged() error = %v", err)
 			}
 			if converged {
 				t.Fatalf("alreadyConverged() = true with dolt_ignore pattern %q missing, want false", missing)
+			}
+		})
+	}
+}
+
+// TestDoltIgnoreSeededQualifiesOnlyWhatWasSelected pins where the read's
+// database name comes from. When a selector put the session on the database it
+// hands back the quoted name and the read states it; when the session was
+// already there, DATABASE() itself was the proof and the read is
+// session-scoped. The probe never re-derives or re-quotes a name of its own —
+// that rule is what let the domain/db import go.
+func TestDoltIgnoreSeededQualifiesOnlyWhatWasSelected(t *testing.T) {
+	for _, tt := range []struct {
+		name      string
+		qualifier string
+		table     string
+	}{
+		{name: "selected", qualifier: "`testdb`", table: qualifiedDoltIgnore("testdb")},
+		{name: "already on the database", qualifier: "", table: unqualifiedDoltIgnore},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			db, mock := newMockDB(t)
+			expectDoltIgnoreRead(mock, tt.table, seededIgnorePatterns(LatestVersion()))
+
+			seeded, err := doltIgnoreSeeded(context.Background(), db, tt.qualifier, mainSource.latest())
+			if err != nil {
+				t.Fatalf("doltIgnoreSeeded() error = %v", err)
+			}
+			if !seeded {
+				t.Fatal("doltIgnoreSeeded() = false on a fully seeded database, want true")
+			}
+			if err := mock.ExpectationsWereMet(); err != nil {
+				t.Fatalf("unmet SQL expectations: %v", err)
 			}
 		})
 	}
@@ -473,9 +611,9 @@ func TestDoltIgnoreSeededHonorsTheVersionGate(t *testing.T) {
 
 			t.Run("below the gate", func(t *testing.T) {
 				db, mock := newMockDB(t)
-				expectDoltIgnoreRead(mock, "testdb", ungated)
+				expectDoltIgnoreRead(mock, unqualifiedDoltIgnore, ungated)
 
-				seeded, err := doltIgnoreSeeded(context.Background(), db, "testdb", gated.minMainVersion-1)
+				seeded, err := doltIgnoreSeeded(context.Background(), db, "", gated.minMainVersion-1)
 				if err != nil {
 					t.Fatalf("doltIgnoreSeeded() error = %v", err)
 				}
@@ -490,9 +628,9 @@ func TestDoltIgnoreSeededHonorsTheVersionGate(t *testing.T) {
 
 			t.Run("at the gate", func(t *testing.T) {
 				db, mock := newMockDB(t)
-				expectDoltIgnoreRead(mock, "testdb", ungated)
+				expectDoltIgnoreRead(mock, unqualifiedDoltIgnore, ungated)
 
-				seeded, err := doltIgnoreSeeded(context.Background(), db, "testdb", gated.minMainVersion)
+				seeded, err := doltIgnoreSeeded(context.Background(), db, "", gated.minMainVersion)
 				if err != nil {
 					t.Fatalf("doltIgnoreSeeded() error = %v", err)
 				}
@@ -516,10 +654,10 @@ func TestAlreadyConvergedAcceptsOverriddenIgnorePattern(t *testing.T) {
 	expectNoMigrationWorkNeeded(mock)
 	// The probe selects patterns only; the mock never offers the ignored
 	// column, so a query that filtered on it would not match this expectation.
-	expectDoltIgnoreRead(mock, "testdb", seededIgnorePatterns(LatestVersion()))
+	expectDoltIgnoreRead(mock, unqualifiedDoltIgnore, seededIgnorePatterns(LatestVersion()))
 	expectMigrationLockProbe(mock, "testdb", 1)
 
-	converged, err := alreadyConverged(context.Background(), db, "testdb")
+	converged, err := alreadyConverged(context.Background(), db, "testdb", nil)
 	if err != nil {
 		t.Fatalf("alreadyConverged() error = %v", err)
 	}
@@ -545,10 +683,10 @@ func TestAlreadyConvergedOnForwardSkew(t *testing.T) {
 	ahead := LatestVersion() + 5
 	expectCurrentDatabase(mock, "testdb")
 	expectNoMigrationWorkNeededAtVersion(mock, ahead)
-	expectDoltIgnoreRead(mock, "testdb", seededIgnorePatterns(ahead))
+	expectDoltIgnoreRead(mock, unqualifiedDoltIgnore, seededIgnorePatterns(ahead))
 	expectMigrationLockProbe(mock, "testdb", 1)
 
-	converged, err := alreadyConverged(context.Background(), db, "testdb")
+	converged, err := alreadyConverged(context.Background(), db, "testdb", nil)
 	if err != nil {
 		t.Fatalf("alreadyConverged() error = %v", err)
 	}
@@ -573,7 +711,7 @@ func TestAlreadyConvergedFailsClosedOnUnreadableState(t *testing.T) {
 		mock.ExpectQuery(`SELECT COUNT\(\*\) FROM information_schema\.tables`).
 			WillReturnError(sql.ErrConnDone)
 
-		converged, err := alreadyConverged(context.Background(), db, "testdb")
+		converged, err := alreadyConverged(context.Background(), db, "testdb", nil)
 		if err != nil {
 			t.Fatalf("alreadyConverged() error = %v", err)
 		}
@@ -587,10 +725,10 @@ func TestAlreadyConvergedFailsClosedOnUnreadableState(t *testing.T) {
 
 		expectCurrentDatabase(mock, "testdb")
 		expectNoMigrationWorkNeeded(mock)
-		mock.ExpectQuery(regexp.QuoteMeta("SELECT pattern FROM `testdb`.dolt_ignore")).
+		mock.ExpectQuery(regexp.QuoteMeta("SELECT pattern FROM dolt_ignore")).
 			WillReturnError(sql.ErrConnDone)
 
-		converged, err := alreadyConverged(context.Background(), db, "testdb")
+		converged, err := alreadyConverged(context.Background(), db, "testdb", nil)
 		if err == nil {
 			t.Fatal("alreadyConverged() error = nil, want the dolt_ignore read failure")
 		}
@@ -604,11 +742,11 @@ func TestAlreadyConvergedFailsClosedOnUnreadableState(t *testing.T) {
 
 		expectCurrentDatabase(mock, "testdb")
 		expectNoMigrationWorkNeeded(mock)
-		expectDoltIgnoreRead(mock, "testdb", seededIgnorePatterns(LatestVersion()))
+		expectDoltIgnoreRead(mock, unqualifiedDoltIgnore, seededIgnorePatterns(LatestVersion()))
 		mock.ExpectQuery(regexp.QuoteMeta("SELECT IS_FREE_LOCK(?)")).
 			WillReturnError(sql.ErrConnDone)
 
-		converged, err := alreadyConverged(context.Background(), db, "testdb")
+		converged, err := alreadyConverged(context.Background(), db, "testdb", nil)
 		if err == nil {
 			t.Fatal("alreadyConverged() error = nil, want the lock probe failure")
 		}
@@ -617,20 +755,6 @@ func TestAlreadyConvergedFailsClosedOnUnreadableState(t *testing.T) {
 		}
 	})
 
-	t.Run("unquotable database name", func(t *testing.T) {
-		db, mock := newMockDB(t)
-
-		expectCurrentDatabase(mock, "bad`name")
-		expectNoMigrationWorkNeeded(mock)
-
-		converged, err := alreadyConverged(context.Background(), db, "bad`name")
-		if err == nil {
-			t.Fatal("alreadyConverged() error = nil, want the identifier rejection")
-		}
-		if converged {
-			t.Fatal("alreadyConverged() = true on an unquotable database name, want false")
-		}
-	})
 }
 
 // TestMigrateUpWithLockLogsAnUnavailableFastPath pins the diagnostic on the
