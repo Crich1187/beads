@@ -174,11 +174,13 @@ func migrationLockFree(ctx context.Context, db DBConn, lockName string) (bool, e
 // The read is schema-qualified. dolt_ignore is a Dolt system table: it is NOT
 // listed in information_schema.tables (verified against a live dolt sql-server
 // — the cursor-table existence probe pattern from migrationSource.currentVersion
-// would report it absent and disable the fast path permanently), so the
-// be-bv7x guarantee here comes from the always-succeeding
-// information_schema.schemata probe in selectTargetDatabase, which proves the
-// database exists before any statement that could fail is issued, and from
-// naming the database explicitly instead of depending on session state.
+// would report it absent and disable the fast path permanently), so this read
+// cannot get the full be-bv7x probe-before-act treatment at table granularity.
+// What it has instead: the schemata probe in selectTargetDatabase has already
+// proved the DATABASE exists, Dolt materializes dolt_ignore on every real
+// database (live-verified), the name is validated and stated explicitly
+// instead of depending on session state, and IsTableNotExist below fails
+// closed onto the locked path should that materialization assumption break.
 func doltIgnoreSeeded(ctx context.Context, db DBConn, databaseName string, mainVersionAtLeast int) (bool, error) {
 	if err := domaindb.ValidateIdentifier(databaseName); err != nil {
 		return false, fmt.Errorf("reading dolt_ignore: %w", err)

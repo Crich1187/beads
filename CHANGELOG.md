@@ -204,7 +204,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   path that can actually migrate. That last term is what keeps the probe honest
   while a peer is mid-pass: the cursors land before the backfills and rekeys
   finish, so a held lock, not the cursors alone, is the proof that nobody is
-  rewriting the tables underneath this caller. The probe is read-only and fails
+  rewriting the tables underneath this caller. The probe issues no writes —
+  its one session mutation is the `USE` that pins the target database — and fails
   closed: any error, any unreadable state, and anything short of provably
   converged falls through to the locked path unchanged, as does any caller
   carrying fresh-bootstrap heal authority.
