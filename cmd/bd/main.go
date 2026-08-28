@@ -1357,7 +1357,7 @@ var rootCmd = &cobra.Command{
 		if cfgErr != nil {
 			return HandleError("failed to load beads config from %s: %v (refusing to fall back to the embedded store; fix or restore metadata.json and retry)", beadsDir, cfgErr)
 		}
-		if backendErr := validateConfiguredBackend(cfg); backendErr != nil {
+		if backendErr := validateConfiguredBackend(cfg, beadsDir); backendErr != nil {
 			return HandleError("%v", backendErr)
 		}
 		if readonlyMode && !backendSupportsStrictReadonly(cfg) {

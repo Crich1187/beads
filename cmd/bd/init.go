@@ -2463,7 +2463,7 @@ func checkExistingBeadsDataAt(beadsDir string, prefix string) error {
 		return fmt.Errorf("failed to load %s: %w; refusing to reinitialize automatically (restore the metadata or use --reinit-local after safeguarding existing data)", configfile.ConfigPath(beadsDir), cfgErr)
 	}
 	if cfg != nil {
-		if guardErr := validateConfiguredBackend(cfg); guardErr != nil {
+		if guardErr := validateConfiguredBackend(cfg, beadsDir); guardErr != nil {
 			return guardErr
 		}
 	}

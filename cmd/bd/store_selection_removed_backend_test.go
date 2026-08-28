@@ -391,14 +391,15 @@ func TestStoreFactoriesRemovedBackendsFailLoud(t *testing.T) {
 }
 
 func TestRequireDoltBackend(t *testing.T) {
+	beadsDir := t.TempDir()
 	for _, cfg := range []*configfile.Config{nil, {}, {Backend: configfile.BackendDolt}} {
-		if err := requireDoltBackend(cfg); err != nil {
+		if err := requireDoltBackend(cfg, beadsDir); err != nil {
 			t.Fatalf("Dolt config %#v rejected: %v", cfg, err)
 		}
 	}
 
 	for _, backend := range []string{configfile.BackendPostgres, configfile.BackendMySQL, configfile.BackendSQLite} {
-		err := requireDoltBackend(&configfile.Config{Backend: backend})
+		err := requireDoltBackend(&configfile.Config{Backend: backend}, beadsDir)
 		if err == nil || !strings.Contains(err.Error(), "no longer supported") || !strings.Contains(err.Error(), "export") {
 			t.Fatalf("removed backend %q guard error = %v, want rollback and migration guidance", backend, err)
 		}

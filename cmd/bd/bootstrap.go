@@ -211,7 +211,7 @@ Examples:
 		if cfg == nil {
 			cfg = configfile.DefaultConfig()
 		}
-		if err := requireBootstrapDoltBackend(cfg); err != nil {
+		if err := requireBootstrapDoltBackend(cfg, beadsDir); err != nil {
 			return HandleError("%v", err)
 		}
 
@@ -287,8 +287,8 @@ func noWorkspaceBootstrapPayload() map[string]interface{} {
 	}
 }
 
-func requireBootstrapDoltBackend(cfg *configfile.Config) error {
-	if err := validateConfiguredBackend(cfg); err != nil {
+func requireBootstrapDoltBackend(cfg *configfile.Config, beadsDir string) error {
+	if err := validateConfiguredBackend(cfg, beadsDir); err != nil {
 		return err
 	}
 	// A registered extension backend passes validateConfiguredBackend so its
@@ -574,7 +574,7 @@ func confirmPrompt(message string, nonInteractive bool) bool {
 }
 
 func executeBootstrapPlan(plan BootstrapPlan, cfg *configfile.Config, nonInteractive bool) error {
-	if err := requireBootstrapDoltBackend(cfg); err != nil {
+	if err := requireBootstrapDoltBackend(cfg, plan.BeadsDir); err != nil {
 		return err
 	}
 	if !confirmPrompt("Proceed?", nonInteractive) {
