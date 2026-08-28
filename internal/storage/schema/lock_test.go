@@ -234,6 +234,10 @@ func TestMigrateUpSeedsIgnorePatternsWhenNoWorkNeeded(t *testing.T) {
 	defer db.Close()
 
 	expectIgnorePatternSeed(mock, LatestVersion())
+	// #4356: the open-time untrack reconcile runs right after the seed and
+	// before the no-work short-circuit. On a healthy database it is two reads
+	// and no writes.
+	expectIgnoredCursorHealNoop(mock)
 	// migrationWorkNeeded: both cursors at latest, both content_hash columns
 	// present, no custom backfill pending -> no work, MigrateUp short-circuits.
 	expectCursorProbe(mock, "schema_migrations", true)
@@ -276,6 +280,10 @@ func TestMigrateUpSkipsSeedCommitWhenNothingChanged(t *testing.T) {
 	defer db.Close()
 
 	expectIgnorePatternSeedNoop(mock, LatestVersion())
+	// #4356: the open-time untrack reconcile runs right after the seed and
+	// before the no-work short-circuit. On a healthy database it is two reads
+	// and no writes.
+	expectIgnoredCursorHealNoop(mock)
 	// migrationWorkNeeded: no work, MigrateUp short-circuits.
 	expectCursorProbe(mock, "schema_migrations", true)
 	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM schema_migrations", "version", LatestVersion())
@@ -360,6 +368,10 @@ func expectOnePendingMigration(t *testing.T, mock sqlmock.Sqlmock) {
 	latestIgnored := LatestIgnoredVersion()
 
 	expectIgnorePatternSeed(mock, latest-1)
+	// #4356: the open-time untrack reconcile runs right after the seed and
+	// before the no-work short-circuit. On a healthy database it is two reads
+	// and no writes.
+	expectIgnoredCursorHealNoop(mock)
 	expectCursorProbe(mock, "schema_migrations", true)
 	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM schema_migrations", "version", latest-1)
 	expectDoltStatusRows(mock)
@@ -534,6 +546,10 @@ func expectDirtyGuardRefusal(t *testing.T, mock sqlmock.Sqlmock) {
 	cursor := eventsFlipVersion - 1
 
 	expectIgnorePatternSeedNoop(mock, cursor)
+	// #4356: the open-time untrack reconcile runs right after the seed and
+	// before the no-work short-circuit. On a healthy database it is two reads
+	// and no writes.
+	expectIgnoredCursorHealNoop(mock)
 	// migrationWorkNeeded: main cursor behind -> work needed (short-circuits).
 	expectCursorProbe(mock, "schema_migrations", true)
 	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM schema_migrations", "version", cursor)
