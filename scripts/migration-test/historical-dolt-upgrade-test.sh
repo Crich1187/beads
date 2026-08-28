@@ -1672,6 +1672,72 @@ run_wisp_plane_upgrade() {
         die "$version: bd doctor quick failed after the upgrade"
 }
 
+# #5816: an ignored-named table that is tracked at HEAD *and* dirty, with
+# ignored migrations still pending, hard-locks the open.
+#
+# This state is not constructible from clean OSS lineage — every release since
+# v0.63.3 registers the dolt_ignore patterns before creating the tables — which
+# is exactly why it needs synthetic surgery here, and why it still matters:
+# clones from forks and from older-behavior lineages arrive in it. The surgery
+# is the only place this file runs DML through the oracle, and it runs it
+# against a throwaway workspace.
+#
+# #5816 is still open, so this does NOT gate on whether the candidate accepts or
+# refuses. It gates on the two things that must hold either way: the command
+# terminates, and no wisp rows are lost. If it refuses, the refusal has to name
+# the dirty tables rather than failing opaquely.
+#
+# TODO(#5816): once the fix lands, tighten this to "the open must succeed and
+# `bd dolt commit` must clear the dirty state".
+run_dirty_tracked_wisp_scenario() {
+    local version="$1" source i1 w1 w2 before after output table
+    printf '\n● Dirty tracked wisp tables (#5816): %s → candidate\n' "$version"
+    source=$(download_verified_release_binary "$version") || die "$version: verified release is unavailable"
+    run_in_workspace "$source" init --quiet --prefix histwispdirty --skip-hooks --skip-agents ||
+        die "$version: dirty-table source init failed"
+    i1=$(create_wisp_lane_issue "$source" 'Dirty-table blocker issue' task 1) ||
+        die "$version: could not create the dirty-table blocker issue"
+    w1=$(create_wisp_lane_issue "$source" 'dirty-table wisp' task 2 --ephemeral) ||
+        die "$version: could not create the dirty-table wisp"
+    w2=$(create_wisp_lane_issue "$source" 'dirty-table blocked wisp' task 2 --ephemeral) ||
+        die "$version: could not create the dirty-table blocked wisp"
+    run_in_workspace "$source" dep add "$w2" "$i1" >/dev/null ||
+        die "$version: could not block the dirty-table wisp"
+
+    # Track the ignored-named tables at HEAD, then dirty one of them again with
+    # a normal old-binary write. dolt_add/dolt_commit are the only DML the
+    # oracle ever issues.
+    for table in wisps wisp_comments wisp_dependencies; do
+        oracle_sql "$version" "CALL DOLT_ADD('-f', '$table')" >/dev/null
+    done
+    oracle_sql "$version" "CALL DOLT_COMMIT('-m', 'baseline: wisp tables tracked at HEAD', '--author', 'historical-upgrade <historical-upgrade@test.invalid>')" >/dev/null
+    [ "$(oracle_count "$version" 'SELECT COUNT(*) FROM dolt_status')" = 0 ] ||
+        die "$version: the dirty-table baseline commit did not leave a clean status"
+    run_in_workspace "$source" update "$w1" --notes 'dirty the tracked wisp table' >/dev/null ||
+        die "$version: could not dirty the tracked wisp table"
+    [ "$(oracle_count "$version" 'SELECT COUNT(*) FROM dolt_status')" -gt 0 ] ||
+        die "$version: the tracked wisp table did not become dirty, so the scenario would be vacuous"
+
+    before=$(oracle_count "$version" 'SELECT COUNT(*) FROM wisps')
+    output="$workspace/dirty-tracked-open.out"
+    # run_in_workspace already wraps every call in `timeout`, so a hard-lock
+    # surfaces as a timeout kill rather than hanging the job.
+    if run_in_workspace "$candidate" list --json -n 0 --all > "$output" 2>&1; then
+        printf '  · candidate accepted the dirty tracked wisp tables\n'
+    else
+        grep -Fq 'dirty tables' "$output" ||
+            die "$version: candidate refused the dirty tracked wisp tables without naming them: $(head -c 300 "$output")"
+        for table in wisps wisp_comments; do
+            grep -Fq "$table" "$output" || continue
+            printf '  · candidate refused cleanly, naming %s\n' "$table"
+            break
+        done
+    fi
+    after=$(oracle_count "$version" 'SELECT COUNT(*) FROM wisps')
+    [ "$after" = "$before" ] ||
+        die "$version: the dirty-table open lost wisp rows ($before -> $after)"
+}
+
 prepare_workspace() {
     workspace=$(mktemp -d "$RUN_ROOT/bd-historical-upgrade.XXXXXX") || die 'could not create isolated workspace'
     public_bridge_destination=""
@@ -1707,6 +1773,15 @@ for version in "${SELECTED_VERSIONS[@]}"; do
         prepare_workspace
         run_wisp_plane_upgrade "$version"
         printf '  ✓ wisp-plane upgrade preserved the ignored plane and the ignored track was idempotent\n'
+        cleanup
+        workspace=""
+    fi
+    # One version carries the synthetic #5816 state; it is a containment check,
+    # not a regime check, so it does not need repeating across the corpus.
+    if [ "$version" = v1.1.2 ]; then
+        prepare_workspace
+        run_dirty_tracked_wisp_scenario "$version"
+        printf '  ✓ dirty tracked wisp tables terminated without losing wisp rows\n'
         cleanup
         workspace=""
     fi
