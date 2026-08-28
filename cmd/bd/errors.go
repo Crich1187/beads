@@ -6,8 +6,12 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/spf13/cobra"
+
+	"github.com/steveyegge/beads/internal/beads"
 	"github.com/steveyegge/beads/internal/metrics"
 	"github.com/steveyegge/beads/internal/migration"
+	"github.com/steveyegge/beads/internal/ui"
 )
 
 type exitError struct {
@@ -160,6 +164,29 @@ func CheckReadonly(operation string) {
 	}
 }
 
+// freezeSearchRoots returns the directories whose ancestry the freeze lookup
+// must cover in addition to the working directory: the resolved workspace, so
+// the gate keys on the store being written rather than on the caller's shell.
+// Without it, `BEADS_DIR=/work/repo/.beads bd create` run from $HOME, `bd -C
+// /work/repo create` (which sets BEADS_DIR and never chdirs), and any daemon
+// or cron job with an unrelated cwd all walk the wrong tree and write straight
+// through a freeze.
+//
+// PersistentPreRunE exports BEADS_DIR as part of selecting the workspace
+// (prepareSelectedCommandContext), so by the time a command's RunE reaches
+// CheckReadonly this is a cheap env read. The FindBeadsDir fallback covers the
+// callers that run before that — and returns "" rather than erroring when
+// there is no workspace at all, which Find skips.
+func freezeSearchRoots() []string {
+	if dir := os.Getenv("BEADS_DIR"); dir != "" {
+		return []string{dir}
+	}
+	if dir := beads.FindBeadsDir(); dir != "" {
+		return []string{dir}
+	}
+	return nil
+}
+
 // migrationFreezeError reports the active migration freeze, if any: it
 // returns nil when writes are not frozen, and otherwise prints the refusal to
 // stderr and returns an ExitMigrationFrozen exit error. The refusal names the
@@ -182,17 +209,39 @@ func CheckReadonly(operation string) {
 //     doesn't block it either), so it cannot inherit the freeze check from
 //     caller 1 and needs its own explicit call.
 func migrationFreezeError(operation string) error {
-	path := migration.Find()
-	if path == "" {
+	return migrationFreezeRefusal(operation, migration.Find(freezeSearchRoots()...))
+}
+
+// migrationFreezeRefusal renders an already-resolved lookup. Callers that
+// need the same Result for more than the refusal — PersistentPreRunE, which
+// also derives frozenForMaintenance from it — resolve once and pass it here,
+// so a single walk answers the whole invocation and the two readings cannot
+// disagree about a marker that appeared or vanished between them.
+func migrationFreezeRefusal(operation string, res migration.Result) error {
+	if !res.Frozen() {
 		return nil
 	}
 
-	info := migration.ReadFile(path)
+	if res.Err != nil {
+		// Fail closed: bd could not tell whether a marker is present (a
+		// permission error on the marker or a directory above it). An
+		// undeterminable gate is not an open gate, and saying so beats
+		// writing into a workspace that may be mid-migration.
+		fmt.Fprint(os.Stderr, "⛔ ERROR: cannot determine whether this workspace is frozen for migration.\n")
+		fmt.Fprintf(os.Stderr, "   %s\n", ui.SanitizeForTerminal(res.Err.Error()))
+		fmt.Fprintf(os.Stderr, "   bd %s is blocked until the marker can be read.\n", operation)
+		fmt.Fprintf(os.Stderr, "   Fix the permissions, or set %s to a path bd can stat.\n", migration.EnvFreezeFile)
+		return &exitError{Code: ExitMigrationFrozen}
+	}
+
+	// The marker can live in a directory bd does not control, so its payload
+	// is untrusted input on its way to a terminal. parse already keeps it to
+	// one line; sanitizing strips ANSI and control bytes on top of that.
 	operator := ""
 	reason := ""
-	if info != nil {
-		operator = info.Operator
-		reason = info.Reason
+	if info := migration.ReadFile(res.Path); info != nil {
+		operator = ui.SanitizeForTerminal(info.Operator)
+		reason = ui.SanitizeForTerminal(info.Reason)
 	}
 
 	if operator != "" {
@@ -205,13 +254,45 @@ func migrationFreezeError(operation string) error {
 	if reason != "" {
 		fmt.Fprintf(os.Stderr, "   Reason: %s\n", reason)
 	}
-	fmt.Fprintf(os.Stderr, "   bd %s is blocked by the freeze marker at %s.\n", operation, path)
-	if os.Getenv(migration.EnvFreezeFile) != "" {
-		// Find is env-authoritative, so a set variable means this path came
-		// from it — and removing the file is then only half the story.
+	fmt.Fprintf(os.Stderr, "   bd %s is blocked by the freeze marker at %s.\n", operation, res.Path)
+	if res.FromEnv {
 		fmt.Fprintf(os.Stderr, "   To resume writes, remove that file or unset %s.\n", migration.EnvFreezeFile)
 	} else {
+		// Name the variable on this path too: when the marker sits in a
+		// directory the caller cannot write to, pointing the variable
+		// elsewhere is the only recovery available to them.
 		fmt.Fprint(os.Stderr, "   To resume writes, remove that file.\n")
+		fmt.Fprintf(os.Stderr, "   If you cannot remove it, set %s to a path bd should check instead.\n", migration.EnvFreezeFile)
 	}
 	return &exitError{Code: ExitMigrationFrozen}
+}
+
+// migrationFreezeGate is the RunE-side entry point: it renders the refusal and,
+// because the refusal has already said everything worth saying, suppresses
+// cobra's own error and usage rendering for this invocation.
+//
+// Without the suppression a freeze refusal on any command that does not set
+// SilenceErrors/SilenceUsage statically — duplicate, supersede, dep
+// relate/unrelate, backup init/sync/remove/restore, ado sync, migrate-personal,
+// batch — is followed by "Error: exit code 14" (exitError's placeholder text)
+// and a full usage dump, so a clean refusal reads like a syntax error. Setting
+// the flags here rather than on each command covers the ones added after this
+// comment too. main() exits on the exitError before its own SilenceErrors
+// branch, so nothing prints the placeholder.
+func migrationFreezeGate(cmd *cobra.Command, operation string, res migration.Result) error {
+	err := migrationFreezeRefusal(operation, res)
+	if err != nil && cmd != nil {
+		cmd.SilenceErrors = true
+		cmd.SilenceUsage = true
+	}
+	return err
+}
+
+// migrationFreezeGateFor resolves the freeze and gates in one step, for the
+// callers that have no Result to thread: the skip-store commands (bd init,
+// bd bootstrap), which return from PersistentPreRunE long before it resolves
+// one, and any command handed an explicit target path.
+func migrationFreezeGateFor(cmd *cobra.Command, operation string, extraRoots ...string) error {
+	roots := append(freezeSearchRoots(), extraRoots...)
+	return migrationFreezeGate(cmd, operation, migration.Find(roots...))
 }

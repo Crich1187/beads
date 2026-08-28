@@ -456,7 +456,7 @@ Selected commonly-used variables:
 | `BD_NO_PAGER`, `BD_PAGER` | Pager behavior |
 | `BD_NON_INTERACTIVE` | Disable prompts |
 | `BD_DEBUG` | Enable debug logging |
-| `BD_MIGRATION_FREEZE_FILE` | Check this exact path for the freeze marker instead of walking ancestor directories (see [Migration Freeze](#migration-freeze)) |
+| `BD_MIGRATION_FREEZE_FILE` | Check this exact path for the freeze marker instead of walking ancestor directories; authoritative when set (see [Migration Freeze](#migration-freeze)) |
 | `BEADS_DIR` | Force the active beads workspace directory |
 | `BEADS_ACTOR` | Actor identity (preferred over `BD_ACTOR`, which is a deprecated alias) |
 | `BEADS_IDENTITY` | Sender identity for `bd mail` |
@@ -472,7 +472,9 @@ Integration secrets follow tracker-specific conventions: `LINEAR_API_KEY`, `GITH
 
 Maintenance that runs outside `bd` — moving a database to a new host, rewriting schema by hand — needs a way to stop writes for its duration without uninstalling the tool. Create a file named `MIGRATION-FREEZE` and every write command refuses to run until you delete it.
 
-bd looks for the marker in the working directory and each of its ancestors, so one file above a tree of repositories freezes all of them at once.
+bd looks for the marker in the workspace directory and in the working directory, plus every ancestor of each, so one file above a tree of repositories freezes all of them at once — and targeting a frozen workspace from elsewhere (`BEADS_DIR=…`, `bd -C …`) is refused the same way.
+
+Markers found in a world-writable sticky directory such as `/tmp` are ignored: anyone on a shared machine could plant one there, and the sticky bit would stop you removing it. Put the marker at the root of the tree you are freezing.
 
 ```bash
 touch MIGRATION-FREEZE     # the file's existence is the whole signal
@@ -490,9 +492,17 @@ bd create "new work"
 rm MIGRATION-FREEZE        # thaw
 ```
 
-Blocked commands exit **14** — a stable code scripts branch on to tell "someone is migrating this workspace, come back later" from a generic failure worth an immediate retry. Reads (`bd list`, `bd show`, `bd ready`, …) keep working during a freeze, and a frozen workspace is never rewritten behind your back: version-bump migration and JSONL auto-import are skipped too.
+Blocked commands exit **14** — a stable code scripts branch on to tell "someone is migrating this workspace, come back later" from a generic failure worth an immediate retry. That includes the destructive ones: `bd init --reinit-local` and `bd bootstrap` are refused too.
 
-Set `BD_MIGRATION_FREEZE_FILE` to consult one explicit path and skip the ancestor walk. It covers markers that live outside the working tree, and doubles as an opt-out when it points at a path that does not exist.
+Reads (`bd list`, `bd show`, `bd ready`, …) keep working during a freeze, and bd's own background maintenance stands down with them — version-bump migration, JSONL auto-import, Dolt auto-commit, auto-backup, auto-export and auto-push are all skipped, so running a read does not leave a commit in the store you are migrating.
+
+<Warning>
+A `bd serve` process started before the marker appeared keeps accepting HTTP writes: the freeze is a CLI-invocation gate, and a running server never re-reads it. Stop the server before you freeze.
+</Warning>
+
+If bd cannot tell whether a marker is present — a permission error on the marker or on a directory above it — it refuses the write and says so, rather than assuming the workspace is open.
+
+`BD_MIGRATION_FREEZE_FILE` names one explicit path to consult instead of walking ancestors, for markers that live outside the tree. It is authoritative: when it is set, nothing else is checked.
 
 ## Security: Where Secrets Live
 
