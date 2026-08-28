@@ -193,11 +193,14 @@ func TestNormalizeIssuePrefixAndDatabaseName(t *testing.T) {
 	}
 }
 
-// TestInitCloneURL pins which URLs init rewrites before handing them to
-// DOLT_CLONE. Forge URLs must arrive in git+ form so Dolt uses the git remote
-// factory rather than the remotesapi retry storm (#4421); a user-configured
-// remotesapi endpoint must arrive byte-identical (GH#3339).
-func TestInitCloneURL(t *testing.T) {
+// TestDoltRemoteURL pins which URLs bd rewrites before handing them to Dolt —
+// for DOLT_CLONE, for DOLT_REMOTE('add', ...) and therefore for DOLT_PUSH.
+// Forge URLs must arrive in git+ form so Dolt uses the git remote factory
+// rather than the remotesapi retry storm (#4421); a user-configured remotesapi
+// endpoint must arrive byte-identical (GH#3339). bd init and bd bootstrap
+// share this one helper so they can never disagree about the URL derived from
+// a single committed sync.remote.
+func TestDoltRemoteURL(t *testing.T) {
 	tests := []struct {
 		name string
 		in   string
@@ -219,8 +222,8 @@ func TestInitCloneURL(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := initCloneURL(tt.in); got != tt.want {
-				t.Errorf("initCloneURL(%q) = %q, want %q", tt.in, got, tt.want)
+			if got := doltRemoteURL(tt.in); got != tt.want {
+				t.Errorf("doltRemoteURL(%q) = %q, want %q", tt.in, got, tt.want)
 			}
 		})
 	}
@@ -235,7 +238,7 @@ func TestRunInitRemoteCloneReceivesRoutedURL(t *testing.T) {
 	} {
 		t.Run(tt.in, func(t *testing.T) {
 			var gotURL string
-			if _, err := runInitRemoteClone(initCloneURL(tt.in), func(url string) error {
+			if _, err := runInitRemoteClone(doltRemoteURL(tt.in), func(url string) error {
 				gotURL = url
 				return nil
 			}); err != nil {

@@ -4,7 +4,6 @@ package main
 
 import (
 	"errors"
-	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -96,9 +95,14 @@ func setupSyncRemoteConfig(t *testing.T, beadsDir, remote string) func() {
 }
 
 // stubProbeGitRemoteDoltData replaces the refs/dolt/data probe for the
-// duration of a test. Every test in this file must install a stub: the real
-// probe shells out to `git ls-remote` against whatever host the fixture URL
-// names.
+// duration of a test. Every test that configures a forge sync.remote must
+// install a stub: the real probe shells out to `git ls-remote` against
+// whatever host the fixture URL names.
+//
+// A configured sync.remote also suppresses the git-origin auto-detect leg
+// (gitOriginHasDoltDataRef, which is not behind this seam), so these tests
+// cannot reach the network through that path either — including the
+// fall-through cases, whose whole point is to keep going after the probe.
 func stubProbeGitRemoteDoltData(t *testing.T, fn func(string) (bool, error)) {
 	t.Helper()
 	orig := probeGitRemoteDoltData
@@ -170,12 +174,19 @@ func TestDetectBootstrapAction_GitForgeSyncRemote_ProbeRouting(t *testing.T) {
 				if plan.SyncRemote != tc.wantClone {
 					t.Errorf("SyncRemote=%q, want %q", plan.SyncRemote, tc.wantClone)
 				}
-				// The durable #4421 pin: no raw forge http(s) URL may ever
-				// reach DOLT_CLONE, because Dolt routes those through the
+				// The durable #4421 pin: once isGitCodeRepoURL recognizes a
+				// URL as a forge, no raw http(s) form of it may reach
+				// DOLT_CLONE, because Dolt routes those through the
 				// remotesapi client and retries forever at ~1000% CPU. The
 				// git+ prefix is what selects the git remote factory.
+				//
+				// Scope note: this pins the routing, not the classifier. A
+				// forge the classifier does not recognize (self-hosted Gitea
+				// at https://git.example.com/org/repo, no .git suffix) still
+				// takes the trusted-as-is path unprobed, exactly as it did
+				// before this change — a pre-existing gap tracked separately.
 				if !strings.HasPrefix(plan.SyncRemote, "git+") {
-					t.Errorf("SyncRemote=%q lacks the git+ prefix; a raw forge URL must never reach DOLT_CLONE (#4421)", plan.SyncRemote)
+					t.Errorf("SyncRemote=%q lacks the git+ prefix; a recognized forge URL must never reach DOLT_CLONE raw (#4421)", plan.SyncRemote)
 				}
 				if plan.Blocked {
 					t.Error("Blocked=true on a successful sync plan")
@@ -187,7 +198,7 @@ func TestDetectBootstrapAction_GitForgeSyncRemote_ProbeRouting(t *testing.T) {
 		}
 	})
 
-	t.Run("no data falls through to init", func(t *testing.T) {
+	t.Run("no data falls through to init and still wires the remote", func(t *testing.T) {
 		beadsDir := newForgeSyncRemoteWorkspace(t, "https://github.com/org/repo.git")
 		stubProbeGitRemoteDoltData(t, func(string) (bool, error) { return false, nil })
 
@@ -199,8 +210,12 @@ func TestDetectBootstrapAction_GitForgeSyncRemote_ProbeRouting(t *testing.T) {
 		if plan.Blocked {
 			t.Error("Blocked=true; a clean 'no data yet' probe is not a failure")
 		}
-		if plan.SyncRemote != "" {
-			t.Errorf("SyncRemote=%q, want empty (nothing to clone)", plan.SyncRemote)
+		// Carried so executeInitAction can register it as Dolt "origin".
+		// Without it the first `bd dolt push` has no remote and either
+		// refuses or adopts the git origin — a different repository under
+		// the dedicated-data-repo pattern.
+		if plan.SyncRemote != "git+https://github.com/org/repo.git" {
+			t.Errorf("SyncRemote=%q, want the routed URL so the fresh database gets wired to it", plan.SyncRemote)
 		}
 	})
 
@@ -227,34 +242,104 @@ func TestDetectBootstrapAction_GitForgeSyncRemote_ProbeRouting(t *testing.T) {
 		}
 	})
 
+	// The error text is the shape the real probe now produces: git's own
+	// stderr, threaded out of exec.ExitError.Stderr by gitLsRemoteProbeError.
+	probeErr := errors.New("git ls-remote: exit status 128: fatal: Could not read from remote repository.")
+
 	t.Run("probe error blocks and never clones", func(t *testing.T) {
-		for _, tc := range forgeSyncRemoteForms {
-			t.Run(tc.name, func(t *testing.T) {
-				beadsDir := newForgeSyncRemoteWorkspace(t, tc.remote)
-				probeErr := errors.New("exit status 128: Permission denied (publickey)")
-				stubProbeGitRemoteDoltData(t, func(string) (bool, error) { return false, probeErr })
+		const remote = "git+ssh://github.com/org/repo.git"
+		beadsDir := newForgeSyncRemoteWorkspace(t, remote)
+		stubProbeGitRemoteDoltData(t, func(string) (bool, error) { return false, probeErr })
 
-				plan := detectBootstrapAction(beadsDir, configfile.DefaultConfig())
+		plan := detectBootstrapAction(beadsDir, configfile.DefaultConfig())
 
-				if plan.Action != "none" {
-					t.Fatalf("action=%q, want %q (UNKNOWN must fail closed)", plan.Action, "none")
-				}
-				if !plan.Blocked {
-					t.Error("Blocked=false; an unverifiable remote must exit non-zero, not print a success tick")
-				}
-				if plan.SyncRemote != "" {
-					t.Errorf("SyncRemote=%q, want empty (an unverified URL must not propagate to the clone)", plan.SyncRemote)
-				}
-				if plan.BlockedRemote != tc.wantClone {
-					t.Errorf("BlockedRemote=%q, want %q (needed for the ls-remote hint)", plan.BlockedRemote, tc.wantClone)
-				}
-				if !strings.Contains(plan.Reason, tc.remote) {
-					t.Errorf("Reason=%q does not name the offending URL %q", plan.Reason, tc.remote)
-				}
-				if !strings.Contains(plan.Reason, "publickey") {
-					t.Errorf("Reason=%q does not carry the probe error", plan.Reason)
-				}
-			})
+		if plan.Action != "none" {
+			t.Fatalf("action=%q, want %q (UNKNOWN must fail closed)", plan.Action, "none")
+		}
+		if !plan.Blocked {
+			t.Error("Blocked=false; an unverifiable remote must exit non-zero, not print a success tick")
+		}
+		if plan.SyncRemote != "" {
+			t.Errorf("SyncRemote=%q, want empty (an unverified URL must not be cloned from or pushed to)", plan.SyncRemote)
+		}
+		if plan.BlockedRemote != remote {
+			t.Errorf("BlockedRemote=%q, want %q (needed for the ls-remote hint)", plan.BlockedRemote, remote)
+		}
+		if !strings.Contains(plan.Reason, remote) {
+			t.Errorf("Reason=%q does not name the offending URL %q", plan.Reason, remote)
+		}
+		if !strings.Contains(plan.Reason, "Could not read from remote repository") {
+			t.Errorf("Reason=%q does not carry git's own diagnosis", plan.Reason)
+		}
+	})
+
+	t.Run("probe error still restores from a local backup", func(t *testing.T) {
+		// Offline laptop or credential-less CI: verifying the remote failed,
+		// but restoring a local backup touches no remote. The same machine
+		// with network and an empty remote would restore from this identical
+		// file, so a probe failure must not be the thing that denies it.
+		beadsDir := newForgeSyncRemoteWorkspace(t, "https://github.com/org/repo.git")
+		backupDir := filepath.Join(beadsDir, "backup")
+		if err := os.MkdirAll(backupDir, 0o750); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(backupDir, "issues.jsonl"), []byte(`{"id":"bd-1"}`+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		stubProbeGitRemoteDoltData(t, func(string) (bool, error) { return false, probeErr })
+
+		plan := detectBootstrapAction(beadsDir, configfile.DefaultConfig())
+
+		if plan.Action != "restore" {
+			t.Fatalf("action=%q reason=%q, want %q", plan.Action, plan.Reason, "restore")
+		}
+		if plan.Blocked {
+			t.Error("Blocked=true on a plan that recovers locally")
+		}
+		if plan.SyncRemote != "" {
+			t.Errorf("SyncRemote=%q, want empty: the remote is unverified, so nothing may be wired to it", plan.SyncRemote)
+		}
+	})
+
+	t.Run("probe error still imports git-tracked jsonl", func(t *testing.T) {
+		beadsDir := newForgeSyncRemoteWorkspace(t, "https://github.com/org/repo.git")
+		jsonl := filepath.Join(beadsDir, "issues.jsonl")
+		if err := os.WriteFile(jsonl, []byte(`{"id":"bd-1"}`+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		stubProbeGitRemoteDoltData(t, func(string) (bool, error) { return false, probeErr })
+
+		plan := detectBootstrapAction(beadsDir, configfile.DefaultConfig())
+
+		if plan.Action != "jsonl-import" {
+			t.Fatalf("action=%q reason=%q, want %q", plan.Action, plan.Reason, "jsonl-import")
+		}
+		if plan.Blocked {
+			t.Error("Blocked=true on a plan that recovers locally")
+		}
+	})
+
+	t.Run("credentials are stripped from the reason and the blocked URL", func(t *testing.T) {
+		const token = "ghp_SUPERSECRETTOKENVALUE"
+		beadsDir := newForgeSyncRemoteWorkspace(t, "https://x-access-token:"+token+"@github.com/org/repo.git")
+		stubProbeGitRemoteDoltData(t, func(string) (bool, error) { return false, probeErr })
+
+		plan := detectBootstrapAction(beadsDir, configfile.DefaultConfig())
+
+		if !plan.Blocked {
+			t.Fatalf("action=%q, want a blocked plan", plan.Action)
+		}
+		// Reason and blocked_remote both land in CI logs and agent
+		// transcripts; the clone funnel already scrubs userinfo before
+		// reporting and these diagnostics must not be the hole in that.
+		if strings.Contains(plan.Reason, token) {
+			t.Errorf("Reason leaks the token: %q", plan.Reason)
+		}
+		if strings.Contains(plan.BlockedRemote, token) {
+			t.Errorf("BlockedRemote leaks the token: %q", plan.BlockedRemote)
+		}
+		if !strings.Contains(plan.BlockedRemote, "github.com/org/repo.git") {
+			t.Errorf("BlockedRemote=%q lost the part the user needs", plan.BlockedRemote)
 		}
 	})
 
@@ -289,12 +374,13 @@ func TestDetectBootstrapAction_GitForgeSyncRemote_ProbeRouting(t *testing.T) {
 
 // TestBootstrapPlanOutcome pins the exit status of every plan shape.
 // Action=="none" used to be an unconditional success, which is how a rejected
-// sync.remote exited 0 with no database (#5743).
+// sync.remote exited 0 with no database (#5743). Blocked is the single
+// discriminator; --dry-run is always a successful preview.
 func TestBootstrapPlanOutcome(t *testing.T) {
 	tests := []struct {
 		name     string
 		plan     BootstrapPlan
-		jsonMode bool
+		dryRun   bool
 		wantExit int // 0 means "nil error"
 	}{
 		{
@@ -303,13 +389,8 @@ func TestBootstrapPlanOutcome(t *testing.T) {
 			wantExit: 0,
 		},
 		{
-			name:     "blocked remote probe",
+			name:     "blocked plan fails",
 			plan:     BootstrapPlan{Action: "none", Blocked: true, Reason: "could not verify refs/dolt/data"},
-			wantExit: 1,
-		},
-		{
-			name:     "server database unverifiable",
-			plan:     BootstrapPlan{Action: "none", Reason: "Could not verify existing server database beads: dial tcp: refused"},
 			wantExit: 1,
 		},
 		{
@@ -323,22 +404,18 @@ func TestBootstrapPlanOutcome(t *testing.T) {
 			wantExit: 0,
 		},
 		{
-			name:     "blocked in json mode",
-			plan:     BootstrapPlan{Action: "none", Blocked: true},
-			jsonMode: true,
-			wantExit: 1,
-		},
-		{
-			name:     "existing database in json mode",
-			plan:     BootstrapPlan{Action: "none", HasExisting: true},
-			jsonMode: true,
+			// bd doctor documents `bd bootstrap --dry-run` as the safe
+			// inspection step, so a preview must never abort a set -e script.
+			name:     "dry run previews a blocked plan without failing",
+			plan:     BootstrapPlan{Action: "none", Blocked: true, Reason: "could not verify refs/dolt/data"},
+			dryRun:   true,
 			wantExit: 0,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := bootstrapPlanOutcome(tt.plan, tt.jsonMode)
+			err := bootstrapPlanOutcome(tt.plan, tt.dryRun)
 			if tt.wantExit == 0 {
 				if err != nil {
 					t.Fatalf("bootstrapPlanOutcome() = %v, want nil", err)
@@ -356,54 +433,135 @@ func TestBootstrapPlanOutcome(t *testing.T) {
 	}
 }
 
-// captureBootstrapOutput runs fn with stdout and stderr redirected, returning
-// everything written to either.
-func captureBootstrapOutput(t *testing.T, fn func()) string {
-	t.Helper()
-	r, w, err := os.Pipe()
-	if err != nil {
-		t.Fatalf("os.Pipe: %v", err)
+// TestDetectBootstrapAction_BlockedIsDerivedNotInherited covers the state-leak
+// class the seeded plan used to create: existingBootstrapDBPlan's "none"
+// verdict was copied into the working plan, so every later branch inherited
+// its HasExisting/Blocked/Reason. A probe error on top of a seeded
+// HasExisting=true produced action=none + blocked=true + has_existing=true,
+// which printed the success tick and exited 0 — the #5743 bug, reintroduced.
+func TestDetectBootstrapAction_BlockedIsDerivedNotInherited(t *testing.T) {
+	// newSeededServerWorkspace builds the synthesized-beadsDir shape: the
+	// .beads directory does not exist, so existingBootstrapDBPlan's verdict is
+	// held as a fallback rather than returned outright.
+	newSeededServerWorkspace := func(t *testing.T, remote string, check bootstrapServerDBCheck) (string, *configfile.Config) {
+		t.Helper()
+		snapshotBootstrapEnv(t)
+
+		tmpDir := t.TempDir()
+		configDir := filepath.Join(tmpDir, "config-beads")
+		if err := os.MkdirAll(configDir, 0o750); err != nil {
+			t.Fatal(err)
+		}
+		cleanup := setupSyncRemoteConfig(t, configDir, remote)
+		t.Cleanup(cleanup)
+
+		doltDataDir := filepath.Join(tmpDir, "dolt-data")
+		if err := os.MkdirAll(filepath.Join(doltDataDir, "mydb"), 0o750); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv("BEADS_DOLT_DATA_DIR", doltDataDir)
+
+		oldWd, _ := os.Getwd()
+		t.Cleanup(func() { _ = os.Chdir(oldWd) })
+		if err := os.Chdir(tmpDir); err != nil {
+			t.Fatal(err)
+		}
+
+		origCheck := checkBootstrapServerDB
+		checkBootstrapServerDB = func(bootstrapServerProbeConfig) bootstrapServerDBCheck { return check }
+		t.Cleanup(func() { checkBootstrapServerDB = origCheck })
+
+		origDelay := bootstrapRetryDelay
+		bootstrapRetryDelay = func(time.Duration) {}
+		t.Cleanup(func() { bootstrapRetryDelay = origDelay })
+
+		cfg := configfile.DefaultConfig()
+		cfg.DoltMode = configfile.DoltModeServer
+		cfg.DoltDatabase = "mydb"
+		cfg.DoltDataDir = doltDataDir
+		// Never created: this is the "fresh clone, .beads synthesized" path.
+		return filepath.Join(tmpDir, ".beads"), cfg
 	}
-	oldStdout, oldStderr := os.Stdout, os.Stderr
-	os.Stdout, os.Stderr = w, w
-	done := make(chan string, 1)
-	go func() {
-		b, _ := io.ReadAll(r)
-		done <- string(b)
-	}()
 
-	func() {
-		defer func() {
-			os.Stdout, os.Stderr = oldStdout, oldStderr
-			_ = w.Close()
-		}()
-		fn()
-	}()
+	t.Run("existing server database wins over a failed probe", func(t *testing.T) {
+		beadsDir, cfg := newSeededServerWorkspace(t, "https://github.com/org/repo.git",
+			bootstrapServerDBCheck{Exists: true, Reachable: true})
+		stubProbeGitRemoteDoltData(t, func(string) (bool, error) {
+			return false, errors.New("git ls-remote: exit status 128")
+		})
 
-	out := <-done
-	_ = r.Close()
-	return out
+		plan := detectBootstrapAction(beadsDir, cfg)
+
+		if !plan.HasExisting {
+			t.Fatalf("HasExisting=false; the server database exists (action=%q reason=%q)", plan.Action, plan.Reason)
+		}
+		if plan.Blocked {
+			t.Error("Blocked=true alongside HasExisting=true — self-contradictory, and it would print the tick AND claim a block")
+		}
+		if err := bootstrapPlanOutcome(plan, false); err != nil {
+			t.Errorf("outcome = %v, want nil: a database exists", err)
+		}
+	})
+
+	t.Run("failed server verification does not taint a later sync plan", func(t *testing.T) {
+		beadsDir, cfg := newSeededServerWorkspace(t, "https://github.com/org/repo.git",
+			bootstrapServerDBCheck{Reachable: true, Err: errors.New("dial tcp: connection refused")})
+		stubProbeGitRemoteDoltData(t, func(string) (bool, error) { return true, nil })
+
+		plan := detectBootstrapAction(beadsDir, cfg)
+
+		if plan.Action != "sync" {
+			t.Fatalf("action=%q reason=%q, want %q", plan.Action, plan.Reason, "sync")
+		}
+		if plan.Blocked {
+			t.Error(`Blocked=true on a sync plan: "nothing may clone from a blocked plan" is the field's own contract`)
+		}
+		if plan.BlockedRemote != "" {
+			t.Errorf("BlockedRemote=%q on a sync plan", plan.BlockedRemote)
+		}
+	})
+
+	t.Run("unverifiable server database with no other source blocks", func(t *testing.T) {
+		beadsDir, cfg := newSeededServerWorkspace(t, "",
+			bootstrapServerDBCheck{Reachable: true, Err: errors.New("dial tcp: connection refused")})
+
+		plan := detectBootstrapAction(beadsDir, cfg)
+
+		if plan.Action != "none" || !plan.Blocked {
+			t.Fatalf("action=%q blocked=%v, want none+blocked", plan.Action, plan.Blocked)
+		}
+		if err := bootstrapPlanOutcome(plan, false); err == nil {
+			t.Error("outcome = nil; an unverifiable database must not report success")
+		}
+	})
 }
 
 // TestPrintBootstrapPlan_NoneWithoutDB_NoSuccessTick pins the other half of
 // the #5743 false success: the "✓ Database already exists" line must be
 // reserved for plans that actually found a database.
 func TestPrintBootstrapPlan_NoneWithoutDB_NoSuccessTick(t *testing.T) {
-	t.Run("blocked plan reports the reason and both hints", func(t *testing.T) {
-		plan := BootstrapPlan{
-			Action:        "none",
-			Blocked:       true,
-			BeadsDir:      "/workspace/.beads",
-			BlockedRemote: "git+ssh://github.com/org/repo.git",
-			Reason:        `could not verify refs/dolt/data on sync.remote "git+ssh://github.com/org/repo.git": exit status 128`,
+	blocked := BootstrapPlan{
+		Action:        "none",
+		Blocked:       true,
+		BeadsDir:      "/workspace/.beads",
+		BlockedRemote: "git+ssh://github.com/org/repo.git",
+		Reason:        `could not verify refs/dolt/data on sync.remote "git+ssh://github.com/org/repo.git": git ls-remote: exit status 128: fatal: Could not read from remote repository.`,
+	}
+
+	t.Run("blocked plan prints nothing to stdout", func(t *testing.T) {
+		out := captureStdout(t, func() error { printBootstrapPlan(blocked); return nil })
+		if strings.TrimSpace(out) != "" {
+			t.Fatalf("blocked plan wrote to stdout (the success tick lives there):\n%s", out)
 		}
+	})
 
-		out := captureBootstrapOutput(t, func() { printBootstrapPlan(plan) })
+	t.Run("blocked plan reports the reason and actionable hints on stderr", func(t *testing.T) {
+		out := captureStderr(t, func() { printBootstrapPlan(blocked) })
 
-		if strings.Contains(out, "✓") || strings.Contains(out, "Database already exists") {
+		if strings.Contains(out, "Database already exists") {
 			t.Fatalf("blocked plan printed a success tick:\n%s", out)
 		}
-		if !strings.Contains(out, plan.Reason) {
+		if !strings.Contains(out, blocked.Reason) {
 			t.Errorf("output does not carry the reason:\n%s", out)
 		}
 		// The hint must be runnable: git ls-remote does not understand the
@@ -411,25 +569,11 @@ func TestPrintBootstrapPlan_NoneWithoutDB_NoSuccessTick(t *testing.T) {
 		if !strings.Contains(out, "git ls-remote ssh://github.com/org/repo.git refs/dolt/data") {
 			t.Errorf("output lacks a runnable ls-remote hint:\n%s", out)
 		}
-		if !strings.Contains(out, filepath.Join("/workspace/.beads", "config.yaml")) {
-			t.Errorf("output does not point at config.yaml:\n%s", out)
-		}
-	})
-
-	t.Run("unblocked none without a database still fails visibly", func(t *testing.T) {
-		plan := BootstrapPlan{
-			Action:   "none",
-			BeadsDir: "/workspace/.beads",
-			Reason:   "Could not verify existing server database beads: dial tcp: connection refused",
-		}
-
-		out := captureBootstrapOutput(t, func() { printBootstrapPlan(plan) })
-
-		if strings.Contains(out, "✓") || strings.Contains(out, "Nothing to do") {
-			t.Fatalf("plan with no database printed a success tick:\n%s", out)
-		}
-		if !strings.Contains(out, "connection refused") {
-			t.Errorf("output does not carry the reason:\n%s", out)
+		// Deleting sync.remote is NOT offered as a remedy: the git-origin
+		// probe swallows its error, so on a credential failure that retry
+		// would "succeed" by creating a database diverged from the team's.
+		if strings.Contains(out, "remove 'sync.remote'") {
+			t.Errorf("hint still suggests deleting sync.remote, which can silently diverge:\n%s", out)
 		}
 	})
 
@@ -441,13 +585,32 @@ func TestPrintBootstrapPlan_NoneWithoutDB_NoSuccessTick(t *testing.T) {
 			Reason:      "Database already exists at /workspace/.beads/embeddeddolt",
 		}
 
-		out := captureBootstrapOutput(t, func() { printBootstrapPlan(plan) })
+		out := captureStdout(t, func() error { printBootstrapPlan(plan); return nil })
 
 		if !strings.Contains(out, "✓ Database already exists: /workspace/.beads") {
 			t.Fatalf("existing database lost its success line:\n%s", out)
 		}
 		if !strings.Contains(out, "Nothing to do") {
 			t.Errorf("existing database lost its 'Nothing to do' line:\n%s", out)
+		}
+	})
+
+	t.Run("sync plan does not print credentials", func(t *testing.T) {
+		const token = "ghp_SUPERSECRETTOKENVALUE"
+		plan := BootstrapPlan{
+			Action:     "sync",
+			BeadsDir:   "/workspace/.beads",
+			Database:   "beads",
+			SyncRemote: "git+https://x-access-token:" + token + "@github.com/org/repo.git",
+		}
+
+		out := captureStdout(t, func() error { printBootstrapPlan(plan); return nil })
+
+		if strings.Contains(out, token) {
+			t.Fatalf("plan output leaks the token:\n%s", out)
+		}
+		if !strings.Contains(out, "github.com/org/repo.git") {
+			t.Errorf("plan output lost the remote entirely:\n%s", out)
 		}
 	})
 }
@@ -461,21 +624,7 @@ func TestDetectBootstrapAction_ValidDoltSyncRemoteUnchanged(t *testing.T) {
 		"git+ssh://my-self-hosted-dolt.example.com/org/db",
 	} {
 		t.Run(remote, func(t *testing.T) {
-			snapshotBootstrapEnv(t)
-
-			tmpDir := t.TempDir()
-			beadsDir := filepath.Join(tmpDir, ".beads")
-			if err := os.MkdirAll(beadsDir, 0o750); err != nil {
-				t.Fatal(err)
-			}
-			cleanup := setupSyncRemoteConfig(t, beadsDir, remote)
-			defer cleanup()
-
-			oldWd, _ := os.Getwd()
-			defer func() { _ = os.Chdir(oldWd) }()
-			if err := os.Chdir(tmpDir); err != nil {
-				t.Fatal(err)
-			}
+			beadsDir := newForgeSyncRemoteWorkspace(t, remote)
 
 			// Non-forge remotes take the trusted-as-is path and must never
 			// pay for an ls-remote — a Dolt remotesapi endpoint has no

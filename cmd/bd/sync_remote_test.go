@@ -131,3 +131,58 @@ func runGitForCommitConfigTest(t *testing.T, dir string, args ...string) string 
 func shellQuoteForTest(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", "'\\''") + "'"
 }
+
+// TestRedactRemoteURL pins the credential scrubbing applied to every remote URL
+// bd echoes into an error, a hint, a log line or JSON. CI commonly configures
+// sync.remote as https://x-access-token:<token>@github.com/org/repo.git.
+func TestRedactRemoteURL(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{
+			name: "https token is dropped whole",
+			in:   "https://x-access-token:ghp_secret@github.com/org/repo.git",
+			want: "https://github.com/org/repo.git",
+		},
+		{
+			name: "git+https token is dropped whole",
+			in:   "git+https://user:pass@github.com/org/repo.git",
+			want: "git+https://github.com/org/repo.git",
+		},
+		{
+			name: "http basic auth is dropped whole",
+			in:   "http://user:pass@myserver:7007/mydb",
+			want: "http://myserver:7007/mydb",
+		},
+		{
+			// The conventional SSH account selector is not a secret, and the
+			// ls-remote hint is useless without it.
+			name: "ssh user is kept",
+			in:   "git+ssh://git@github.com/org/repo.git",
+			want: "git+ssh://git@github.com/org/repo.git",
+		},
+		{
+			name: "ssh password is dropped, user kept",
+			in:   "ssh://alice:hunter2@my-dolt.example.com/org/db",
+			want: "ssh://alice@my-dolt.example.com/org/db",
+		},
+		{
+			name: "scp style is untouched",
+			in:   "git@github.com:org/repo.git",
+			want: "git@github.com:org/repo.git",
+		},
+		{name: "no userinfo", in: "https://github.com/org/repo.git", want: "https://github.com/org/repo.git"},
+		{name: "dolt native", in: "dolthub://myorg/mydb", want: "dolthub://myorg/mydb"},
+		{name: "empty", in: "", want: ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := redactRemoteURL(tt.in); got != tt.want {
+				t.Errorf("redactRemoteURL(%q) = %q, want %q", tt.in, got, tt.want)
+			}
+		})
+	}
+}

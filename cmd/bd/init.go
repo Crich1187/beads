@@ -1282,7 +1282,7 @@ Non-interactive mode (--non-interactive or BD_NON_INTERACTIVE=1):
 			// A raw https:// forge URL would route through Dolt's remotesapi
 			// client and spin forever (#4421); its git+ form routes through
 			// the git remote factory. Non-forge URLs are untouched (GH#3339).
-			syncURL = initCloneURL(syncURL)
+			syncURL = doltRemoteURL(syncURL)
 			cloneCfg := initTimeCloneConfig(initServerMode, serverHost, serverPort, serverSocket, serverUser, dbName)
 			disposition, err := runInitRemoteClone(syncURL, func(remoteURL string) error {
 				return cloneFromRemoteWithMode(ctx, beadsDir, remoteURL, dbName, cloneCfg, initRemoteCloneMode(initServerMode, externalServer))
@@ -1498,8 +1498,14 @@ Non-interactive mode (--non-interactive or BD_NON_INTERACTIVE=1):
 		// falling back to JSONL-as-sync. Gateway mode skips it: the hosted
 		// server owns the database, so DOLT_REMOTE('add', ...) must not run
 		// against it (see shouldWriteInitDoltRemote).
+		// The URL is routed here too, not just on the clone path: the
+		// no-Dolt-data-yet case (the pre-first-push wiring this is for) never
+		// clones, so without routing a raw https forge URL would be stored
+		// verbatim in dolt_remotes and the *first* `bd dolt push` would take
+		// it to the remotesapi client — the #4421 storm, one leg further down
+		// (#5743).
 		if shouldWriteInitDoltRemote(doltCfg.Gateway, syncURL, syncFromRemote, syncURLFromConfig, syncURLFromGitOrigin, isDoltLocalOnly()) {
-			configureInitDoltRemote(ctx, store, syncURL, quiet)
+			configureInitDoltRemote(ctx, store, doltRemoteURL(syncURL), quiet)
 		}
 
 		// === CONFIGURATION METADATA (Pattern A: Fatal) ===
