@@ -120,7 +120,7 @@ Bootstrap auto-detects the right action:
   • If database already exists: validates and reports status
 
 If sync.remote points at a git repository, bootstrap verifies refs/dolt/data
-before cloning.
+before cloning. Bootstrap exits non-zero when it cannot set up a database.
 
 This is the recommended command for:
   • Setting up beads on a fresh clone
@@ -240,7 +240,7 @@ Examples:
 				return err
 			}
 			if plan.Action == "none" || dryRun {
-				return nil
+				return bootstrapPlanOutcome(plan, true)
 			}
 		} else {
 			if repairMsg != "" {
@@ -248,7 +248,7 @@ Examples:
 			}
 			printBootstrapPlan(plan)
 			if plan.Action == "none" || dryRun {
-				return nil
+				return bootstrapPlanOutcome(plan, false)
 			}
 		}
 
@@ -296,6 +296,26 @@ type BootstrapPlan struct {
 	// gets a copy-pasteable diagnostic.
 	BlockedRemote string `json:"blocked_remote,omitempty"`
 	HasExisting   bool   `json:"has_existing"`
+}
+
+// bootstrapPlanOutcome maps a printed plan to the command's exit status.
+// Action=="none" is two different outcomes wearing one name: "a database
+// already exists, nothing to do" (success) and "bootstrap declined and left
+// you with no database" (failure). Before #5743 both returned nil, so a
+// rejected sync.remote printed a success tick and exited 0 with no database.
+func bootstrapPlanOutcome(plan BootstrapPlan, jsonMode bool) error {
+	if plan.Action != "none" {
+		return nil
+	}
+	if plan.HasExisting {
+		return nil
+	}
+	if jsonMode {
+		// The plan JSON (including "blocked") is already on stdout.
+		return SilentExit()
+	}
+	// printBootstrapPlan already wrote the reason and hints to stderr.
+	return &exitError{Code: 1}
 }
 
 func noWorkspaceBootstrapPayload() map[string]interface{} {
@@ -507,7 +527,11 @@ func existingBootstrapDBPlan(beadsDir string, cfg *configfile.Config, isServer, 
 			bootstrapRetryDelay(retryDelays[attempt])
 		}
 		if result.Err != nil {
+			// Same "declined, and no database was confirmed" class as a
+			// failed remote probe: report it and exit non-zero rather than
+			// printing a success tick (#5743).
 			plan.Action = "none"
+			plan.Blocked = true
 			plan.Reason = fmt.Sprintf("Could not verify existing server database %s: %v", cfg.GetDoltDatabase(), result.Err)
 			return plan, true
 		}
@@ -586,6 +610,18 @@ func bootstrapServerPort(beadsDir string, cfg *configfile.Config, isSharedServer
 func printBootstrapPlan(plan BootstrapPlan) {
 	switch plan.Action {
 	case "none":
+		if !plan.HasExisting {
+			// Nothing was set up and nothing was found. Never print the
+			// success tick here — that is the #5743 false success.
+			fmt.Fprintf(os.Stderr, "Bootstrap did not set up a database: %s\n", plan.Reason)
+			if plan.Blocked && plan.BlockedRemote != "" {
+				fmt.Fprintf(os.Stderr, "  Verify access: git ls-remote %s refs/dolt/data\n",
+					gitRemoteURLForLsRemote(plan.BlockedRemote))
+				fmt.Fprintf(os.Stderr, "  If this remote should not carry Dolt data, remove 'sync.remote' from %s and re-run 'bd bootstrap' (origin auto-detect will still find refs/dolt/data).\n",
+					filepath.Join(plan.BeadsDir, "config.yaml"))
+			}
+			return
+		}
 		fmt.Printf("✓ Database already exists: %s\n", plan.BeadsDir)
 		if !usesSQLServer() {
 			fmt.Printf("  Nothing to do.\n")

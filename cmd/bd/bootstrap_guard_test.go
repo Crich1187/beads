@@ -4,6 +4,7 @@ package main
 
 import (
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -282,6 +283,171 @@ func TestDetectBootstrapAction_GitForgeSyncRemote_ProbeRouting(t *testing.T) {
 		}
 		if len(probed) != 1 || probed[0] != "git+https://github.com/org/repo.git" {
 			t.Errorf("probe calls = %v, want exactly [%q]", probed, "git+https://github.com/org/repo.git")
+		}
+	})
+}
+
+// TestBootstrapPlanOutcome pins the exit status of every plan shape.
+// Action=="none" used to be an unconditional success, which is how a rejected
+// sync.remote exited 0 with no database (#5743).
+func TestBootstrapPlanOutcome(t *testing.T) {
+	tests := []struct {
+		name     string
+		plan     BootstrapPlan
+		jsonMode bool
+		wantExit int // 0 means "nil error"
+	}{
+		{
+			name:     "existing database is a genuine no-op",
+			plan:     BootstrapPlan{Action: "none", HasExisting: true, Reason: "Database already exists at /tmp/x"},
+			wantExit: 0,
+		},
+		{
+			name:     "blocked remote probe",
+			plan:     BootstrapPlan{Action: "none", Blocked: true, Reason: "could not verify refs/dolt/data"},
+			wantExit: 1,
+		},
+		{
+			name:     "server database unverifiable",
+			plan:     BootstrapPlan{Action: "none", Reason: "Could not verify existing server database beads: dial tcp: refused"},
+			wantExit: 1,
+		},
+		{
+			name:     "sync plan proceeds",
+			plan:     BootstrapPlan{Action: "sync", SyncRemote: "git+https://github.com/org/repo.git"},
+			wantExit: 0,
+		},
+		{
+			name:     "init plan proceeds",
+			plan:     BootstrapPlan{Action: "init"},
+			wantExit: 0,
+		},
+		{
+			name:     "blocked in json mode",
+			plan:     BootstrapPlan{Action: "none", Blocked: true},
+			jsonMode: true,
+			wantExit: 1,
+		},
+		{
+			name:     "existing database in json mode",
+			plan:     BootstrapPlan{Action: "none", HasExisting: true},
+			jsonMode: true,
+			wantExit: 0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := bootstrapPlanOutcome(tt.plan, tt.jsonMode)
+			if tt.wantExit == 0 {
+				if err != nil {
+					t.Fatalf("bootstrapPlanOutcome() = %v, want nil", err)
+				}
+				return
+			}
+			code, ok := exitCodeFromError(err)
+			if !ok {
+				t.Fatalf("bootstrapPlanOutcome() = %v, want an *exitError", err)
+			}
+			if code != tt.wantExit {
+				t.Errorf("exit code = %d, want %d", code, tt.wantExit)
+			}
+		})
+	}
+}
+
+// captureBootstrapOutput runs fn with stdout and stderr redirected, returning
+// everything written to either.
+func captureBootstrapOutput(t *testing.T, fn func()) string {
+	t.Helper()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	oldStdout, oldStderr := os.Stdout, os.Stderr
+	os.Stdout, os.Stderr = w, w
+	done := make(chan string, 1)
+	go func() {
+		b, _ := io.ReadAll(r)
+		done <- string(b)
+	}()
+
+	func() {
+		defer func() {
+			os.Stdout, os.Stderr = oldStdout, oldStderr
+			_ = w.Close()
+		}()
+		fn()
+	}()
+
+	out := <-done
+	_ = r.Close()
+	return out
+}
+
+// TestPrintBootstrapPlan_NoneWithoutDB_NoSuccessTick pins the other half of
+// the #5743 false success: the "✓ Database already exists" line must be
+// reserved for plans that actually found a database.
+func TestPrintBootstrapPlan_NoneWithoutDB_NoSuccessTick(t *testing.T) {
+	t.Run("blocked plan reports the reason and both hints", func(t *testing.T) {
+		plan := BootstrapPlan{
+			Action:        "none",
+			Blocked:       true,
+			BeadsDir:      "/workspace/.beads",
+			BlockedRemote: "git+ssh://github.com/org/repo.git",
+			Reason:        `could not verify refs/dolt/data on sync.remote "git+ssh://github.com/org/repo.git": exit status 128`,
+		}
+
+		out := captureBootstrapOutput(t, func() { printBootstrapPlan(plan) })
+
+		if strings.Contains(out, "✓") || strings.Contains(out, "Database already exists") {
+			t.Fatalf("blocked plan printed a success tick:\n%s", out)
+		}
+		if !strings.Contains(out, plan.Reason) {
+			t.Errorf("output does not carry the reason:\n%s", out)
+		}
+		// The hint must be runnable: git ls-remote does not understand the
+		// git+ prefix, so it is stripped exactly as the probe strips it.
+		if !strings.Contains(out, "git ls-remote ssh://github.com/org/repo.git refs/dolt/data") {
+			t.Errorf("output lacks a runnable ls-remote hint:\n%s", out)
+		}
+		if !strings.Contains(out, filepath.Join("/workspace/.beads", "config.yaml")) {
+			t.Errorf("output does not point at config.yaml:\n%s", out)
+		}
+	})
+
+	t.Run("unblocked none without a database still fails visibly", func(t *testing.T) {
+		plan := BootstrapPlan{
+			Action:   "none",
+			BeadsDir: "/workspace/.beads",
+			Reason:   "Could not verify existing server database beads: dial tcp: connection refused",
+		}
+
+		out := captureBootstrapOutput(t, func() { printBootstrapPlan(plan) })
+
+		if strings.Contains(out, "✓") || strings.Contains(out, "Nothing to do") {
+			t.Fatalf("plan with no database printed a success tick:\n%s", out)
+		}
+		if !strings.Contains(out, "connection refused") {
+			t.Errorf("output does not carry the reason:\n%s", out)
+		}
+	})
+
+	t.Run("existing database keeps the success tick", func(t *testing.T) {
+		plan := BootstrapPlan{
+			Action:      "none",
+			HasExisting: true,
+			BeadsDir:    "/workspace/.beads",
+			Reason:      "Database already exists at /workspace/.beads/embeddeddolt",
+		}
+
+		out := captureBootstrapOutput(t, func() { printBootstrapPlan(plan) })
+
+		if !strings.Contains(out, "✓ Database already exists: /workspace/.beads") {
+			t.Fatalf("existing database lost its success line:\n%s", out)
+		}
+		if !strings.Contains(out, "Nothing to do") {
+			t.Errorf("existing database lost its 'Nothing to do' line:\n%s", out)
 		}
 	})
 }
