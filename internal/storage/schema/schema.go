@@ -667,6 +667,13 @@ func MigrateUp(ctx context.Context, db DBConn) (int, error) {
 	// migrated clones converge to byte-identical, merge-safe dependencies. Runs
 	// here, after the schema migrations (0050 has asserted the canonical schema),
 	// and only on a pass where migration work was needed.
+	//
+	// #5268: ignored migration 0026 is what makes "migration work was needed"
+	// true one more time on every existing clone, so the now merge-aware re-key
+	// reaches the databases a pre-1.3.0 binary left half-re-keyed at the latest
+	// main version. It is also why this call sits ABOVE ignoredSource.migrate:
+	// the marker records only if the re-key returned, so an aborted re-key is
+	// retried on the next open instead of the database claiming it migrated.
 	rekeyed, err := rekeyDependencyIDs(ctx, db)
 	if err != nil {
 		return applied, fmt.Errorf("rekey dependency ids: %w", err)
