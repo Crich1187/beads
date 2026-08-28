@@ -26,7 +26,9 @@ Usage: historical-dolt-upgrade-test.sh [--version VERSION]
 
 Runs the authentic historical SQLite bridges (v0.9.1, v0.17.0, v0.49.6, v0.50.3), historical server-Dolt corpus
 (v0.55.4, v0.56.1, v0.57.0, v0.62.0), and direct embedded-Dolt corpus
-(v0.63.3, v1.0.0, v1.0.1, v1.1.0, v1.1.2) against CANDIDATE_BIN. Every release archive is pinned and verified.
+(v0.63.3, v1.0.0, v1.0.1, v1.1.0, v1.1.2, v1.2.2) against CANDIDATE_BIN. Every release archive is pinned and verified.
+The wisp-capable sources (v1.0.1, v1.1.0, v1.1.2, v1.2.2) additionally run a wisp-plane lane in a fresh workspace,
+which needs the pinned external Dolt runtime as a read-only oracle.
 EOF
 }
 
@@ -1132,6 +1134,13 @@ is_wisp_plane_version() {
     return 1
 }
 
+is_embedded_dolt_version() {
+    case " ${EMBEDDED_DOLT_VERSIONS[*]} " in
+        *" $1 "*) return 0 ;;
+    esac
+    return 1
+}
+
 # A pre-upgrade Dolt remote is authentic input only where the candidate will
 # still migrate the clone. Probed at implementation time: at v1.0.1 a configured
 # remote trips the #4259 designated-migrator refusal (main cursor 32 -> 66 is
@@ -1754,8 +1763,17 @@ for version in "${SELECTED_VERSIONS[@]}"; do
         "$SOURCE_TAG_SQLITE_VERSION") run_v091_upgrade ;;
         "$PRE_CANONICAL_SQLITE_VERSION") run_v017_upgrade ;;
         "$CLASSIC_SQLITE_VERSION"|"$CONFIGURED_SQLITE_VERSION") run_classic_sqlite_upgrade "$version" ;;
-        v0.63.3|v1.0.0|v1.0.1|v1.1.0|v1.1.2) run_embedded_dolt_upgrade "$version" ;;
-        *) run_dolt_upgrade "$version" ;;
+        *)
+            # Membership rather than a second hardcoded list: the embedded
+            # corpus is already declared once in lib/versions.sh, and a copy
+            # here silently routes any newly added version into the server-Dolt
+            # bridge instead.
+            if is_embedded_dolt_version "$version"; then
+                run_embedded_dolt_upgrade "$version"
+            else
+                run_dolt_upgrade "$version"
+            fi
+            ;;
     esac
     printf '  ✓ historical upgrade preserved representative data and schema migration was idempotent\n'
     cleanup
