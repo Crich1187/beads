@@ -192,3 +192,58 @@ func TestNormalizeIssuePrefixAndDatabaseName(t *testing.T) {
 		})
 	}
 }
+
+// TestInitCloneURL pins which URLs init rewrites before handing them to
+// DOLT_CLONE. Forge URLs must arrive in git+ form so Dolt uses the git remote
+// factory rather than the remotesapi retry storm (#4421); a user-configured
+// remotesapi endpoint must arrive byte-identical (GH#3339).
+func TestInitCloneURL(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"raw https forge", "https://github.com/org/repo.git", "git+https://github.com/org/repo.git"},
+		{"forge without .git", "https://github.com/org/repo", "git+https://github.com/org/repo"},
+		{"scp style forge", "git@github.com:org/repo.git", "git+ssh://git@github.com/org/repo.git"},
+		{"ssh forge", "ssh://git@gitlab.com/org/repo.git", "git+ssh://git@gitlab.com/org/repo.git"},
+		{"already normalized", "git+https://github.com/org/repo.git", "git+https://github.com/org/repo.git"},
+
+		{"remotesapi endpoint", "http://myserver:7007/mydb", "http://myserver:7007/mydb"},
+		{"remotesapi https endpoint", "https://doltremoteapi.dolthub.com/org/db", "https://doltremoteapi.dolthub.com/org/db"},
+		{"dolthub native", "dolthub://myorg/mydb", "dolthub://myorg/mydb"},
+		{"s3 native", "s3://bucket/path", "s3://bucket/path"},
+		{"self-hosted dolt over ssh", "git+ssh://my-dolt.example.com/org/db", "git+ssh://my-dolt.example.com/org/db"},
+		{"empty", "", ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := initCloneURL(tt.in); got != tt.want {
+				t.Errorf("initCloneURL(%q) = %q, want %q", tt.in, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestRunInitRemoteCloneReceivesRoutedURL proves the routing survives the call
+// into runInitRemoteClone — the seam the init RunE body actually uses.
+func TestRunInitRemoteCloneReceivesRoutedURL(t *testing.T) {
+	for _, tt := range []struct{ in, want string }{
+		{"https://github.com/org/repo.git", "git+https://github.com/org/repo.git"},
+		{"http://myserver:7007/mydb", "http://myserver:7007/mydb"},
+	} {
+		t.Run(tt.in, func(t *testing.T) {
+			var gotURL string
+			if _, err := runInitRemoteClone(initCloneURL(tt.in), func(url string) error {
+				gotURL = url
+				return nil
+			}); err != nil {
+				t.Fatalf("runInitRemoteClone: %v", err)
+			}
+			if gotURL != tt.want {
+				t.Errorf("clone received %q, want %q", gotURL, tt.want)
+			}
+		})
+	}
+}

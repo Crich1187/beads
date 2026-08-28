@@ -11,6 +11,26 @@ const (
 	initRemoteCloneFresh
 )
 
+// initCloneURL returns the URL init should hand to DOLT_CLONE.
+//
+// A git-forge URL must reach Dolt in its git+ form. Dolt's dbfactory routes by
+// scheme: raw http(s):// goes to the remotesapi client, which speaks Dolt's
+// wire protocol at github.com and retries indefinitely (#4421), while
+// git+https/git+ssh goes to the git remote factory, which shells out to git
+// and fails cleanly. Init has never had bootstrap's forge guard, so a
+// configured `https://github.com/org/repo.git` sync.remote was cloned as-is
+// straight into the storm path.
+//
+// Everything else is returned byte-identical. That preserves GH#3339: a
+// user-configured Dolt remotesapi endpoint (http://myserver:7007/mydb) must
+// never be rewritten to git+http://, and it never classifies as a forge URL.
+func initCloneURL(syncURL string) string {
+	if isGitCodeRepoURL(syncURL) {
+		return normalizeRemoteURL(syncURL)
+	}
+	return syncURL
+}
+
 // runInitRemoteClone runs one remote clone attempt and classifies the result
 // for Init. Empty remotes initialize locally; every other clone error is
 // returned unchanged.

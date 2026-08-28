@@ -1279,6 +1279,10 @@ Non-interactive mode (--non-interactive or BD_NON_INTERACTIVE=1):
 			}
 		}
 		if syncFromRemote {
+			// A raw https:// forge URL would route through Dolt's remotesapi
+			// client and spin forever (#4421); its git+ form routes through
+			// the git remote factory. Non-forge URLs are untouched (GH#3339).
+			syncURL = initCloneURL(syncURL)
 			cloneCfg := initTimeCloneConfig(initServerMode, serverHost, serverPort, serverSocket, serverUser, dbName)
 			disposition, err := runInitRemoteClone(syncURL, func(remoteURL string) error {
 				return cloneFromRemoteWithMode(ctx, beadsDir, remoteURL, dbName, cloneCfg, initRemoteCloneMode(initServerMode, externalServer))
@@ -1730,7 +1734,9 @@ Non-interactive mode (--non-interactive or BD_NON_INTERACTIVE=1):
 			// Must run AFTER createConfigYaml which creates the file.
 			// Persist the effective remote so future bootstrap and hooks know
 			// Dolt, not JSONL, is the cross-machine sync path. Plain git
-			// origins are valid here: the first push creates refs/dolt/data.
+			// origins are valid here: the first push creates refs/dolt/data,
+			// and bootstrap resolves such a URL by probing refs/dolt/data
+			// rather than rejecting it (#5743).
 			if err := persistInitSyncRemote(beadsDir, initRemote, syncURL, syncFromRemote, syncURLFromConfig, syncURLFromGitOrigin); err != nil {
 				return fmt.Errorf("failed to persist sync.remote to config.yaml: %v", err)
 			}
