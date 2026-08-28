@@ -674,8 +674,22 @@ func MigrateUp(ctx context.Context, db DBConn) (int, error) {
 	// main version. It is also why this call sits ABOVE ignoredSource.migrate:
 	// the marker records only if the re-key returned, so an aborted re-key is
 	// retried on the next open instead of the database claiming it migrated.
-	rekeyed, err := rekeyDependencyIDs(ctx, db)
+	//
+	// dirtyBefore goes in because that same ordering means the changed-signature
+	// guard below runs AFTER the marker is durably recorded: a re-key that wrote
+	// into a pre-existing dirty table would fail the pass once and then never
+	// retry. The re-key refuses at plan time instead, before any write.
+	rekeyed, err := rekeyDependencyIDs(ctx, db, dirtyBefore)
 	if err != nil {
+		// The two refusals the re-key raises deliberately carry their own
+		// user-facing recovery text and are matched with errors.As by the
+		// callers that must stay open (embeddeddolt's non-strict intents), so
+		// they travel unwrapped rather than under a mechanical prefix.
+		var dirtyErr *DirtyTablesError
+		var conflictErr *DependencyRekeyConflictError
+		if errors.As(err, &dirtyErr) || errors.As(err, &conflictErr) {
+			return applied, err
+		}
 		return applied, fmt.Errorf("rekey dependency ids: %w", err)
 	}
 	backfilled = backfilled || rekeyed
