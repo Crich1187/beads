@@ -19,24 +19,54 @@ withheld. Read the upgrade notes before installing.
 
 **The first invocation migrates your schema, in place, from v53 to v66.** A
 v1.2.2 (or any 1.1.x) database sits at main-series schema v53; this binary
-knows v66, so the first command that opens the store applies 13 migrations
-(`0054_add_lease_columns` through `0066_add_events_journal_actor`), plus the
-clone-local series that tracks it. Two of those passes rewrite rows rather than
-just reshaping tables — the aux-row id rekey and the `events` dolt_ignore flip
-described under **Changed** — so on a large store the first invocation is
-*noticeably* slower than the ones after it. It is crash-resumable and picks up
-where it left off, but do not interrupt it if you can avoid it. Migration
-progress prints per step on stderr (`Applying migration 0054: add_lease_columns…`),
-though only when stderr is a terminal: piped and CI runs see nothing, which is
-deliberate and means a silent-looking CI upgrade is not a stuck one.
+knows v66, so the first command that opens the store applies 13 main-series
+migrations, `0054_add_lease_columns` through `0066_add_events_journal_actor`.
+Two of those passes rewrite rows rather than just reshaping tables — the
+aux-row id rekey and the `events` dolt_ignore flip described under **Changed** —
+so on a large store the first invocation is *noticeably* slower than the ones
+after it. It is crash-resumable and picks up where it left off, but do not
+interrupt it if you can avoid it.
 
-**Back up first.** A JSONL export is cheap, issue-complete, and importable by
-any bd version:
+**The counter restarts partway through, and that is not a loop.** The
+clone-local (dolt_ignored) series runs after the main one, through the same
+printer and its own numbering, and it moves 0011 → 0025 on this upgrade. So the
+run is about **27 migrations**, not 13, and what you see on stderr is 13 lines
+counting up to 0066 followed by 14 lines starting again at 0012:
+
+```
+Applying migration 0065: widen_wisp_comments_text…
+Applying migration 0066: add_events_journal_actor…
+Applying migration 0012: create_leases…      ← clone-local series, not a restart
+```
+
+A counter that jumps backwards is the signature operators kill runs over. Let
+it finish.
+
+Progress prints only when stderr is a terminal. Piped and CI runs see nothing
+at all, which is deliberate — a silent-looking CI upgrade is not a stuck one.
+
+**Back up first, with the binary you have now.** Take the backup *before* you
+install 1.3.0. Under the new binary `bd export` triggers the auto-migration
+before it exports, so a snapshot taken afterwards is a post-migration snapshot
+and cannot protect you against the migration going wrong. On a remote-backed
+store, finish syncing with the old binary too: once 1.3.0 is installed the
+pending-migration gate refuses `bd dolt push` and `bd dolt pull` as well, not
+just `bd migrate`.
 
 ```bash
+# with your CURRENT bd, before installing 1.3.0:
+bd dolt push                                                   # remote-backed stores only
 bd export --all -o .beads/backup/pre-1.3.0-$(date +%Y%m%d).jsonl
-# or, for a full snapshot including Dolt history and config:
-bd backup
+```
+
+A JSONL export is cheap, issue-complete, and importable by any bd version. If
+you want a Dolt-native snapshot that keeps history and config, configure a
+destination and sync it — **bare `bd backup` takes no backup**, it is a command
+group that prints help and exits 0:
+
+```bash
+bd backup init <path-or-dolthub-url>   # once, to configure a destination
+bd backup sync                         # take the snapshot
 ```
 
 **Upgrade every client that shares a store, together.** The forward schema-skew
@@ -60,11 +90,16 @@ v66, with the version numbers adjusted.
 
 ### Breaking changes for v1.2.2 users
 
-Seven documented behavioral breaks reach a v1.2.2 user on this upgrade. Five of
-them were documented under [1.2.1] and are restated here because that release
-never reached anyone still on the supported line — [1.2.2] withheld them and
-v1.2.1 itself was pulled. The other two are new in 1.3.0 and are written up in
-full under **Changed** below.
+**This is a highlights list, not the complete set.** A v1.2.2 user is crossing
+two releases at once, and the breaks below are the ones most likely to stop a
+script or a service. The full set is the `[1.2.1]` section further down plus the
+**Changed** section here — read `[1.2.1]` in full before upgrading, since
+[1.2.2] withheld it and v1.2.1 itself was pulled, so nobody on the supported
+line has seen it.
+
+After upgrading, `bd upgrade review` prints exactly the entries between the
+version you were running and this one. (Prefer it to `bd info --whats-new`,
+which dumps the entire release history.)
 
 **Carried from [1.2.1] — never shipped to v1.2.2 users:**
 
@@ -97,6 +132,22 @@ full under **Changed** below.
   a whole issue database to a public origin on a command the user believed
   targeted an already-configured remote. Adoption now prompts (defaulting to
   no) and fails closed non-interactively. `--yes`/`-y` consents ahead of time.
+- **`bd --readonly serve` is refused instead of binding a server that cannot do
+  what it advertises.** On a Dolt SQL-server workspace the flag was previously a
+  silent no-op and the server came up fully writable, so anything scripted as a
+  "safe" read-only server **does not start after this upgrade** — drop the flag.
+  Worth checking before you restart a long-running `bd serve` as part of the
+  fleet upgrade above.
+- **`bd config list` and `GET /v0/beads/config` no longer enumerate the `kv.`
+  plane**, which is where `bd remember` memories live. That closed an
+  unauthenticated `GET /v0/beads/config` handing out every stored memory. A
+  script that read memories out of `bd config list` now gets empty output rather
+  than an error; use `bd kv` / `bd remember` instead.
+- **The published `backend` package drops orphan handling** (bd-gwryr).
+  `backend.OrphanHandling` and its four constants, the `storage` originals they
+  aliased, `BatchCreateOptions.OrphanHandling` and `issueops.CheckOrphan` are
+  removed. They never did anything except cost a query, but a Go consumer that
+  names them no longer compiles.
 
 **New in 1.3.0** (full entries under **Changed**):
 

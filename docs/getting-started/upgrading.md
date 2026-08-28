@@ -11,9 +11,12 @@ How to upgrade bd and keep your projects in sync.
 # Current version
 bd version
 
-# What's new in recent versions
+# What changed since the version you were running — the delta, not the archive
+bd upgrade review
+bd upgrade review --json  # Machine-readable
+
+# The full release history (large; every version bd knows about)
 bd info --whats-new
-bd info --whats-new --json  # Machine-readable
 ```
 
 ## Short Version
@@ -22,11 +25,11 @@ bd info --whats-new --json  # Machine-readable
    new binary:
    `bd dolt push`
    `bd dolt pull`
-2. Back up before migration:
+2. Back up **with that same current binary**, before installing:
    `bd export --all -o .beads/backup/pre-migrate-$(date +%Y%m%d).jsonl`
 3. Upgrade using the command that matches your install method.
 4. After upgrading:
-   `bd info --whats-new`
+   `bd upgrade review`
    `bd hooks install`
    `bd version`
 5. If crossing a schema migration on a remote-backed database, only the
@@ -141,36 +144,64 @@ bd migrate --yes
 
 ### Upgrading to 1.3.0
 
-A 1.2.2 or 1.1.x database sits at schema v53, and 1.3.0 knows v66 — this
-upgrade crosses **13 migrations** in one step. That is more than a routine
-upgrade, because 1.2.2 was a recovery release that shipped the 1.1 code under a
-higher version number, so there is a release line's worth of schema between the
-two.
+A 1.2.2 or 1.1.x database sits at schema v53, and 1.3.0 knows v66. That is more
+than a routine upgrade: 1.2.2 was a recovery release that shipped the 1.1 code
+under a higher version number, so there is a release line's worth of schema
+between the two.
 
-The first command you run after installing applies all 13, in place. Expect it
-to take noticeably longer than the commands after it: two of the passes rewrite
-rows rather than reshaping tables. It is crash-resumable and picks up where it
-left off, but let it finish. Progress prints per migration:
+#### Back up first, with the binary you have now
+
+Do this **before** you install 1.3.0. Under the new binary, `bd export` triggers
+the migration before it exports, so a snapshot taken afterwards is a
+post-migration snapshot and cannot protect you against the migration going
+wrong. The same ordering rule as the section below applies: do all syncing with
+your **current** binary, since once 1.3.0 is installed the pending-migration
+gate refuses `bd dolt push` and `bd dolt pull` too.
+
+```bash
+# with your CURRENT bd:
+bd dolt push                                                   # remote-backed stores only
+bd export --all -o .beads/backup/pre-1.3.0-$(date +%Y%m%d).jsonl
+```
+
+For a Dolt-native snapshot that keeps history and config, configure a
+destination and sync it. Bare `bd backup` takes no backup — it is a command
+group that prints help and exits 0:
+
+```bash
+bd backup init <path-or-dolthub-url>   # once, to configure a destination
+bd backup sync                         # take the snapshot
+```
+
+#### What the migration looks like
+
+The first command you run after installing applies the whole set, in place. The
+main series runs 0054 → 0066 (13 migrations), and then the clone-local series
+runs through the same printer with its own numbering, 0012 → 0025 — so it is
+about **27 migrations**, and the counter visibly restarts partway through:
 
 ```
-Applying migration 0054: add_lease_columns…
-  done (0.4s)
+Applying migration 0065: widen_wisp_comments_text…
+Applying migration 0066: add_events_journal_actor…
+Applying migration 0012: create_leases…      ← clone-local series, not a restart
 ```
 
-Those lines go to stderr and only when stderr is a terminal, so a piped or CI
-upgrade prints nothing. Silence there is not a stall.
+A counter jumping backwards looks exactly like a loop. It is not one — let it
+finish. Expect the run to take noticeably longer than the commands after it
+(two passes rewrite rows rather than reshaping tables). It is crash-resumable
+and picks up where it left off.
 
-Two things to get right before you start:
+Those lines go to stderr, and only when stderr is a terminal, so a piped or CI
+upgrade prints nothing at all. Silence there is not a stall either.
 
-- **Back up.** Take the export described under [Remote-backed databases and
-  multiple clones](#remote-backed-databases-and-multiple-clones) below —
-  it applies to a local database too, and it matters more than usual here,
-  since 13 migrations is 13 chances for a drifted database to be caught out.
-- **Upgrade every client that shares a store, together.** A bd binary refuses a
-  database migrated past the schema it knows, rather than proceeding blind. One
-  machine upgrading takes the shared store forward and every client still on
-  1.2.2 stops working. Check for a second binary earlier in your `PATH` with
-  `which -a bd`, and restart any long-running `bd serve`.
+#### Upgrade every client that shares a store, together
+
+A bd binary refuses a database migrated past the schema it knows, rather than
+proceeding blind. One machine upgrading takes the shared store forward and every
+client still on 1.2.2 stops working. Check for a second binary earlier in your
+`PATH` with `which -a bd`, and restart any long-running `bd serve` — noting that
+`bd --readonly serve` is now refused outright, so a server scripted with that
+flag will not come back up until you drop it.
 
 If you need to go back, the rollback is a schema-cursor rollback rather than a
 downgrade of the data — see
@@ -178,9 +209,9 @@ downgrade of the data — see
 procedure is the same for any cursor rollback even though its worked example is
 that release.
 
-`bd info --whats-new` summarizes the behavior changes that land with the
-migration; several commands changed defaults, so read it before your first
-session on the new binary.
+Once you are on the new binary, `bd upgrade review` prints exactly the changes
+between the version you were running and this one. Several commands changed
+defaults, so read it before your first session.
 
 ### Remote-backed databases and multiple clones
 
