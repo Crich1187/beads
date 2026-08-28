@@ -7,6 +7,105 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-08-28
+
+The first tested release off `main` since the 1.1 line. [1.2.2] was a recovery
+release that re-shipped the v1.1.2 code under a higher version number, so a
+v1.2.2 user is running 1.1-era code and meets **everything** below at once:
+the changes listed here, plus the [1.2.1] changes that release deliberately
+withheld. Read the upgrade notes before installing.
+
+### Upgrade notes
+
+**The first invocation migrates your schema, in place, from v53 to v66.** A
+v1.2.2 (or any 1.1.x) database sits at main-series schema v53; this binary
+knows v66, so the first command that opens the store applies 13 migrations
+(`0054_add_lease_columns` through `0066_add_events_journal_actor`), plus the
+clone-local series that tracks it. Two of those passes rewrite rows rather than
+just reshaping tables — the aux-row id rekey and the `events` dolt_ignore flip
+described under **Changed** — so on a large store the first invocation is
+*noticeably* slower than the ones after it. It is crash-resumable and picks up
+where it left off, but do not interrupt it if you can avoid it. Migration
+progress prints per step on stderr (`Applying migration 0054: add_lease_columns…`),
+though only when stderr is a terminal: piped and CI runs see nothing, which is
+deliberate and means a silent-looking CI upgrade is not a stuck one.
+
+**Back up first.** A JSONL export is cheap, issue-complete, and importable by
+any bd version:
+
+```bash
+bd export --all -o .beads/backup/pre-1.3.0-$(date +%Y%m%d).jsonl
+# or, for a full snapshot including Dolt history and config:
+bd backup
+```
+
+**Upgrade every client that shares a store, together.** The forward schema-skew
+guard means an older co-resident binary — a second `bd` earlier in `PATH`, a
+long-running `bd serve`, another clone's cron job — refuses a database migrated
+past what it knows, rather than proceeding blind. That is the guard working, not
+a bug, but it makes a mixed-version fleet a broken fleet: one machine running
+1.3.0 takes the whole store forward and every 1.2.2 client stops. Run
+`which -a bd` after installing, and on a remote-backed store follow the existing
+designated-migrator procedure (one clone migrates and pushes; the rest pull or
+re-clone). See
+[Upgrading](https://beads.gascity.com/getting-started/upgrading) for the
+per-install-method recipes and the multi-clone flow.
+
+**If you need to go back**, the rollback is a schema-cursor rollback, not a
+downgrade of the data: the procedure is written up in the
+[recovery runbook](https://beads.gascity.com/recovery/accidental-1-2-1-release)
+(repo copy: `docs/recovery/accidental-1-2-1-release.md`). Its worked example is
+the v53↔v65 case from the accidental 1.2.1 release; the steps are the same for
+v66, with the version numbers adjusted.
+
+### Breaking changes for v1.2.2 users
+
+Seven documented behavioral breaks reach a v1.2.2 user on this upgrade. Five of
+them were documented under [1.2.1] and are restated here because that release
+never reached anyone still on the supported line — [1.2.2] withheld them and
+v1.2.1 itself was pulled. The other two are new in 1.3.0 and are written up in
+full under **Changed** below.
+
+**Carried from [1.2.1] — never shipped to v1.2.2 users:**
+
+- **`bd update --status <done-status>` now enforces close policy.** Moving an
+  issue to `closed` (or any configured done-category status) via `bd update`,
+  `bd batch update`, or the issueops facade refuses when the issue has open
+  children or a live direct blocker, matching `bd close`. Override with
+  `bd update --force` (`update <id> status=closed force=true` in `bd batch`;
+  `UpdateRequest.ForceClosePolicy` for facade consumers). An unforced refusal
+  rolls back the entire batch.
+- **`bd search` includes closed issues by default** (bd-t5yex). The dominant
+  query is "was this already found/filed/fixed?", where excluding closed issues
+  produced a false "no". Narrow with `--status open` to get the old behavior.
+  `bd list` keeps its open-only default.
+- **The no-ID "last touched issue" fallback on `bd update` / `bd close` is
+  interactive-only** (bd-m00pb,
+  [#4839](https://github.com/gastownhall/beads/pull/4839)). A scripted
+  `bd update $ID …` with an empty `$ID` now refuses in argument validation
+  instead of mutating whatever was touched last. The fallback requires a
+  terminal stdin; `BD_NON_INTERACTIVE=1` and `CI=1/true` also disable it. Set
+  `BD_LAST_TOUCHED_FALLBACK=1` if a script genuinely relied on it.
+- **`bd human list` hides done/frozen and pinned beads by default, and
+  validates `--status`** (#5332). It previously passed `--status` through
+  unvalidated and showed closed beads. A `--status` typo is now an error rather
+  than an empty list. Every bead *type* still shows.
+- **`bd dolt push` and `bd sync` no longer adopt a git-origin-derived Dolt
+  remote without consent** (#5068). Both used to silently derive a remote from
+  `git remote get-url origin`, persist `sync.remote`, commit that config change
+  under your git identity, and upload the full issue history — which published
+  a whole issue database to a public origin on a command the user believed
+  targeted an already-configured remote. Adoption now prompts (defaulting to
+  no) and fails closed non-interactively. `--yes`/`-y` consents ahead of time.
+
+**New in 1.3.0** (full entries under **Changed**):
+
+- An explicitly configured Dolt server port now outranks the ambient
+  `BEADS_DOLT_PORT` environment variable.
+- Actor matching decodes an exact `--` run to `/` instead of collapsing it to a
+  generic separator, so `gastown--mayor` matches `gastown/mayor` and stops
+  matching `gastown__mayor`.
+
 ### Added
 
 - **The events journal records WHO performed each mutation.** `bd_events_journal`
@@ -51,7 +150,158 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   concept, themes are labels here, and `--label theme:x` is the native way to
   say it.
 
+- **New `*.gate.lock` files appear next to and inside `.beads`** ([#5046](https://github.com/gastownhall/beads/pull/5046),
+  [#5093](https://github.com/gastownhall/beads/pull/5093)). A two-level
+  cooperative gate now serializes the operations that cannot safely overlap —
+  ordinary commands take it shared, maintenance like `bd backup restore` takes
+  it exclusive. It is `flock`-based, so the file is the lock's *name*, not its
+  state: the gate is created once (mode `0600`) and deliberately never deleted,
+  because deleting it is how two processes end up holding two different locks
+  for the same resource. Each gate sits *beside* what it guards, never inside
+  it: the workspace gate for `<dir>/.beads` is `<dir>/.beads.gate.lock` in the
+  project root, and the physical-root gate is `.beads/embeddeddolt.gate.lock` in
+  the default embedded mode (`.beads/dolt.gate.lock` under a server layout;
+  under the shared server it lives beside `~/.beads/shared-server/dolt` and
+  never enters the workspace at all; a remote Dolt host has no physical gate).
+  Both are covered by the `*.gate.lock*` pattern `bd doctor` maintains in the
+  project and `.beads` gitignores, so an upgraded workspace picks up the ignore
+  rule on the next `bd doctor --fix`; a workspace with no `.beads` directory is
+  not gated at all, rather than scattering lock files into whatever directory
+  `bd` was run from.
+
+- **`sort` on `GET /v0/beads/issues`.** The listing served one order —
+  `(created_at DESC, id ASC)` — because the cursor is a keyset position in it,
+  and the spec said so in its own words: "the sort order is welded to the cursor
+  contract, and a new order needs new surface." The cost of that welding fell on
+  every client that wanted `bd list`'s ordering, because the only way to get it
+  was to page the whole result set and re-sort locally. Measured over a
+  1400-row store at the 200-row page an HTTP client actually uses, that is
+  **7 requests plus a client-side comparator; `?sort=priority` is 1**
+  (`TestProxiedServerListSortRetiresTheWalk`, which runs both strategies against
+  a real `bd serve` and checks both against `bd list --json` row for row). It is
+  the one cost on this surface that got worse as a project grew.
+
+  **Two values, and the set is closed.** `created` is the existing order, now
+  spellable. `priority` is `(priority ASC, created_at DESC, id ASC)` — `bd
+  list`'s flagless ordering, which is also what `bd list --sort priority`
+  produces, so one served order retires the walk for both. The other seven
+  orders `bd list --sort` takes are not offered: each value here is a cursor
+  contract needing a key proven total, and `id` is a natural-numeric order no
+  database expresses, `updated` moves on every write, `closed` is nullable, and
+  `status`/`title`/`type`/`assignee` are mutable and unindexed.
+
+  **Absent `sort` still means `created`, permanently.** It is the compatibility
+  contract for every client written before the parameter existed; changing it
+  would alter which rows a truncated page contains, with no error to notice it
+  by. A server that predates the parameter answers `param: "sort"` with
+  `reason: "unknown_parameter"`, which is the per-parameter capability probe a
+  client dispatches on to fall back.
+
+  **The cursor now carries its order, and a mismatch is refused.** This is the
+  half that makes the parameter safe rather than merely useful. The token was
+  base64 of `{t,i}` with no binding, so a `created`-order cursor replayed under
+  `sort=priority` would have decoded perfectly and been read as a position in a
+  different total order — a page that both skips and duplicates rows, served
+  with a 200, undetectable by the client. Tokens are now `v2` with an explicit
+  order member and decode refuses any token whose order differs from the
+  request's, as `invalid_cursor` (documented recovery: restart paging).
+  Outstanding `v1` tokens stay readable as the `created`-order positions they
+  are, so **no traversal in flight has to restart**. This does not contradict
+  "the token carries no filters": filters select the set, the order decides what
+  the position means.
+
+  **`priority` is a mutable key**, which `created_at` is not, and the spec says
+  so: under `created` only new rows move relative to a walk, while a priority
+  update moves an existing row too, so it can be seen twice or missed. That is
+  the already-documented "a cursor pins a position, not a snapshot" caveat
+  reached by a second route, not a new class of error — unchanged data never
+  skips or repeats under either order.
+
 ### Changed
+
+- **`--profile` is now `--cpu-profile`, with no alias**
+  ([#5126](https://github.com/gastownhall/beads/pull/5126), bd-ugz). The
+  persistent flag that writes a CPU profile is spelled `--cpu-profile`; the old
+  `--profile` spelling is gone rather than deprecated, so it fails as an unknown
+  flag instead of silently doing nothing. `--profile` is the conventional name
+  for a *named configuration*, not for pprof output, and holding it hostage to
+  a debugging aid nobody passes twice a year was the wrong trade. Scripts and
+  aliases that profile bd need the new spelling.
+
+- **Migration 0061 rekeys every events, comments, snapshot and
+  compaction-snapshot row to a content-derived id**
+  ([#5150](https://github.com/gastownhall/beads/pull/5150), bd-ri8bd). Those
+  four aux tables minted random UUIDv7 ids, which is fine for a single writer
+  and wrong for replication: unversioned newest-wins replication has no merge
+  pass, so two clones recording the same fact produced two rows that never
+  converged. Ids are now UUIDv5 over a SHA-256 digest of the row's own content
+  (frozen column order, plus the table name and a duplicate-disambiguating
+  ordinal), so the same fact derives the same id everywhere and convergence is
+  a property of the key rather than of a reconciliation step. New rows derive
+  their id at insert; existing rows are converted by a **one-time bulk rekey**
+  on the first open after upgrade, which is the main reason that invocation is
+  slower than the ones after it. The pass is crash-resumable through a
+  `local_metadata` sentinel and records completion clone-locally, so it runs
+  once per clone and is not repeated on the next command. `wisp_events` and
+  `wisp_comments` are deliberately excluded — they are clone-local and never
+  merge. **Any external reference to an event, comment or snapshot id taken
+  before the upgrade will not resolve afterwards.**
+
+- **The `events` audit table is now clone-local**
+  ([#5162](https://github.com/gastownhall/beads/pull/5162), bd-red8u).
+  Migration 0062 moves `events` onto the dolt_ignored plane in a self-committing
+  drop/commit/recreate that preserves every row. Events are single-writer audit
+  rows with low cross-machine value, and minting a versioned Dolt commit for
+  each one was the dominant source of commit churn on a busy store. The
+  consequence is the point: **`events` rows no longer replicate.** They keep
+  full SQL durability locally and `bd history <id> --events` still reads them,
+  but a pull no longer brings another machine's events over, and a push no
+  longer sends yours. Events already committed before the flip stay in the
+  remote's history until the next squash window. Comments stay versioned.
+
+- **The `interactions.jsonl` audit sidecar is opt-in**
+  ([#4688](https://github.com/gastownhall/beads/pull/4688), fixes
+  [#4687](https://github.com/gastownhall/beads/issues/4687)). `audit.enabled`
+  now defaults to **false** and `bd init` no longer creates the file, so
+  status/assignee/priority field-change logging writes nothing unless you ask
+  for it. Set `audit.enabled=true` (or `BD_AUDIT_ENABLED=1`) to restore the old
+  behavior. The database-backed replacement is `bd history <id> --events`, which
+  needs no sidecar. Anything that read `.beads/interactions.jsonl` on the
+  assumption it would exist needs the config key set.
+
+- **`bd import` refuses a redirected stdin rather than quietly ignoring it**
+  ([#5171](https://github.com/gastownhall/beads/pull/5171), bd-axluy). Bare
+  `bd import` imports the default JSONL, and `bd import -` imports stdin; a
+  `bd import < file.jsonl` looked like the second and behaved like the first,
+  importing a different file than the one on the command line with no way to
+  notice. With stdin redirected, no `-`, and no named source, `bd import` now
+  errors and names both fixes. `/dev/null` is a character device, so a scripted
+  bare `bd import` under a subprocess still imports the default file as before.
+
+- **Auto-backup defaults to off under a Dolt sql-server** (wy-zrmqr). The
+  automatic backup used to switch itself on whenever a git remote existed,
+  regardless of storage mode — which on one shared sql-server meant ~31 clients
+  independently deciding to back up the same database, pinning its CPU. The
+  default is now off in server, proxied-server and shared-server modes (and in
+  nocgo builds, which are always server-backed); embedded mode is unchanged and
+  still enables it when a git remote is present. An explicitly configured
+  `backup.enabled` (or `BD_BACKUP_ENABLED`) always wins over the default, and
+  `bd config get backup.enabled` now prints the effective value with its source
+  — `default (auto: off in sql-server mode)` — rather than a bare `false` that
+  could not be told apart from a configured one.
+
+- **`bd hooks install --chain` and `--force` are accepted no-ops**
+  ([#5284](https://github.com/gastownhall/beads/pull/5284), bd-5vdt8). Managed
+  `BEGIN`/`END BEADS INTEGRATION` marker sections made both flags meaningless:
+  an install now replaces only the content between its own markers, so content
+  outside them is *always* preserved (what `--force` used to negate) and an
+  existing hook *always* keeps running alongside the bd section (what `--chain`
+  used to request). The flags remain registered so existing invocations do not
+  break, and `--json` still echoes them, but neither changes what is written.
+  A hook with no markers is handled by shape: a legacy bd hook is replaced, and
+  a foreign one gets a one-time `<hook>.backup` sidecar before the section is
+  injected. Symlinked and git-tracked hook paths are refused outright, before
+  anything is written.
 
 - **Write commands now refuse to run while a MIGRATION-FREEZE sentinel sits
   at the town root** (dc-6jaq), mirroring the gate the gt CLI already applies
@@ -172,6 +422,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   or mixed runs, `__` and `---` included, are unaffected and still collapse.
 
 ### Fixed
+
+- **`bd purge` and `bd prune` select candidates by TIER, so a typed wisp is
+  ephemeral however it was minted**
+  ([#5995](https://github.com/gastownhall/beads/pull/5995)). The two sweeps
+  split the world between them — `bd purge` clears the ephemeral tier, `bd
+  prune` the durable one — but membership was decided by the raw `ephemeral`
+  column, and a wisp minted before that column was set carried a `wisp_type`
+  with `ephemeral = 0`. Such a bead belonged to neither sweep: `bd purge`
+  reported "No closed ephemeral beads to purge" while `bd prune` skipped it as
+  a wisp. One production database had 858 such rows / 7.3 MB that no sweep
+  could ever reach. The tiers are now complementary predicates over both
+  columns — ephemeral is `ephemeral = 1 OR wisp_type` is non-empty, durable is
+  its exact complement — evaluated across both planes rather than taking the
+  wisps-plane fast path, because legacy typed wisps live in the `issues` table.
+  A non-empty `wisp_type` now also implies ephemeral at mint, on every create
+  path, so no new bead can land in the gap. **A previously unreachable typed
+  wisp is now a `bd purge` candidate**, so the first purge after upgrade may
+  clear considerably more than usual. NoHistory beads (wisps plane, no
+  `wisp_type`) stay durable-tier, unchanged.
 
 - **`bd prime` says when it could NOT read the memory plane**
   ([#5877](https://github.com/gastownhall/beads/issues/5877)). A broken or
@@ -432,53 +701,6 @@ stopgap (`BD_IGNORE_SCHEMA_SKEW=1`).
   `go install github.com/steveyegge/beads/cmd/bd@latest` resolves to this
   release instead of the accidental one. (The retract block is also
   carried on main so future tags keep the retractions.)
-- **`sort` on `GET /v0/beads/issues`.** The listing served one order —
-  `(created_at DESC, id ASC)` — because the cursor is a keyset position in it,
-  and the spec said so in its own words: "the sort order is welded to the cursor
-  contract, and a new order needs new surface." The cost of that welding fell on
-  every client that wanted `bd list`'s ordering, because the only way to get it
-  was to page the whole result set and re-sort locally. Measured over a
-  1400-row store at the 200-row page an HTTP client actually uses, that is
-  **7 requests plus a client-side comparator; `?sort=priority` is 1**
-  (`TestProxiedServerListSortRetiresTheWalk`, which runs both strategies against
-  a real `bd serve` and checks both against `bd list --json` row for row). It is
-  the one cost on this surface that got worse as a project grew.
-
-  **Two values, and the set is closed.** `created` is the existing order, now
-  spellable. `priority` is `(priority ASC, created_at DESC, id ASC)` — `bd
-  list`'s flagless ordering, which is also what `bd list --sort priority`
-  produces, so one served order retires the walk for both. The other seven
-  orders `bd list --sort` takes are not offered: each value here is a cursor
-  contract needing a key proven total, and `id` is a natural-numeric order no
-  database expresses, `updated` moves on every write, `closed` is nullable, and
-  `status`/`title`/`type`/`assignee` are mutable and unindexed.
-
-  **Absent `sort` still means `created`, permanently.** It is the compatibility
-  contract for every client written before the parameter existed; changing it
-  would alter which rows a truncated page contains, with no error to notice it
-  by. A server that predates the parameter answers `param: "sort"` with
-  `reason: "unknown_parameter"`, which is the per-parameter capability probe a
-  client dispatches on to fall back.
-
-  **The cursor now carries its order, and a mismatch is refused.** This is the
-  half that makes the parameter safe rather than merely useful. The token was
-  base64 of `{t,i}` with no binding, so a `created`-order cursor replayed under
-  `sort=priority` would have decoded perfectly and been read as a position in a
-  different total order — a page that both skips and duplicates rows, served
-  with a 200, undetectable by the client. Tokens are now `v2` with an explicit
-  order member and decode refuses any token whose order differs from the
-  request's, as `invalid_cursor` (documented recovery: restart paging).
-  Outstanding `v1` tokens stay readable as the `created`-order positions they
-  are, so **no traversal in flight has to restart**. This does not contradict
-  "the token carries no filters": filters select the set, the order decides what
-  the position means.
-
-  **`priority` is a mutable key**, which `created_at` is not, and the spec says
-  so: under `created` only new rows move relative to a walk, while a priority
-  update moves an existing row too, so it can be seen twice or missed. That is
-  the already-documented "a cursor pins a position, not a snapshot" caveat
-  reached by a second route, not a new class of error — unchanged data never
-  skips or repeats under either order.
 
 ## [1.2.1] - 2026-08-11
 
