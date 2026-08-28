@@ -98,7 +98,10 @@ jobs:
           sudo timeout 180 apt-get install -y jq libicu74
 
       - name: Install Dolt test runtime
-        if: contains(fromJSON('["v0.55.4","v0.56.1","v0.57.0","v0.62.0"]'), matrix.version)
+        # v0.55.4-v0.62.0 host their fixture on this server; v1.0.1-v1.1.2 use
+        # the same pinned binary as a read-only oracle over the wisp plane,
+        # which has no `bd dolt sql` equivalent.
+        if: contains(fromJSON('["v0.55.4","v0.56.1","v0.57.0","v0.62.0","v1.0.1","v1.1.0","v1.1.2"]'), matrix.version)
         run: |
           archive="$RUNNER_TEMP/dolt-linux-amd64.tar.gz"
           runtime="$RUNNER_TEMP/dolt-runtime"

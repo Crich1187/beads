@@ -35,6 +35,18 @@ declare -ar EMBEDDED_DOLT_VERSIONS=(
     "v1.1.2"
 )
 
+# Embedded-Dolt sources whose wisp plane is close enough to the 1.3.0 input
+# regimes to be worth seeding: v1.0.1 is the legacy single-target
+# wisp_dependencies shape with no ignored-migration cursor, v1.1.0/v1.1.2 are
+# the post-split shape with the cursor parked at ignored-0011. Both are replayed
+# over populated rows by the candidate's main 0054-0066 + ignored 0012-0025
+# chain. Also gates the external Dolt oracle download in migration-test.yml.
+declare -ar WISP_PLANE_VERSIONS=(
+    "v1.0.1"
+    "v1.1.0"
+    "v1.1.2"
+)
+
 # The test server is an external compatibility fixture, not the runner's
 # ambient Dolt installation. CI downloads this exact linux/amd64 archive.
 readonly DOLT_TEST_RUNTIME_VERSION="v2.1.8"
