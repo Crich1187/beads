@@ -618,6 +618,47 @@ func TestRecordTipShownSkippedDuringFreeze(t *testing.T) {
 	}
 }
 
+// TestMigrationFreezeProbeAndTargetedGate pins the two entry points that exist
+// for callers outside PersistentPreRunE: the silent probe used by diagnosis
+// paths that must keep running while frozen but skip their own writes, and the
+// targeted refusal for a command handed a workspace other than the one it was
+// launched in (`bd doctor /frozen/repo`). Both must agree with the gate.
+func TestMigrationFreezeProbeAndTargetedGate(t *testing.T) {
+	unrelated := t.TempDir()
+	frozenRoot := t.TempDir()
+	writeFreezeMarker(t, frozenRoot, "migrator", "cross-tree migration")
+	target := filepath.Join(frozenRoot, "repo")
+	if err := os.MkdirAll(target, 0755); err != nil {
+		t.Fatalf("creating %s: %v", target, err)
+	}
+	t.Chdir(unrelated)
+	t.Setenv(migration.EnvFreezeFile, "")
+	t.Setenv("BEADS_DIR", "")
+
+	if migrationFreezeActive() {
+		t.Errorf("migrationFreezeActive() = true with an unrelated cwd and no marker above it")
+	}
+
+	var gateErr error
+	stderr := captureStderr(t, func() { gateErr = migrationFreezeErrorFor("doctor --fix", target) })
+	if gateErr == nil {
+		t.Fatalf("migrationFreezeErrorFor returned nil for a frozen target — a named workspace must be checked")
+	}
+	code, ok := exitCodeFromError(gateErr)
+	if !ok || code != ExitMigrationFrozen {
+		t.Errorf("exitCodeFromError = (%d, %v), want (%d, true)", code, ok, ExitMigrationFrozen)
+	}
+	if !strings.Contains(stderr, "doctor --fix") {
+		t.Errorf("refusal does not name the operation it was given:\n%s", stderr)
+	}
+
+	// The probe agrees once the frozen tree is the one bd resolved.
+	t.Chdir(target)
+	if !migrationFreezeActive() {
+		t.Errorf("migrationFreezeActive() = false inside a frozen tree")
+	}
+}
+
 type fakeTipMetadataWriter struct{ calls int }
 
 func (f *fakeTipMetadataWriter) SetLocalMetadata(_ context.Context, _, _ string) error {

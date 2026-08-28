@@ -293,6 +293,24 @@ func migrationFreezeGate(cmd *cobra.Command, operation string, res migration.Res
 // bd bootstrap), which return from PersistentPreRunE long before it resolves
 // one, and any command handed an explicit target path.
 func migrationFreezeGateFor(cmd *cobra.Command, operation string, extraRoots ...string) error {
-	roots := append(freezeSearchRoots(), extraRoots...)
-	return migrationFreezeGate(cmd, operation, migration.Find(roots...))
+	return migrationFreezeGate(cmd, operation, migration.Find(freezeRootsWith(extraRoots)...))
+}
+
+// migrationFreezeErrorFor is migrationFreezeError against extra roots, for
+// callers that hold a target path but no *cobra.Command to silence — a command
+// given a workspace to operate on that is not the one it was launched in.
+func migrationFreezeErrorFor(operation string, extraRoots ...string) error {
+	return migrationFreezeRefusal(operation, migration.Find(freezeRootsWith(extraRoots)...))
+}
+
+// migrationFreezeActive is the print-nothing probe for code that must SKIP a
+// write during a freeze rather than refuse the whole command — the diagnosis
+// paths that keep running while frozen but must not apply version tracking or
+// schema auto-migration.
+func migrationFreezeActive() bool {
+	return migration.Find(freezeSearchRoots()...).Frozen()
+}
+
+func freezeRootsWith(extraRoots []string) []string {
+	return append(freezeSearchRoots(), extraRoots...)
 }
