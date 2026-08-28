@@ -221,6 +221,23 @@ type VersionChange struct {
 // versionChanges contains agent-actionable changes for recent versions
 var versionChanges = []VersionChange{
 	{
+		Version: "1.3.0",
+		Date:    "2026-08-28",
+		Changes: []string{
+			"RELEASE: first tested release off main since the 1.1 line. v1.2.2 shipped the v1.1.2 tree, so a v1.2.2 user gets the 1.2.1 changes AND the 1.3.0 changes in one step; read the [1.3.0] upgrade notes in CHANGELOG.md before installing.",
+			"MIGRATION: the first invocation auto-migrates an existing store from schema v53 to v66 (13 migrations) in place. Two passes rewrite rows, so that first command is noticeably slower; it is crash-resumable, do not interrupt it. Progress prints per step on stderr only when stderr is a terminal — a silent CI upgrade is not a stuck one. Back up first: bd export --all -o .beads/backup/pre-1.3.0.jsonl (or bd backup). Remote-backed stores are still gated; one designated clone migrates and pushes.",
+			"UPGRADE: after migrating, older co-resident binaries REFUSE the store (forward schema-skew guard), so every client sharing a store must be upgraded together. Check with 'which -a bd' and restart any long-running 'bd serve'. Rollback is a schema-cursor rollback: https://beads.gascity.com/recovery/accidental-1-2-1-release",
+			"BREAKING: seven documented behavior changes reach a v1.2.2 user — 'bd update -s <done-status>' enforces close policy (override with --force); 'bd search' includes closed by default (narrow with --status open); the no-ID last-touched fallback on update/close is interactive-only; 'bd human list' hides done/frozen/pinned and validates --status; 'bd dolt push'/'bd sync' no longer adopt a git-origin-derived Dolt remote without consent; an explicitly configured Dolt port outranks BEADS_DOLT_PORT; and actor matching decodes an exact '--' run to '/'.",
+			"BREAKING: the CPU profiling flag is now --cpu-profile; the old --profile spelling is gone with no alias and fails as an unknown flag.",
+			"CHANGE: migration 0061 rekeys every events/comments/snapshot/compaction-snapshot row to a content-derived (UUIDv5-over-SHA-256) id, once per clone, on the first open after upgrade. Ids captured before the upgrade will not resolve afterwards.",
+			"CHANGE: migration 0062 moves the events audit table to the clone-local plane — events keep full local durability and 'bd history <id> --events' still reads them, but they no longer replicate on push or pull.",
+			"CHANGE: the interactions.jsonl audit sidecar is opt-in (audit.enabled defaults false, or BD_AUDIT_ENABLED=1); use 'bd history <id> --events' instead. Auto-backup now defaults OFF under a Dolt sql-server (embedded is unchanged); set backup.enabled explicitly to override.",
+			"CHANGE: 'bd import' now ERRORS on a redirected stdin with no source argument instead of importing the default JSONL — use 'bd import -' or name the file. 'bd hooks install --chain/--force' are accepted no-ops; marker sections always preserve non-bd hook content.",
+			"FIX: 'bd purge'/'bd prune' select candidates by tier (#5995), so typed wisps minted before the ephemeral column are reachable again — the first purge after upgrade may clear considerably more than usual.",
+			"NEW: a two-level cooperative gate writes *.gate.lock files beside .beads and beside the Dolt physical root (e.g. .beads/embeddeddolt.gate.lock). They are flock names, never deleted; 'bd doctor --fix' adds the *.gate.lock* gitignore pattern.",
+		},
+	},
+	{
 		Version: "1.2.2",
 		Date:    "2026-08-15",
 		Changes: []string{
