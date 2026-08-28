@@ -51,6 +51,12 @@ type bootstrapServerDBCheck struct {
 // retries. Injectable for testing.
 var bootstrapRetryDelay = func(d time.Duration) { time.Sleep(d) }
 
+// probeGitRemoteDoltData reports whether a git remote carries Dolt data
+// (refs/dolt/data). Injectable for testing; the production value is a
+// 10s-bounded `git ls-remote` with credential prompts suppressed. A non-nil
+// error means UNKNOWN, not "no data".
+var probeGitRemoteDoltData = gitRemoteHasDoltDataRefStatus
+
 var checkBootstrapServerDB = func(probeCfg bootstrapServerProbeConfig) bootstrapServerDBCheck {
 	host := probeCfg.host
 	port := probeCfg.port
@@ -112,6 +118,9 @@ Bootstrap auto-detects the right action:
   • If .beads/issues.jsonl exists: imports from git-tracked JSONL
   • If no database exists: creates a fresh one
   • If database already exists: validates and reports status
+
+If sync.remote points at a git repository, bootstrap verifies refs/dolt/data
+before cloning.
 
 This is the recommended command for:
   • Setting up beads on a fresh clone
@@ -269,14 +278,24 @@ func applyBootstrapMetadataRepair(beadsDir string, cfg *configfile.Config, apply
 
 // BootstrapPlan describes what bootstrap will do.
 type BootstrapPlan struct {
-	Action      string `json:"action"` // "sync", "restore", "jsonl-import", "init", "none"
-	Reason      string `json:"reason"` // Human-readable explanation
-	BeadsDir    string `json:"beads_dir"`
-	Database    string `json:"database"`
-	SyncRemote  string `json:"sync_remote,omitempty"`
-	BackupDir   string `json:"backup_dir,omitempty"`
-	JSONLFile   string `json:"jsonl_file,omitempty"`
-	HasExisting bool   `json:"has_existing"`
+	Action     string `json:"action"` // "sync", "restore", "jsonl-import", "init", "none"
+	Reason     string `json:"reason"` // Human-readable explanation
+	BeadsDir   string `json:"beads_dir"`
+	Database   string `json:"database"`
+	SyncRemote string `json:"sync_remote,omitempty"`
+	BackupDir  string `json:"backup_dir,omitempty"`
+	JSONLFile  string `json:"jsonl_file,omitempty"`
+	// Blocked marks an Action=="none" plan that declined to act rather than
+	// finding an existing database. It is additive on purpose: JSON consumers
+	// switch on "action", so a new action value would break them, while
+	// "none" + "blocked" + a non-zero exit code is backwards compatible.
+	Blocked bool `json:"blocked,omitempty"`
+	// BlockedRemote is the remote URL a Blocked plan could not verify. It is
+	// deliberately not SyncRemote: nothing may clone from a blocked plan, so
+	// the URL is carried in a field no clone path reads, purely so the user
+	// gets a copy-pasteable diagnostic.
+	BlockedRemote string `json:"blocked_remote,omitempty"`
+	HasExisting   bool   `json:"has_existing"`
 }
 
 func noWorkspaceBootstrapPayload() map[string]interface{} {
@@ -346,21 +365,54 @@ func detectBootstrapAction(beadsDir string, cfg *configfile.Config) BootstrapPla
 	syncRemote := resolveSyncRemote()
 	if syncRemote != "" {
 		if isGitCodeRepoURL(syncRemote) {
-			// Cloning from a git code-repo URL via DOLT_CLONE spins dolt to
-			// 1000% CPU and requires manual SIGKILL. Reject and
-			// surface the misconfiguration rather than attempting the clone.
-			fmt.Fprintf(os.Stderr, "error: sync.remote %q looks like a git code-repository URL, not a Dolt remote — skipping clone\n", syncRemote)
-			plan.Action = "none"
-			plan.Reason = fmt.Sprintf("sync.remote %q rejected: git code-repository URL (not a Dolt remote)", syncRemote)
+			// A git-forge URL is a *supported* Dolt remote: `bd init` and
+			// `bd dolt remote add` both persist one, and `bd dolt push`
+			// stores the database under refs/dolt/data on it. What must
+			// never happen is handing a raw http(s) forge URL to DOLT_CLONE
+			// — Dolt routes that through the remotesapi client and retries
+			// forever at ~1000% CPU (#4421) — or cloning blind from a repo
+			// that carries no Dolt data at all.
+			//
+			// So classify, then route: probe refs/dolt/data first and clone
+			// only the git+ form, which Dolt's dbfactory sends to the git
+			// remote factory. Rejecting outright (the previous behavior)
+			// broke every repo whose committed .beads/config.yaml holds the
+			// forge URL init itself wrote (#5743, #5663).
+			normalized := normalizeRemoteURL(syncRemote)
+			hasData, probeErr := probeGitRemoteDoltData(normalized)
+			switch {
+			case probeErr != nil:
+				// UNKNOWN, not "no data" — fail closed and loud rather than
+				// cloning something we could not verify, matching init's
+				// resolveRemoteHasDoltDataProbe convention.
+				plan.Action = "none"
+				plan.Blocked = true
+				plan.BlockedRemote = normalized
+				plan.Reason = fmt.Sprintf("could not verify refs/dolt/data on sync.remote %q: %v", syncRemote, probeErr)
+				return plan
+			case hasData:
+				plan.SyncRemote = normalized
+				plan.Action = "sync"
+				plan.Reason = "sync.remote git repo has Dolt data (refs/dolt/data) — will clone from " + normalized
+				return plan
+			default:
+				// Definitively no Dolt data: the repo was wired before the
+				// first `bd dolt push`. Say so and keep looking, the same
+				// way bd init falls back to a fresh local database.
+				fmt.Fprintf(os.Stderr, "note: sync.remote %q has no Dolt data yet (refs/dolt/data absent); checking other recovery sources\n", syncRemote)
+				// Fall through to origin auto-detect → backup → JSONL → init.
+			}
+		} else {
+			// User-provided sync.remote — trust the URL format as-is.
+			// normalizeRemoteURL would convert http:// to git+http://,
+			// breaking Dolt remotesapi endpoints (GH#3339). That concern
+			// cannot apply in the branch above: a remotesapi endpoint never
+			// classifies as a git code-repo URL.
+			plan.SyncRemote = syncRemote
+			plan.Action = "sync"
+			plan.Reason = "sync.remote configured — will clone from " + syncRemote
 			return plan
 		}
-		// User-provided sync.remote — trust the URL format as-is.
-		// normalizeRemoteURL would convert http:// to git+http://,
-		// breaking Dolt remotesapi endpoints (GH#3339).
-		plan.SyncRemote = syncRemote
-		plan.Action = "sync"
-		plan.Reason = "sync.remote configured — will clone from " + syncRemote
-		return plan
 	}
 
 	// Auto-detect: probe git origin for Dolt data stored in git
