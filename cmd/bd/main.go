@@ -328,6 +328,17 @@ func isForcedMigrate(cmd *cobra.Command) bool {
 	return force
 }
 
+// isMigrateVerb reports whether cmd is `bd migrate` or `bd migrate schema` —
+// the invocations in which the operator asked for a migration by name. That
+// request is the consent the shared-store gate wants for a database with no
+// remote (#5920); see schema.SetSharedMigrateConsent. It is deliberately NOT
+// the whole `bd migrate` subcommand tree: `bd migrate sync`, `bd migrate
+// hooks`, and the mode-switch verbs do their own work and consent to nothing
+// about the schema.
+func isMigrateVerb(cmd *cobra.Command) bool {
+	return cmd == migrateCmd || cmd == migrateSchemaCmd
+}
+
 // forcedMigratePreviewFlag returns the name of a preview flag (--dry-run,
 // --inspect) that conflicts with --force on a forced migrate invocation, or ""
 // when there is no conflict. The combination must be rejected BEFORE the store
@@ -1455,6 +1466,14 @@ var rootCmd = &cobra.Command{
 		// Unconditional set-or-clear keeps the override self-clearing should the
 		// root command ever be re-run in-process (tests, a future server mode).
 		schema.SetForceAllowRemoteMigrate(forcedMigrate)
+
+		// Typing the migrate verb is consent to migrate a shared database that
+		// has no remote (#5920): there is no cross-clone fork to risk, only
+		// the co-resident lockout the operator is asking to accept. A preview
+		// withholds it — `bd migrate schema --dry-run` must not migrate on the
+		// way to printing what it would do. Same set-or-clear discipline as
+		// the --force override above.
+		schema.SetSharedMigrateConsent(isMigrateVerb(cmd) && !previewMode)
 
 		// Auto-migrate database on version bump (bd-jgxi).
 		// Runs for ALL non-preview commands (including read-only ones) because

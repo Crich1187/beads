@@ -2820,8 +2820,15 @@ func (s *DoltStore) initSchema(ctx context.Context, bootstrapHeal *schema.FreshB
 		// depend on that external guard alone.
 		ReadOnly: s.readOnly,
 	}
+	// The shared variant (#5920): a DoltStore is always a sql-server client,
+	// and a sql-server accepts co-resident clients by construction — that is
+	// what distinguishes it from the flock-guarded single-writer embedded
+	// store. So this open must never promote the schema cursor on its own,
+	// with or without a remote. Auto-started servers included: other bd
+	// processes attach to them while they run, which is the exact shape #5920
+	// was reported on.
 	gate := func(ctx context.Context, db *sql.DB) error {
-		return schema.CheckRemoteMigrateGateForRemoteWithRemoteCheckAndAdopt(ctx, db, s.remote, s.hasPersistedCLIRemote, adopt)
+		return schema.CheckSharedStoreMigrateGate(ctx, db, s.remote, s.hasPersistedCLIRemote, adopt)
 	}
 	applied, err := initSchemaOnDBWithRetryAndGateBootstrapHeal(ctx, migDB, gate, bootstrapHeal, s.serverEndpoint)
 	return applied, err

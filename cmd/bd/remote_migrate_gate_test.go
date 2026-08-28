@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"io"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/steveyegge/beads/internal/storage/schema"
@@ -165,4 +166,73 @@ func TestHandleRemoteMigrateGateJSON_FallbackReason(t *testing.T) {
 			t.Errorf("adopt decision must not carry fallback_reason, got %v", obj["fallback_reason"])
 		}
 	})
+}
+
+// TestHandleRemoteMigrateGateJSON_SharedNoRemote covers the shared-store
+// refusal's agent-facing block (gastownhall/beads#5920). It is deliberately
+// NOT the migrate-or-adopt shape: with no remote there is nothing to adopt
+// from, so the only option is "migrate once the fleet is upgraded", and the
+// runnable command stays inside that conditional option.
+func TestHandleRemoteMigrateGateJSON_SharedNoRemote(t *testing.T) {
+	gate := &schema.RemoteMigrateGateError{
+		CurrentVersion: 53, LatestVersion: 66, Pending: 13,
+		Decision: "shared-no-remote",
+	}
+
+	origStderr := os.Stderr
+	r, w, pipeErr := os.Pipe()
+	if pipeErr != nil {
+		t.Fatal(pipeErr)
+	}
+	os.Stderr = w
+	defer func() { os.Stderr = origStderr }()
+	handleRemoteMigrateGateJSON(gate)
+	_ = w.Close()
+
+	var buf bytes.Buffer
+	if _, err := io.Copy(&buf, r); err != nil {
+		t.Fatal(err)
+	}
+	_ = r.Close()
+
+	var parsed map[string]interface{}
+	if err := json.Unmarshal(buf.Bytes(), &parsed); err != nil {
+		t.Fatalf("json.Unmarshal stderr: %v\nstderr was: %s", err, buf.String())
+	}
+	if parsed["hint"] == gate.EscapeHint() {
+		t.Errorf("hint must not be the runnable escape command %q (agent footgun)", gate.EscapeHint())
+	}
+
+	obj, ok := parsed["remote_migrate_gate"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("remote_migrate_gate key missing or wrong type: %T", parsed["remote_migrate_gate"])
+	}
+	if got, _ := obj["decision"].(string); got != "shared-no-remote" {
+		t.Errorf("decision = %v, want \"shared-no-remote\"", obj["decision"])
+	}
+	if got, _ := obj["observed"].(string); !strings.Contains(got, "shared server database") {
+		t.Errorf("observed = %q, want the shared-server framing", got)
+	}
+	if got, _ := obj["expected"].(string); !strings.Contains(got, "bd migrate schema") {
+		t.Errorf("expected = %q, want the consent verb", got)
+	}
+	if _, ok := obj["fallback_reason"]; ok {
+		t.Errorf("a tailored decision must not carry fallback_reason, got %v", obj["fallback_reason"])
+	}
+
+	rawOpts, ok := obj["options"].([]interface{})
+	if !ok || len(rawOpts) != 1 {
+		t.Fatalf("options = %v, want exactly one (no adopt path without a remote)", obj["options"])
+	}
+	o, _ := rawOpts[0].(map[string]interface{})
+	if id, _ := o["id"].(string); id != "migrate-shared" {
+		t.Errorf("option id = %v, want \"migrate-shared\"", o["id"])
+	}
+	if o["when"] == nil || o["risk"] == nil {
+		t.Errorf("migrate-shared option missing when/risk: %v", o)
+	}
+	cmds, _ := o["commands"].([]interface{})
+	if len(cmds) != 1 || cmds[0] != "bd migrate schema" {
+		t.Errorf("commands = %v, want [\"bd migrate schema\"]", cmds)
+	}
 }

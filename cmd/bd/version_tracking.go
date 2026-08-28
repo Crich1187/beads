@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -14,6 +15,7 @@ import (
 	"github.com/steveyegge/beads/internal/doltserver"
 	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/storage/dolt"
+	"github.com/steveyegge/beads/internal/storage/schema"
 	"github.com/steveyegge/beads/issueops"
 )
 
@@ -250,6 +252,7 @@ func autoMigrateOnVersionBump(beadsDir string) {
 	if err != nil {
 		// Failed to open database - skip migration
 		debug.Logf("auto-migrate: failed to open database: %v", err)
+		noticeSharedMigrateRefusal(err)
 		return
 	}
 	defer func() {
@@ -283,6 +286,31 @@ func autoMigrateOnVersionBump(beadsDir string) {
 	default:
 		debug.Logf("auto-migrate: database already at version %s", Version)
 	}
+}
+
+// noticeSharedMigrateRefusal turns the one failure autoMigrateOnVersionBump
+// must not swallow into a one-line stderr notice.
+//
+// Every other failure here is genuinely best-effort — the command's own store
+// open will report anything that matters. A shared-store gate refusal is
+// different: it is the whole point of the version bump (there ARE pending
+// migrations), it will not be reported by a read command's own open (read-only
+// opens never touch the schema), and it is the moment gastownhall/beads#5920
+// used to silently promote the cursor for every co-resident client. Now
+// nothing is promoted, so say what happened and what to do about it.
+//
+// It fires once per version bump, because .local_version is consumed in the
+// same pre-run. The per-command surfaces are the write-open refusal itself and
+// the docs; this line exists so the upgrade is not silent.
+func noticeSharedMigrateRefusal(err error) {
+	var gateErr *schema.RemoteMigrateGateError
+	if !errors.As(err, &gateErr) {
+		return
+	}
+	fmt.Fprintf(os.Stderr,
+		"bd upgraded to v%s: %d schema migration(s) pending on this shared database — not auto-applying (#5920).\n"+
+			"Run 'bd migrate schema' once every client of this server is upgraded; reads keep working meanwhile.\n",
+		Version, gateErr.Pending)
 }
 
 // recordedWorkspaceVersion reads the marker through the role's accessor on a

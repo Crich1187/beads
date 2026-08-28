@@ -48,6 +48,13 @@ func handleRemoteMigrateGateJSON(e *schema.RemoteMigrateGateError) {
 			gate["decision"] = "adopt"
 			gate["observed"] = "the remote is already migrated; migrating here would fork it"
 			gate["expected"] = "adopt the remote's migrated database (destructive re-clone — operator decision)"
+		case "shared-no-remote":
+			// #5920: no remote at all, so the migrate-or-adopt framing above
+			// does not apply — there is one shared copy and the only question
+			// is whether every client of it is upgraded.
+			gate["decision"] = "shared-no-remote"
+			gate["observed"] = fmt.Sprintf("%d pending schema migration(s) on a shared server database, no consent", e.Pending)
+			gate["expected"] = "operator upgrades co-resident clients, then consents once via bd migrate schema"
 		case "fork-skew":
 			gate["decision"] = "fork-skew"
 			gate["observed"] = fmt.Sprintf("this clone and the remote applied different content for migration(s) %s — already forked", schema.FormatMigrationVersions(e.SkewVersions))
