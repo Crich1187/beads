@@ -43,6 +43,15 @@ func (s *DoltStore) runIssueOperationTx(ctx context.Context, commitMsg string, f
 // inversion). The only cost of a swallowed failure is a missing dolt-log
 // audit line until the next commit.
 //
+// Caller contract (non-verified batch mutators): CreateBatch, ApplyBatch, and
+// CloseBatch route through here and, unlike the claim paths, have no
+// verify-by-re-read recovery — so for them a nil error means "data durable in
+// the branch working set; the trailing Dolt history commit may be deferred and
+// is observable only via bd.db.post_tx_commit_dropped." That is the conscious,
+// documented contract: a nil return is not a retry signal, and propagating a
+// publish-failure sentinel to those callers would reintroduce the double-apply
+// inversion this reorder exists to prevent.
+//
 // Audit-trail caveat (server mode): sessions on one branch share the working
 // set, so a concurrent writer's DOLT_COMMIT can absorb this operation's rows
 // under its own message; this operation's commit then degrades to
