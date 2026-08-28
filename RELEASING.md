@@ -208,12 +208,13 @@ Add release notes to CHANGELOG.md:
 - Changed behavior of B (migration guide)
 ```
 
-Commit the CHANGELOG changes:
+Commit the CHANGELOG changes and open a PR against the release branch:
 
 ```bash
 git add CHANGELOG.md
 git commit -m "docs: Add CHANGELOG entry for v0.22.0"
-git push origin main
+git push origin release-prep/v0.22.0
+gh pr create --base release/0.22.0 --label status/needs-review-auto
 ```
 
 ### Update Version and Create Release Tag
@@ -228,8 +229,10 @@ is retired; it now only prints a pointer here.)
 ```
 
 This updates:
-- `cmd/bd/version.go` — CLI version constant (the canonical version;
-  `check-versions.sh` compares everything else against it)
+- `cmd/bd/version.go` — CLI version constant. This is the canonical version:
+  `check-versions.sh` reads it and compares the gated files against it. Note
+  that "gated" is narrower than "updated" — `default.nix` and `README.md` are
+  bumped here but checked by nothing, so eyeball them.
 - `integrations/beads-mcp/pyproject.toml` — MCP server version
 - `integrations/beads-mcp/src/beads_mcp/__init__.py` — MCP Python version
 - `integrations/beads-mcp/uv.lock` — the `beads-mcp` pin, via `uv lock`. A
@@ -256,15 +259,30 @@ It does **not** touch `CHANGELOG.md`, `cmd/bd/info.go`, or `default.nix`'s
 `./scripts/update-nix-vendorhash.sh` if `go.mod`/`go.sum` changed since the
 last tag.
 
-Then commit, tag, and push:
+Then commit and land it as a PR — **not** a direct push, and **do not tag
+yet**:
 
 ```bash
 git add -A
 git commit -m "chore: bump version to 0.22.0"
+git push origin release-prep/v0.22.0
+gh pr create --base release/0.22.0 --label status/needs-review-auto
+```
+
+Tag only after that PR merges, and tag the **merged** commit:
+
+```bash
+git checkout release/0.22.0 && git pull
 git tag -a v0.22.0 -m "Release v0.22.0"
-git push origin release/0.22.0
 git push origin v0.22.0
 ```
+
+Two reasons the order matters, both of which have teeth. With branch
+protection on, a direct push to the release branch is rejected — after you
+have already minted the tag locally. And with a squash merge, a tag created
+before the merge points at a commit that is not an ancestor of
+`release/x.y.z`; goreleaser packages `CHANGELOG.md` *from the tag* into every
+published archive, so the release would ship the pre-review notes.
 
 Pushing the tag triggers GitHub Actions to build release artifacts
 automatically.
@@ -472,17 +490,17 @@ top-level CLI commands" passes vacuously for it, e.g. wy-gx5rj for `bd
 sync`). Bump it as part of THIS release, not a follow-up:
 
 ```bash
-# After tagging (see "Update Version and Create Release Tag" above):
+# After tagging (see "Update Version and Create Release Tag" above).
+# generate-cli-docs.sh builds bd from the pinned tag, so the tag must exist.
 echo "v0.22.0" > docs/cli-docs.pin
 ./scripts/generate-cli-docs.sh
 git add docs/cli-docs.pin docs/CLI_REFERENCE.md docs/cli-reference docs/docs.json
 git commit -m "docs: bump CLI docs pin to v0.22.0"
-git push origin main
 ```
 
 The pin bump lands on `main`, since that is where Mintlify deploys from — fold
 it into the forward-port PR described in [Release Branches](#release-branches)
-rather than pushing it to the release branch.
+rather than pushing it to the release branch (or to `main`) directly.
 
 Skipping this step doesn't fail fast — Check 4 stays green (it validates
 against the *old* pin) until the next bump, at which point every command
@@ -677,32 +695,42 @@ identifier (e.g. `1.1.0-rc.1`); Python tooling normalizes this to PEP 440 form
 
 ### Cut an RC
 
+**An RC is cut from the release branch, like everything else.** This is the
+point of an RC: it validates the SHA the stable release will ship. Tagging the
+tip of `main` instead validates a *different* SHA by construction — the stable
+tag comes off `release/x.y.z` — and re-introduces the "tag a SHA nobody has
+fully tested" failure that [Release Branches](#release-branches) exists to
+prevent. Note the branch is named for the **base** version: an RC for 1.1.0 is
+cut on `release/1.1.0`, not `release/1.1.0-rc.1`.
+
 ```bash
+# 0. Cut (or check out) the release branch — see Release Branches above.
+git checkout release/1.1.0
+
 # 1. Update CHANGELOG.md and cmd/bd/info.go with the RC notes (manual step),
 #    same as a stable release. Date the CHANGELOG section.
 
-# 2. Bump versions. update-versions.sh accepts a prerelease identifier and,
+# 2. Bump versions. update-versions.sh accepts a prerelease identifier, and
+#    also refreshes uv.lock (PEP 440 normalizes 1.1.0-rc.1 to 1.1.0rc1).
 ./scripts/update-versions.sh 1.1.0-rc.1
 #    Windows PE numeric fields (winres file_version/product_version and the
 #    manifest <assemblyIdentity> version) are set to the base version 1.1.0,
 #    because PE versions must be purely numeric; gen-winres.sh strips the
-#    prerelease suffix the same way at build time.
+#    prerelease suffix the same way at build time, and check-versions.sh
+#    checks those fields against the base version for exactly this reason.
 
-# 3. Keep the MCP lockfile in sync (PEP 440 normalizes to 1.1.0rc1), or the
-#    Package Gate (MCP) check goes red:
-(cd integrations/beads-mcp && uv lock)
-
-# 4. Validate locally.
+# 3. Validate locally.
 ./scripts/check-versions.sh
 
-# 5. Open a PR for the RC prep and have it reviewed. RC prep should land
-#    through normal review, not auto-merge.
+# 4. Open a PR for the RC prep against release/1.1.0 and have it reviewed.
+#    RC prep should land through normal review, not auto-merge.
 ```
 
-After the RC prep is merged to `main`, cut the tag from the merge commit:
+After the RC prep merges, cut the tag from the merged commit on the release
+branch:
 
 ```bash
-git checkout main && git pull
+git checkout release/1.1.0 && git pull
 git tag -a v1.1.0-rc.1 -m "Release candidate v1.1.0-rc.1"
 git push origin v1.1.0-rc.1
 ```
@@ -716,8 +744,9 @@ above. Tag creation is restricted to release maintainers; see
 - Install the RC from the GitHub prerelease assets and exercise the changes it
   is gating before promoting.
 - To promote to stable, bump to the base version with no suffix
-  (`./scripts/update-versions.sh 1.1.0`). The stable release **does** publish
-  to Homebrew/PyPI/npm, so follow the standard
+  (`./scripts/update-versions.sh 1.1.0`) **on the same release branch**, so the
+  stable tag lands on the SHA the RC validated. The stable release **does**
+  publish to Homebrew/PyPI/npm, so follow the standard
   [Prepare Release](#1-prepare-release) steps from there.
 
 ## Hotfix Releases
