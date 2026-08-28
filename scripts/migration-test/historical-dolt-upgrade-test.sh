@@ -1107,6 +1107,24 @@ run_v0554_default_embedded_dolt_upgrade() {
 # (migrations/README.md), so every oracle read is decided by its payload and
 # never by an exit status, and no oracle read ever runs DML.
 
+# Old-binary capabilities, probed against each pinned release rather than
+# assumed, so the lane can stay one shape across both regimes:
+#
+#   v1.0.1  v1.1.0  v1.1.2
+#     yes     yes     yes    bd create --ephemeral
+#     yes     yes     yes    dep add: wisp->issue, wisp->wisp, conditional-blocks
+#     yes     yes     yes    dep add: issue->wisp (main dependencies table)
+#     yes     yes     yes    comments add / label add on a wisp
+#     yes     yes     yes    bd mol wisp list --all --json
+#     yes     yes     yes    bd dolt remote add / push over file://
+#      no     yes     yes    a pre-upgrade remote the candidate will still migrate
+#      no     yes     yes    wisps.is_blocked column
+#      no     yes     yes    post-split wisp_dependencies target columns
+#      no     yes     yes    ignored_schema_migrations cursor
+#
+# The two "no" rows in the last block are the point of keeping v1.0.1: it is the
+# only regime that makes the candidate perform the split and bootstrap the
+# ignored cursor over populated rows instead of finding both already done.
 is_wisp_plane_version() {
     case " ${WISP_PLANE_VERSIONS[*]} " in
         *" $1 "*) return 0 ;;
@@ -1314,32 +1332,77 @@ verify_wisp_survival() {
 }
 
 # updated_at is derived-state-sensitive: 0059 and its ignored/0015 twin both
-# self-assign `updated_at = updated_at` precisely so a recompute cannot look
-# like a user edit to staleness and TTL consumers.
+# self-assign `updated_at = updated_at` precisely so an is_blocked repair cannot
+# look like a user edit to staleness and TTL consumers. Their predecessors do
+# not: 0046, 0047 and ignored/0007 all recompute without the guard, so replaying
+# any of them restamps every row they touch.
 #
-# Issues must be byte-stable, and so must every wisp the recompute did not
-# toggle. Blocked wisps are the documented exception: a v1.1.x store parks the
-# ignored cursor at 0011 while `leases.granted_node` is absent, the sentinel
-# disbelieves that cursor, and the whole ignored series replays — including
-# ignored/0007, which predates the self-assign its 0015 successor added. That
-# replay flips is_blocked 1 -> 0 -> 1 and restamps those rows exactly once.
+# Which of them replay is a property of the source cursor, so the tolerance is
+# too:
 #
-# TODO(wisp-restamp): tighten to full byte-identity once ignored/0007 carries
-# the same `updated_at = updated_at` guard as ignored/0015, or once the
-# contradicted-cursor replay stops re-running the pre-guard migration.
+#   v1.0.1  main cursor 32, no ignored cursor. 0046/0047 and the whole ignored
+#           series re-run, so every non-closed row in both tables legitimately
+#           moves. Only the closed rows are provably untouched, because every
+#           recompute is scoped `WHERE status NOT IN ('closed', 'pinned')`.
+#   v1.1.x  main cursor 53, so 0046/0047 are behind it and issues must not move
+#           at all. The ignored cursor says 0011, but `leases.granted_node` does
+#           not exist yet, the sentinel disbelieves the cursor, and the ignored
+#           series replays anyway (#5366) — dragging in ignored/0007 and
+#           restamping the wisps whose is_blocked it toggles.
+#
+# Closed rows must be byte-stable in every regime; that is what bites when a
+# migration forgets its status scope. The strongest guard on the rest is
+# verify_ignored_track_idempotence, which requires a second open to move
+# nothing at all.
+#
+# TODO(wisp-restamp): once ignored/0007 carries the same `updated_at =
+# updated_at` guard as ignored/0015, drop the is_blocked tolerance and require
+# the v1.1.x wisp projection to be byte-identical too.
 verify_no_restamp() {
-    local version="$1" moved blocked stray
-    cmp -s "$workspace/oracle-issues-before.csv" "$workspace/oracle-issues-after.csv" ||
-        die "$version: upgrade restamped issues.updated_at (derived-state repair must self-assign)"
+    local version="$1" table file moved tolerated stray closed_moved
 
-    moved=$(join -t, -j 1 \
-        <(tail -n +2 "$workspace/oracle-wisps-before.csv" | cut -d, -f1,3 | LC_ALL=C sort) \
-        <(tail -n +2 "$workspace/oracle-wisps-after.csv" | cut -d, -f1,3 | LC_ALL=C sort) |
-        awk -F, '$2 != $3 {print $1}' | LC_ALL=C sort)
-    blocked=$(oracle_rows "$version" 'SELECT id FROM wisps WHERE is_blocked = 1 ORDER BY id' | LC_ALL=C sort)
-    stray=$(LC_ALL=C comm -23 <(printf '%s\n' "$moved") <(printf '%s\n' "$blocked"))
-    [ -z "$(tr -d '[:space:]' <<< "$stray")" ] ||
-        die "$version: upgrade restamped wisps.updated_at on rows the is_blocked recompute never toggled: $(tr '\n' ' ' <<< "$stray")"
+    for table in issues wisps; do
+        file="$workspace/oracle-$table"
+        closed_moved=$(wisp_moved_rows "$file-before.csv" "$file-after.csv" \
+            "$(oracle_rows "$version" "SELECT id FROM $table WHERE status IN ('closed', 'pinned')")")
+        [ -z "$closed_moved" ] ||
+            die "$version: upgrade restamped closed $table rows, so a recompute lost its status scope: $closed_moved"
+    done
+
+    is_wisp_plane_split_source "$version" || return 0
+
+    cmp -s "$workspace/oracle-issues-before.csv" "$workspace/oracle-issues-after.csv" ||
+        die "$version: upgrade restamped issues.updated_at with the main cursor already past 0059"
+
+    moved=$(wisp_updated_at_moves "$workspace/oracle-wisps-before.csv" "$workspace/oracle-wisps-after.csv")
+    tolerated=$(oracle_rows "$version" 'SELECT id FROM wisps WHERE is_blocked = 1 ORDER BY id' | LC_ALL=C sort)
+    stray=$(LC_ALL=C comm -23 <(printf '%s\n' "$moved") <(printf '%s\n' "$tolerated") | tr -d '[:space:]')
+    [ -z "$stray" ] ||
+        die "$version: upgrade restamped wisps the is_blocked recompute never toggled: $stray"
+}
+
+# Sources whose cursors already cover the guarded recomputes, so only the
+# ignored-track replay can move a timestamp.
+is_wisp_plane_split_source() {
+    [ "$1" != v1.0.1 ]
+}
+
+# ids whose updated_at differs between two `id,...,updated_at` projections.
+wisp_updated_at_moves() {
+    local before="$1" after="$2"
+    join -t, -j 1 \
+        <(tail -n +2 "$before" | awk -F, '{print $1 "," $NF}' | LC_ALL=C sort) \
+        <(tail -n +2 "$after" | awk -F, '{print $1 "," $NF}' | LC_ALL=C sort) |
+        awk -F, '$2 != $3 {print $1}' | LC_ALL=C sort
+}
+
+# Of the given ids, those whose updated_at moved.
+wisp_moved_rows() {
+    local before="$1" after="$2" candidates="$3"
+    [ -n "$(tr -d '[:space:]' <<< "$candidates")" ] || return 0
+    LC_ALL=C comm -12 \
+        <(wisp_updated_at_moves "$before" "$after") \
+        <(printf '%s\n' "$candidates" | LC_ALL=C sort) | tr '\n' ' ' | sed 's/ *$//'
 }
 
 # W2 blocks-on-issue, W3 blocks-on-wisp and W4 conditional-blocks-on-issue must
@@ -1456,6 +1519,44 @@ verify_unblock_path() {
         die "$version: closing the blocker did not release the blocked wisps: $(tr '\n' ' ' <<< "$actual")"
 }
 
+# The 0058 contract, and the reason v1.0.1 is in this lane at all.
+#
+# v1.0.1 stores wisp dependencies in the legacy single-target shape
+# (issue_id, depends_on_id) with no way to tell an issue target from a wisp
+# target except by looking the id up. The candidate's ignored/0003-0005 split
+# plus the 0047 delegate and the 0058 heal have to re-home those rows into
+# depends_on_issue_id / depends_on_wisp_id / depends_on_external. Getting that
+# wrong on populated rows is the "duplicate primary key given" hazard class in
+# migrations/README.md.
+#
+# At v1.1.x the rows are already split, so the same assertion is a preservation
+# check. Both regimes must end with identical, correctly-homed targets.
+verify_wisp_dependency_split() {
+    local version="$1" column actual expected i1 i2 w1 w2 w3 w4
+    i1=$(wisp_id 1); i2=$(wisp_id 2)
+    w1=$(wisp_id 3); w2=$(wisp_id 4); w3=$(wisp_id 5); w4=$(wisp_id 6)
+    for column in depends_on_issue_id depends_on_wisp_id depends_on_external; do
+        oracle_column_exists "$version" wisp_dependencies "$column" ||
+            die "$version: wisp_dependencies.$column is missing after the split migrations"
+    done
+    if oracle_column_exists "$version" wisp_dependencies depends_on_id; then
+        die "$version: wisp_dependencies still carries the legacy depends_on_id column"
+    fi
+
+    actual=$(oracle_rows "$version" 'SELECT issue_id, depends_on_issue_id, depends_on_wisp_id, type FROM wisp_dependencies ORDER BY issue_id' | LC_ALL=C sort)
+    expected=$(printf '%s,%s,,blocks\n%s,,%s,blocks\n%s,%s,,conditional-blocks\n' \
+        "$w2" "$i1" "$w3" "$w1" "$w4" "$i1" | LC_ALL=C sort)
+    [ "$actual" = "$expected" ] ||
+        die "$version: wisp dependencies did not land on the right split targets: $(tr '\n' ' ' <<< "$actual")"
+
+    # The issue-source edge on a wisp target lives in the main dependencies
+    # table, which is the column 0059's stand-in recompute reads.
+    actual=$(oracle_rows "$version" 'SELECT issue_id, depends_on_issue_id, depends_on_wisp_id, type FROM dependencies ORDER BY issue_id' | LC_ALL=C sort)
+    expected=$(printf '%s,,%s,blocks\n' "$i2" "$w1")
+    [ "$actual" = "$expected" ] ||
+        die "$version: the issue-blocked-by-wisp edge did not survive the dependencies split: $(tr '\n' ' ' <<< "$actual")"
+}
+
 # 0064/0066 and ignored 0022/0025 must land on an upgraded store, not just on a
 # fresh clone, and wisps must stay writable through the 0060/ignored-0020
 # storage_class default.
@@ -1501,8 +1602,6 @@ verify_wisp_vc_ops() {
         die "$version: candidate could not list wisps after a pull"
     jq -e '(.wisps // []) | length == 5' <<< "$listing" >/dev/null ||
         die "$version: a pull disturbed the ignored-plane wisp rows"
-    run_in_workspace "$candidate" doctor quick >/dev/null ||
-        die "$version: bd doctor quick failed after the upgrade"
 }
 
 # MigrateUp reports `applied` from the main track only and never adds
@@ -1558,6 +1657,7 @@ run_wisp_plane_upgrade() {
     verify_wisp_survival "$version"
     verify_no_restamp "$version"
     verify_is_blocked "$version"
+    verify_wisp_dependency_split "$version"
     verify_ignore_superset_and_clean_status "$version"
     verify_events_flip "$version"
 
@@ -1566,6 +1666,10 @@ run_wisp_plane_upgrade() {
     verify_events_journal_and_wisp_write "$version"
     verify_ignored_track_idempotence "$version"
     verify_wisp_vc_ops "$version"
+    # 'bd doctor' has no embedded-mode JSON report; quick is the supported
+    # health surface here (probed at implementation time).
+    run_in_workspace "$candidate" doctor quick >/dev/null ||
+        die "$version: bd doctor quick failed after the upgrade"
 }
 
 prepare_workspace() {
@@ -1599,7 +1703,7 @@ for version in "${SELECTED_VERSIONS[@]}"; do
     fi
     # Second lane, fresh workspace: the shared three-issue fixture never carries
     # wisps, so the ignored plane the 1.3.0 chain rewrites gets its own corpus.
-    if [ "$version" = v1.1.2 ]; then
+    if is_wisp_plane_version "$version"; then
         prepare_workspace
         run_wisp_plane_upgrade "$version"
         printf '  ✓ wisp-plane upgrade preserved the ignored plane and the ignored track was idempotent\n'
