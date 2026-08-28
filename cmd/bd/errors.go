@@ -125,44 +125,52 @@ func WarnError(format string, args ...interface{}) {
 	fmt.Fprintf(os.Stderr, "Warning: "+format+"\n", args...)
 }
 
+// ExitMigrationFrozen is the exit code for a write refused because a
+// migration freeze marker is active (dc-6jaq). Stable value so scripts can
+// branch on "someone is migrating this workspace, come back later" without
+// grep'ing stderr, instead of reading it as a generic failure (1) worth
+// retrying immediately.
+const ExitMigrationFrozen = 14
+
 // CheckReadonly aborts the command when bd is running in read-only mode (the
-// worker-sandbox posture, see readonlyMode), or when a MIGRATION-FREEZE
-// sentinel is active at the town root (dc-6jaq, folded in here rather than
-// requiring every write command to remember a second call — see
-// CheckMigrationFreeze below). This is the chokepoint essentially every
-// write command already calls first, so folding the freeze check in here
-// covers the whole write surface at once, including commands added after
-// this comment is written — not just a hand-picked list that rots (one
-// concrete instance the hand-picked list missed: "bd q", cmd/bd/quick.go,
-// the create alias). It exits via os.Exit and so cannot run the per-command
-// deferred CloseEventAndAdd — a command blocked here records no
-// cli_command event of its own (it never actually ran). It does flush
-// metrics first, so events already queued earlier in this run are still
-// written and scheduled for upload rather than stranded until the next
-// clean exit.
+// worker-sandbox posture, see readonlyMode), or when a migration freeze
+// marker is active (dc-6jaq, folded in here rather than requiring every write
+// command to remember a second call — see migrationFreezeError below). This
+// is the chokepoint essentially every write command already calls first, so
+// folding the freeze check in here covers the whole write surface at once,
+// including commands added after this comment is written — not just a
+// hand-picked list that rots (one concrete instance the hand-picked list
+// missed: "bd q", cmd/bd/quick.go, the create alias). It exits via os.Exit
+// and so cannot run the per-command deferred CloseEventAndAdd — a command
+// blocked here records no cli_command event of its own (it never actually
+// ran). It does flush metrics first, so events already queued earlier in this
+// run are still written and scheduled for upload rather than stranded until
+// the next clean exit. Callers that CAN return an error (the root
+// PersistentPreRunE, runImport) call migrationFreezeError directly instead,
+// so their deferred cleanup still runs.
 func CheckReadonly(operation string) {
 	if readonlyMode {
 		fmt.Fprintf(os.Stderr, "Error: operation '%s' is not allowed in read-only mode\n", operation)
 		metrics.CloseAndFlush()
 		os.Exit(1)
 	}
-	CheckMigrationFreeze(operation)
+	if err := migrationFreezeError(operation); err != nil {
+		metrics.CloseAndFlush()
+		os.Exit(ExitMigrationFrozen)
+	}
 }
 
-// CheckMigrationFreeze aborts the command when a MIGRATION-FREEZE sentinel is
-// present at the town root (dc-6jaq). The gt CLI already refuses to write
-// under the same sentinel (gt mail send, gt nudge, gt sling, gt assign);
-// mail-poller/daemon patrols that also write via bd are stopped separately
-// via the migration playbook's plist-unload step, so this closes the
-// remaining gap: a human typing 'bd create'/'bd update' etc. mid-migration,
-// bypassing the gt-layer gate. Same exit-via-os.Exit tradeoff as
-// CheckReadonly above — no cli_command event for a command blocked here,
-// but queued metrics are still flushed.
+// migrationFreezeError reports the active migration freeze, if any: it
+// returns nil when writes are not frozen, and otherwise prints the refusal to
+// stderr and returns an ExitMigrationFrozen exit error. The refusal names the
+// marker's own path, so the recovery instruction ("remove that file") is
+// always actionable without knowing what created it.
 //
 // Three callers, each closing a different hole:
 //  1. CheckReadonly above — the per-command chokepoint covering the write
 //     surface at large (create/update/close/... and everything that calls
-//     CheckReadonly, ~120 sites).
+//     CheckReadonly, ~120 sites). Only that caller turns this error into an
+//     os.Exit, because its void signature leaves it nothing else to do.
 //  2. The root PersistentPreRunE in main.go, before autoMigrateOnVersionBump
 //     and maybeAutoImportJSONL — those run as store-open side effects
 //     *before* any RunE, so waiting for a write command's own CheckReadonly
@@ -173,25 +181,37 @@ func CheckReadonly(operation string) {
 //     CheckReadonly at all today (a pre-existing, separate gap: readonlyMode
 //     doesn't block it either), so it cannot inherit the freeze check from
 //     caller 1 and needs its own explicit call.
-func CheckMigrationFreeze(operation string) {
-	townRoot := findTownRoot()
-	if !migration.IsFrozen(townRoot) {
-		return
+func migrationFreezeError(operation string) error {
+	path := migration.Find()
+	if path == "" {
+		return nil
 	}
 
-	info := migration.Read(townRoot)
-	operator := "unknown"
+	info := migration.ReadFile(path)
+	operator := ""
 	reason := ""
 	if info != nil {
 		operator = info.Operator
 		reason = info.Reason
 	}
 
-	fmt.Fprintf(os.Stderr, "⛔ ERROR: town is frozen for migration (by %s).\n", operator)
+	if operator != "" {
+		fmt.Fprintf(os.Stderr, "⛔ ERROR: workspace is frozen for migration (by %s).\n", operator)
+	} else {
+		// An empty or unparseable marker (a bare `touch`) records no
+		// operator; say nothing rather than printing "(by )".
+		fmt.Fprint(os.Stderr, "⛔ ERROR: workspace is frozen for migration.\n")
+	}
 	if reason != "" {
 		fmt.Fprintf(os.Stderr, "   Reason: %s\n", reason)
 	}
-	fmt.Fprintf(os.Stderr, "   bd %s is blocked. Clear the freeze: gt migrate thaw\n", operation)
-	metrics.CloseAndFlush()
-	os.Exit(1)
+	fmt.Fprintf(os.Stderr, "   bd %s is blocked by the freeze marker at %s.\n", operation, path)
+	if os.Getenv(migration.EnvFreezeFile) != "" {
+		// Find is env-authoritative, so a set variable means this path came
+		// from it — and removing the file is then only half the story.
+		fmt.Fprintf(os.Stderr, "   To resume writes, remove that file or unset %s.\n", migration.EnvFreezeFile)
+	} else {
+		fmt.Fprint(os.Stderr, "   To resume writes, remove that file.\n")
+	}
+	return &exitError{Code: ExitMigrationFrozen}
 }

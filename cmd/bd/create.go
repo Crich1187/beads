@@ -52,7 +52,7 @@ var createCmd = &cobra.Command{
 	SilenceUsage:  true,
 	SilenceErrors: true,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		CheckReadonly("create") // also covers CheckMigrationFreeze (dc-6jaq)
+		CheckReadonly("create") // also covers the migration freeze check (dc-6jaq)
 
 		evt := metrics.NewCommandEvent("create")
 		defer func() {

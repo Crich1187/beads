@@ -1389,7 +1389,7 @@ var rootCmd = &cobra.Command{
 		policy := effectiveRootStorePolicy(cmd.Name(), readonlyMode)
 		useReadOnly := policy.readOnly || previewMode
 
-		// dc-6jaq: consult the MIGRATION-FREEZE sentinel here, before any of
+		// dc-6jaq: consult the migration freeze marker here, before any of
 		// this hook's own store-touching side effects — trackBdVersion below
 		// (writes .local_version), autoMigrateOnVersionBump (opens its own
 		// store connection and can apply a schema migration), and
@@ -1406,10 +1406,15 @@ var rootCmd = &cobra.Command{
 		// exempt overall: CheckReadonly's own freeze check runs again,
 		// unconditionally, at the per-command chokepoint once RunE is
 		// reached, and that later call has no preview awareness — so a
-		// preview on a frozen town still exits 1 there, fail-closed, same as
-		// strict --readonly already blocks `create --dry-run` today.
+		// preview on a frozen workspace still exits ExitMigrationFrozen
+		// there, fail-closed, same as strict --readonly already blocks
+		// `create --dry-run` today. Returning the refusal rather than
+		// exiting is load-bearing: the gates acquired above are released by
+		// this hook's deferred cleanup, which os.Exit would skip.
 		if !useReadOnly {
-			CheckMigrationFreeze(strings.TrimPrefix(cmd.CommandPath(), cmd.Root().Name()+" "))
+			if err := migrationFreezeError(strings.TrimPrefix(cmd.CommandPath(), cmd.Root().Name()+" ")); err != nil {
+				return err
+			}
 		}
 
 		// dc-6jaq (review round 2, ask #1): a command classified read-only —
@@ -1419,14 +1424,14 @@ var rootCmd = &cobra.Command{
 		// writes against the (possibly frozen) store, run regardless of the
 		// command's own classification — so "the command is a read" must not
 		// imply "these side effects may still run". Reproduced pre-fix:
-		// freeze the town, seed .local_version with a stale version, run
+		// freeze the workspace, seed .local_version with a stale version, run
 		// `bd list` — exit 0 (correct, it's a read), but .local_version was
 		// silently rewritten mid-freeze anyway. Skip both calls under an
 		// active freeze without blocking the read itself. Short-circuits on
-		// !policy.runMaintenance (strict --readonly) so the IsFrozen/
-		// findTownRoot filesystem walk isn't paid on that path, where these
-		// calls are already skipped for an unrelated reason.
-		frozenForMaintenance := policy.runMaintenance && migration.IsFrozen(findTownRoot())
+		// !policy.runMaintenance (strict --readonly) so migration.Find's
+		// filesystem walk isn't paid on that path, where these calls are
+		// already skipped for an unrelated reason.
+		frozenForMaintenance := policy.runMaintenance && migration.Find() != ""
 
 		// Track bd version changes unless strict readonly forbids repository mutation.
 		// Best-effort tracking - failures are silent.
