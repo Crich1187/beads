@@ -34,10 +34,10 @@ Each phase can be skipped individually. Use --dry-run to preview all phases
 without making changes.
 
 Phase 3 runs Dolt's default, generational GC: it only examines data written
-since the last GC. Data that survived an earlier GC lives in the old
-generation and is never revisited, so on a long-lived store the space freed by
-decay may not be reclaimed. Use --full to collect all generations (slower on
-large stores).
+since the last GC. Data that survived an earlier GC lives in the old generation
+and is never revisited, so on a long-lived store the space freed by decay may
+not be reclaimed. Use --full to collect all generations (slower on large
+stores).
 
 Examples:
   bd gc                              # Full GC with defaults (90 day decay)
