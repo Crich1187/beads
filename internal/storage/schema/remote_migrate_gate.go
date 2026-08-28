@@ -17,6 +17,13 @@ import (
 // otherwise fire, so exporting it permanently does not warn on every store open.
 // The CLI-flag twin `bd migrate --force` is the preferred interactive form;
 // this env var remains supported for scripted/CI use.
+//
+// It also unlocks the shared-store arm below, where a shared database has NO
+// remote at all — "REMOTE" in the name is then a wart. It is deliberate: this
+// is the single knob operators and CI already export for exactly this
+// semantic ("I am the designated migrator; apply pending migrations to a
+// database other clients depend on"), and a second variable would multiply
+// the escape-hatch surface for no new meaning.
 const AllowRemoteMigrateEnv = "BD_ALLOW_REMOTE_MIGRATE"
 
 // forceAllowRemoteMigrate is the programmatic (in-process) twin of
@@ -32,6 +39,22 @@ var forceAllowRemoteMigrate bool
 // open. External test packages may reset it to false after each test case.
 func SetForceAllowRemoteMigrate(v bool) { forceAllowRemoteMigrate = v }
 
+// sharedMigrateConsent records that the operator typed the migrate verb
+// itself. It unlocks ONLY the shared-store-without-a-remote arm of the gate:
+// with no remote there is no cross-clone fork to risk, so the single hazard is
+// locking out co-resident clients of the same server — a hazard the operator
+// accepts by asking for a migration by name. A remote-backed database still
+// needs --force / AllowRemoteMigrateEnv, because #4259 coordination is a
+// stronger, different contract.
+var sharedMigrateConsent bool
+
+// SetSharedMigrateConsent sets (or clears) the verb consent above. Like
+// SetForceAllowRemoteMigrate it is set unconditionally (set-or-clear) in the
+// root PersistentPreRunE, before both autoMigrateOnVersionBump and the store
+// open, and is process-local so it cannot leak into child processes. External
+// test packages may reset it to false after each test case.
+func SetSharedMigrateConsent(v bool) { sharedMigrateConsent = v }
+
 // RemoteMigrateGateError is returned when bd is about to auto-apply pending
 // schema migrations to an existing database that has a remote configured.
 //
@@ -43,6 +66,14 @@ func SetForceAllowRemoteMigrate(v bool) { forceAllowRemoteMigrate = v }
 // migrated database from the remote". This gate refuses the silent in-place
 // migration and makes the operator choose migrate vs. adopt. It applies to both
 // server mode and embedded mode (the mode the original report was filed against).
+//
+// The type also carries the shared-store refusal (Decision "shared-no-remote",
+// gastownhall/beads#5920), where there is no remote at all and the hazard is
+// co-resident clients of one server rather than forked clones. The name is
+// imperfect for that arm; every consumer — the server retry loop's permanence
+// classification, embedded's lenient handling, the CLI text and JSON
+// rendering, the AgentDirective/Options contract — already handles this type,
+// and a parallel error universe would cost far more than the imprecise name.
 type RemoteMigrateGateError struct {
 	CurrentVersion int
 	LatestVersion  int
@@ -90,6 +121,13 @@ const (
 	// working set — adopting is loss-free, unlike a plain adopt.
 	gateDecisionAdoptFastForward = "adopt-ff"
 	gateDecisionForkSkew         = "fork-skew"
+	// gateDecisionSharedNoRemote (gastownhall/beads#5920): the database is
+	// shared with co-resident bd clients (dolt sql-server or proxied-server
+	// mode) and has NO remote, so there is no fork to reason about — but
+	// migrating still promotes the schema cursor for every client at once and
+	// locks out each one still on an older binary. Unlocked by the migrate
+	// verb, --force, or AllowRemoteMigrateEnv.
+	gateDecisionSharedNoRemote = "shared-no-remote"
 )
 
 // fallbackReason* enumerates why the smart gate (#4516) fell back to the
@@ -111,6 +149,11 @@ const (
 	// recognized boolean, so the gate stayed enabled by default (same as
 	// unset) but still could not resolve this particular stop.
 	fallbackReasonUnparseableEnv = "unparseable-env"
+	// fallbackReasonSharedStore (gastownhall/beads#5920): the smart gate
+	// resolved a safe first-mover migrate, but this store is shared, so
+	// auto-executing it would promote the schema for every co-resident client.
+	// Structural, not a routing outcome — it outranks the other reasons.
+	fallbackReasonSharedStore = "shared-store"
 )
 
 func (e *RemoteMigrateGateError) Error() string {
@@ -128,6 +171,9 @@ func (e *RemoteMigrateGateError) Error() string {
 	case gateDecisionForkSkew:
 		return fmt.Sprintf("refusing to migrate a remote-backed database (v%d -> v%d): this clone and the remote applied different content for migration(s) %s — the schema has already forked (#4259)",
 			e.CurrentVersion, e.LatestVersion, FormatMigrationVersions(e.SkewVersions))
+	case gateDecisionSharedNoRemote:
+		return fmt.Sprintf("refusing to auto-apply %d pending schema %s to a shared server database (v%d -> v%d): migrating would lock out every co-resident bd client still on the old schema (#5920)",
+			e.Pending, unit, e.CurrentVersion, e.LatestVersion)
 	default:
 		return fmt.Sprintf("refusing to auto-apply %d pending schema %s to a remote-backed database (v%d -> v%d): migrating clones independently forks the schema (#4259)",
 			e.Pending, unit, e.CurrentVersion, e.LatestVersion)
@@ -174,6 +220,8 @@ func (e *RemoteMigrateGateError) fallbackReasonNote() string {
 		why = "it is disabled (" + SmartGateEnv + "=0)"
 	case fallbackReasonUnparseableEnv:
 		why = SmartGateEnv + "=" + e.UnrecognizedSmartGateEnv + " is set but was not recognized (only boolean values enable/disable it), so it stayed enabled by default but still could not resolve this stop"
+	case fallbackReasonSharedStore:
+		why = "this store is shared (dolt sql-server); the first-mover auto-migrate is disabled here because it would lock out co-resident clients (#5920)"
 	default:
 		return ""
 	}
@@ -200,6 +248,22 @@ func (e *RemoteMigrateGateError) userBody() string {
 			"        bd bootstrap\n" +
 			"  Unlike the usual re-clone, this clone has no unpushed commits and no\n" +
 			"  uncommitted local changes to discard.\n"
+	case gateDecisionSharedNoRemote:
+		return "\n" +
+			"  This database is served to multiple clients (dolt sql-server /\n" +
+			"  proxied-server mode). Applying schema migrations promotes the schema\n" +
+			"  version for EVERY client at once: bd clients still running an older\n" +
+			"  version will refuse this database until they are upgraded.\n" +
+			"\n" +
+			"  To migrate (explicit consent):\n" +
+			"    1. Upgrade bd on every client of this server first (or accept that\n" +
+			"       older clients refuse until they are upgraded).\n" +
+			"    2. Then run, once, on any one client:\n" +
+			"        bd migrate schema\n" +
+			"        (or " + AllowRemoteMigrateEnv + "=1 bd <cmd> in scripted/CI use)\n" +
+			"\n" +
+			"  Read commands keep working against the current schema in the meantime;\n" +
+			"  writes stay refused until the schema is migrated.\n"
 	case gateDecisionForkSkew:
 		return "\n" +
 			"  This clone and the remote already applied DIFFERENT content for migration(s) " +
@@ -239,6 +303,11 @@ func (e *RemoteMigrateGateError) userBody() string {
 
 // EscapeHint returns the escape-hatch string for JSON error output.
 func (e *RemoteMigrateGateError) EscapeHint() string {
+	if e.Decision == gateDecisionSharedNoRemote {
+		// No remote, so there is no designated-migrator coordination to force
+		// past: typing the verb IS the consent.
+		return "bd migrate schema"
+	}
 	return "bd migrate --force"
 }
 
@@ -266,6 +335,12 @@ func (e *RemoteMigrateGateError) AgentDirective() string {
 			FormatMigrationVersions(e.SkewVersions) + " — the schema has forked (#4259) and migrating cannot un-fork it. " +
 			"Resolving requires picking a canonical clone and re-bootstrapping the others, discarding their unpushed " +
 			"work — a data-loss decision. Surface remote_migrate_gate.options to the operator; do NOT auto-run anything."
+	case gateDecisionSharedNoRemote:
+		return "Coordination decision required: this database is shared with co-resident bd clients, and migrating " +
+			"promotes the schema for all of them at once — every client still on an older bd refuses the database " +
+			"until it is upgraded (#5920). Other clients' binary versions are not observable from this process, so " +
+			"do NOT auto-run the migration: surface remote_migrate_gate.options to the operator and let them confirm " +
+			"the fleet is upgraded first. Reads keep working on the current schema meanwhile."
 	default:
 		return "Coordination decision required: only ONE clone may migrate a shared remote; " +
 			"a second clone migrating independently forks the schema unrecoverably (#4259). " +
@@ -318,6 +393,15 @@ func (e *RemoteMigrateGateError) Options() []GateOption {
 			Commands: []string{"bd export --all -o backup.jsonl", "bd bootstrap"},
 			Risk:     "re-bootstrapping the non-canonical clones discards their unpushed work; export it first",
 		}}
+	case gateDecisionSharedNoRemote:
+		// No remote means no adopt path — the database is the single copy every
+		// client shares. The only question is whether the fleet is ready.
+		return []GateOption{{
+			ID:       "migrate-shared",
+			When:     "every co-resident bd client of this server is upgraded to this binary (confirmed with the operator)",
+			Commands: []string{"bd migrate schema"},
+			Risk:     "co-resident clients still on an older bd will refuse this database until upgraded",
+		}}
 	default:
 		return []GateOption{
 			{
@@ -346,7 +430,7 @@ func IsRemoteMigrateGateError(err error) bool {
 // store open. Embedded mode uses this form: its dolt_remotes table already
 // reflects remotes persisted in .dolt/config on a fresh open.
 func CheckRemoteMigrateGate(ctx context.Context, db DBConn) error {
-	return checkRemoteMigrateGate(ctx, db, "", nil, nil)
+	return checkRemoteMigrateGate(ctx, db, "", nil, nil, false)
 }
 
 // CheckRemoteMigrateGateWithAdopt is CheckRemoteMigrateGate plus the injected
@@ -357,7 +441,7 @@ func CheckRemoteMigrateGate(ctx context.Context, db DBConn) error {
 // behaves exactly as CheckRemoteMigrateGate. Embedded mode uses this form
 // alongside CheckRemoteMigrateGate's no-remote-name default.
 func CheckRemoteMigrateGateWithAdopt(ctx context.Context, db DBConn, adopt *FastForwardAdopter) error {
-	return checkRemoteMigrateGate(ctx, db, "", nil, adopt)
+	return checkRemoteMigrateGate(ctx, db, "", nil, adopt, false)
 }
 
 // CheckRemoteMigrateGateWithRemoteCheck is CheckRemoteMigrateGate plus an on-disk
@@ -376,7 +460,7 @@ func CheckRemoteMigrateGateWithAdopt(ctx context.Context, db DBConn, adopt *Fast
 // SQL table shows no remote, so the (subprocess-backed) filesystem probe stays off
 // the common open path. A nil extraHasRemote disables the fallback.
 func CheckRemoteMigrateGateWithRemoteCheck(ctx context.Context, db DBConn, extraHasRemote func() bool) error {
-	return checkRemoteMigrateGate(ctx, db, "", extraHasRemote, nil)
+	return checkRemoteMigrateGate(ctx, db, "", extraHasRemote, nil, false)
 }
 
 // CheckRemoteMigrateGateForRemoteWithRemoteCheck is CheckRemoteMigrateGate plus
@@ -384,7 +468,7 @@ func CheckRemoteMigrateGateWithRemoteCheck(ctx context.Context, db DBConn, extra
 // The blunt gate still trips when any Dolt remote exists; the remote name only
 // chooses which remote-tracking ref the opt-in smart router compares against.
 func CheckRemoteMigrateGateForRemoteWithRemoteCheck(ctx context.Context, db DBConn, remoteName string, extraHasRemote func() bool) error {
-	return checkRemoteMigrateGate(ctx, db, remoteName, extraHasRemote, nil)
+	return checkRemoteMigrateGate(ctx, db, remoteName, extraHasRemote, nil, false)
 }
 
 // CheckRemoteMigrateGateForRemoteWithRemoteCheckAndAdopt is
@@ -393,10 +477,31 @@ func CheckRemoteMigrateGateForRemoteWithRemoteCheck(ctx context.Context, db DBCo
 // CheckRemoteMigrateGateWithAdopt. Server mode uses this form: it already has
 // both a configured sync remote and the on-disk remote-check fallback.
 func CheckRemoteMigrateGateForRemoteWithRemoteCheckAndAdopt(ctx context.Context, db DBConn, remoteName string, extraHasRemote func() bool, adopt *FastForwardAdopter) error {
-	return checkRemoteMigrateGate(ctx, db, remoteName, extraHasRemote, adopt)
+	return checkRemoteMigrateGate(ctx, db, remoteName, extraHasRemote, adopt, false)
 }
 
-func checkRemoteMigrateGate(ctx context.Context, db DBConn, remoteName string, extraHasRemote func() bool, adopt *FastForwardAdopter) error {
+// CheckSharedStoreMigrateGate is the gate for a database that is served to
+// co-resident bd clients — a dolt sql-server store or the proxied/`bd serve`
+// unit-of-work provider. It adds two refusals on top of the remote-backed
+// #4259 flow (gastownhall/beads#5920):
+//
+//   - With NO remote, where the ordinary gate allows a silent in-place
+//     migration, it refuses unless the operator consented (the migrate verb,
+//     --force, or AllowRemoteMigrateEnv). Promoting the schema cursor on a
+//     shared server locks out every co-resident client still on an older bd.
+//   - With a remote, it suppresses the smart gate's two auto-EXECUTE arms
+//     (first-mover auto-migrate and auto-fast-forward). Both were written for
+//     a clone this process owns; on a shared server neither can observe the
+//     other clients, and the first-mover arm firing is exactly the #5920
+//     mechanism. The refusal directives are unchanged.
+//
+// A fresh database (current == 0) still migrates: creating a database is
+// consent for its schema.
+func CheckSharedStoreMigrateGate(ctx context.Context, db DBConn, remoteName string, extraHasRemote func() bool, adopt *FastForwardAdopter) error {
+	return checkRemoteMigrateGate(ctx, db, remoteName, extraHasRemote, adopt, true)
+}
+
+func checkRemoteMigrateGate(ctx context.Context, db DBConn, remoteName string, extraHasRemote func() bool, adopt *FastForwardAdopter, shared bool) error {
 	// CurrentVersion treats a missing schema_migrations table as version 0, so a
 	// brand-new database falls through the current==0 check below — nothing to fork.
 	current, err := CurrentVersion(ctx, db)
@@ -426,7 +531,13 @@ func checkRemoteMigrateGate(ctx context.Context, db DBConn, remoteName string, e
 		hasRemote = extraHasRemote()
 	}
 	if !hasRemote {
-		return nil // no remote — no cross-clone fork risk
+		if !shared {
+			return nil // no remote — no cross-clone fork risk
+		}
+		// A shared store has co-resident clients whether or not it has a
+		// remote, and migrating promotes the schema cursor for all of them at
+		// once (gastownhall/beads#5920).
+		return sharedNoRemoteGate(current, len(pending))
 	}
 
 	// Programmatic override — set by `bd migrate --force` / `bd migrate schema
@@ -483,6 +594,14 @@ func checkRemoteMigrateGate(ctx context.Context, db DBConn, remoteName string, e
 		decision, skew, ref, atLatest := routeSmartGate(ctx, db, current, latest, remoteName, adopt)
 		switch decision {
 		case smartAutoMigrate:
+			// The safe-first-mover argument is about clones, not clients: it
+			// proves nothing about the co-resident bd processes attached to
+			// this same server, and auto-executing it here IS the #5920
+			// mechanism. Fall through to the blunt stop, naming why.
+			if shared {
+				fallbackReason = fallbackReasonSharedStore
+				break
+			}
 			smartGateAllowMigrate(len(pending), current)
 			return nil
 		case smartAdopt:
@@ -503,7 +622,11 @@ func checkRemoteMigrateGate(ctx context.Context, db DBConn, remoteName string, e
 			// #4259 fork risk this gate exists to prevent. Landing past
 			// latest would mean a newer binary already migrated the remote
 			// further than this one understands (#4135/#4137 class).
-			if atLatest && canAutoFastForward(adopt) {
+			// Suppressed on a shared store for the same reason as the
+			// first-mover arm above: the fast-forward is a WRITE that promotes
+			// the schema for every co-resident client. The adopt-ff refusal
+			// directive below is still accurate and still offered.
+			if !shared && atLatest && canAutoFastForward(adopt) {
 				// attemptFastForward re-verifies the ancestry/clean/
 				// remoteMax-at-latest preconditions in this SAME db session
 				// immediately before the write (TOCTOU guard) and performs
@@ -556,8 +679,11 @@ func checkRemoteMigrateGate(ctx context.Context, db DBConn, remoteName string, e
 		// An unparseable BD_SMART_GATE value defaults to enabled (same as
 		// unset), so routing above still ran — but it is a more actionable
 		// fact for the operator than the technical routing outcome, so it
-		// takes priority as the surfaced reason.
-		if envState, envValue := smartGateEnvValue(); envState == smartGateEnvUnparseable {
+		// takes priority as the surfaced reason. Not over shared-store: that
+		// one is structural (the gate WOULD have resolved, and was overruled),
+		// so fixing the env value would not change the outcome.
+		envState, envValue := smartGateEnvValue()
+		if envState == smartGateEnvUnparseable && fallbackReason != fallbackReasonSharedStore {
 			fallbackReason = fallbackReasonUnparseableEnv
 			unrecognizedSmartGateEnv = envValue
 		}
@@ -572,6 +698,53 @@ func checkRemoteMigrateGate(ctx context.Context, db DBConn, remoteName string, e
 		UnrecognizedEnv:          unrecognizedEnv,
 		FallbackReason:           fallbackReason,
 		UnrecognizedSmartGateEnv: unrecognizedSmartGateEnv,
+	}
+}
+
+// sharedNoRemoteGate decides the shared-store-without-a-remote arm
+// (gastownhall/beads#5920). There is no remote, so none of the #4259
+// migrate-vs-adopt machinery applies: the only question is whether the
+// operator consented to promoting the schema for every co-resident client.
+//
+// Three surfaces consent, and all three are consulted only once the gate would
+// actually fire, so an operator who exports the env var in a shell profile is
+// never warned on an open with nothing pending.
+func sharedNoRemoteGate(current, pending int) error {
+	warn := func(how string) {
+		fmt.Fprintf(os.Stderr,
+			"Warning: applying %d pending schema migration(s) to a shared server database (%s); co-resident bd clients still on an older binary will refuse this database until they are upgraded (#5920)\n",
+			pending, how)
+	}
+	if forceAllowRemoteMigrate {
+		warn("bd migrate --force")
+		return nil
+	}
+	// The migrate verb itself. Unlike --force this unlocks ONLY here: with a
+	// remote configured, #4259's cross-clone fork risk still demands the
+	// stronger designated-migrator confirmation.
+	if sharedMigrateConsent {
+		warn("bd migrate schema")
+		return nil
+	}
+
+	unrecognizedEnv := ""
+	if v := os.Getenv(AllowRemoteMigrateEnv); v != "" {
+		if allowed, perr := strconv.ParseBool(v); perr == nil {
+			if allowed {
+				warn(AllowRemoteMigrateEnv + "=" + v)
+				return nil
+			}
+		} else {
+			unrecognizedEnv = v
+		}
+	}
+
+	return &RemoteMigrateGateError{
+		CurrentVersion:  current,
+		LatestVersion:   LatestVersion(),
+		Pending:         pending,
+		UnrecognizedEnv: unrecognizedEnv,
+		Decision:        gateDecisionSharedNoRemote,
 	}
 }
 

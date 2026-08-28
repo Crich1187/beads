@@ -913,3 +913,103 @@ func TestMigrateUpWithLockFreshBootstrapHealCapabilityIsOneShot(t *testing.T) {
 		t.Fatalf("unmet SQL expectations: %v", err)
 	}
 }
+
+// TestMigrateUpWithLockMigrationGate pins where WithMigrationGate's callback
+// sits: after the lock and after locked preparation (so the gate reads a
+// prepared, selected database), before MigrateUp (so a refusal applies no
+// migration), and inside the deferred release (so refusing cannot leak the
+// lock).
+func TestMigrateUpWithLockMigrationGate(t *testing.T) {
+	t.Run("refusal stops before MigrateUp and releases the lock", func(t *testing.T) {
+		db, mock, err := sqlmock.New()
+		if err != nil {
+			t.Fatalf("create sql mock: %v", err)
+		}
+		defer db.Close()
+
+		ctx := context.Background()
+		conn, err := db.Conn(ctx)
+		if err != nil {
+			t.Fatalf("pin mock connection: %v", err)
+		}
+		defer conn.Close()
+
+		lockName := MigrationLockName("testdb")
+		expectConvergedFastPathMiss(mock, "testdb")
+		mock.ExpectQuery(regexp.QuoteMeta("SELECT GET_LOCK(?, ?)")).
+			WithArgs(lockName, migrationLockAcquireTimeoutSeconds).
+			WillReturnRows(sqlmock.NewRows([]string{"locked"}).AddRow(1))
+		// No migration statements between here and the release: the refusal
+		// must land before MigrateUp issues its first one.
+		mock.ExpectQuery(regexp.QuoteMeta("SELECT RELEASE_LOCK(?)")).
+			WithArgs(lockName).
+			WillReturnRows(sqlmock.NewRows([]string{"released"}).AddRow(1))
+
+		refusal := &RemoteMigrateGateError{CurrentVersion: 1, LatestVersion: 2, Pending: 1, Decision: gateDecisionSharedNoRemote}
+		prepared := 0
+		gated := 0
+		applied, err := MigrateUpWithLock(ctx, conn, "testdb",
+			WithDatabaseSelector(testDatabaseSelector),
+			WithLockedPreparation("tcp:test", func(context.Context, *sql.Conn) (*FreshBootstrapHealCapability, error) {
+				prepared++
+				if gated != 0 {
+					t.Error("the gate ran before locked preparation; it must read a prepared database")
+				}
+				return nil, nil
+			}),
+			WithMigrationGate(func(context.Context, *sql.Conn) error {
+				gated++
+				return refusal
+			}))
+		if applied != 0 {
+			t.Fatalf("MigrateUpWithLock() applied = %d, want 0", applied)
+		}
+		if prepared != 1 || gated != 1 {
+			t.Fatalf("preparation calls = %d, gate calls = %d, want 1 and 1", prepared, gated)
+		}
+		var gateErr *RemoteMigrateGateError
+		if !errors.As(err, &gateErr) || gateErr != refusal {
+			t.Fatalf("MigrateUpWithLock() error = %v, want the gate refusal unwrapped", err)
+		}
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Fatalf("unmet SQL expectations: %v", err)
+		}
+	})
+
+	t.Run("converged fast path never reaches the gate", func(t *testing.T) {
+		db, mock, err := sqlmock.New()
+		if err != nil {
+			t.Fatalf("create sql mock: %v", err)
+		}
+		defer db.Close()
+
+		ctx := context.Background()
+		conn, err := db.Conn(ctx)
+		if err != nil {
+			t.Fatalf("pin mock connection: %v", err)
+		}
+		defer conn.Close()
+
+		expectConvergedProbe(mock, "testdb")
+
+		gated := 0
+		applied, err := MigrateUpWithLock(ctx, conn, "testdb",
+			WithDatabaseSelector(testDatabaseSelector),
+			WithMigrationGate(func(context.Context, *sql.Conn) error {
+				gated++
+				return errors.New("the gate must not run on a converged database")
+			}))
+		if err != nil {
+			t.Fatalf("MigrateUpWithLock() error = %v", err)
+		}
+		if applied != 0 {
+			t.Fatalf("MigrateUpWithLock() applied = %d, want 0", applied)
+		}
+		if gated != 0 {
+			t.Fatalf("gate calls = %d, want 0 — the steady-state open must cost the gate nothing", gated)
+		}
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Fatalf("unmet SQL expectations: %v", err)
+		}
+	})
+}
