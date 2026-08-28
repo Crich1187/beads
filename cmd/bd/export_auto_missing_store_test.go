@@ -85,11 +85,16 @@ func TestMissingJSONLIssueIDsInStore_IgnoresCompactedWisp(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	missing, err := missingJSONLIssueIDsInStore(ctx, jsonlPath, "")
+	rec, err := reconcileAutoExportJSONL(ctx, jsonlPath, "")
 	if err != nil {
-		t.Fatalf("missingJSONLIssueIDsInStore: %v", err)
+		t.Fatalf("reconcileAutoExportJSONL: %v", err)
 	}
-	if len(missing) != 0 {
-		t.Fatalf("missing = %v, want empty (compacted wisp is out-of-scope and must not be a hard orphan)", missing)
+	if len(rec.unproven) != 0 {
+		t.Fatalf("unproven = %v, want empty (compacted wisp is out-of-scope and must not be a hard orphan)", rec.unproven)
+	}
+	// And it must be out of scope, not merely proven: an ephemeral row never
+	// reaches a proof source, so nothing about it is "reconciled" either.
+	if len(rec.provenDeleted) != 0 {
+		t.Fatalf("provenDeleted = %v, want empty (an out-of-scope wisp is never a candidate in the first place)", rec.provenDeleted)
 	}
 }

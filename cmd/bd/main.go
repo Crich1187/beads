@@ -110,6 +110,13 @@ var (
 	// an intentional empty JSONL artifact instead of treating it as ambiguous.
 	commandMayEmptyJSONLExport atomic.Bool
 
+	// commandDeletedIssueIDs is the in-process handoff from the delete
+	// commands to post-run auto-export: ids this command hard-deleted are
+	// PROVEN gone, so the export's orphan guard skips them instead of
+	// mistaking a deliberate delete for a torn store and refusing forever
+	// (GH#5896). See deletedIssueIDSet for why it is not persisted.
+	commandDeletedIssueIDs deletedIssueIDSet
+
 	// commandDidExplicitDoltCommit is set when a command already created a Dolt commit
 	// explicitly (e.g., bd sync in dolt-native mode, hook flows, bd vc commit).
 	// This prevents a redundant auto-commit attempt in PersistentPostRun.
@@ -892,6 +899,7 @@ var rootCmd = &cobra.Command{
 		// Reset per-command write tracking (used by Dolt auto-commit).
 		commandDidWrite.Store(false)
 		commandMayEmptyJSONLExport.Store(false)
+		commandDeletedIssueIDs.reset()
 		commandDidExplicitDoltCommit = false
 		commandDidWriteTipMetadata = false
 		commandTipIDsShown = make(map[string]struct{})
