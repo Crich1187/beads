@@ -301,6 +301,7 @@ var _ storage.ActiveDatabaseSizer = (*DoltStore)(nil)
 var _ storage.LifecycleManager = (*DoltStore)(nil)
 var _ storage.PendingCommitter = (*DoltStore)(nil)
 var _ storage.GarbageCollector = (*DoltStore)(nil)
+var _ storage.FullGarbageCollector = (*DoltStore)(nil)
 var _ storage.Flattener = (*DoltStore)(nil)
 var _ storage.Compactor = (*DoltStore)(nil)
 var _ storage.SchemaMigrator = (*DoltStore)(nil)
@@ -2869,8 +2870,8 @@ func (s *DoltStore) ActiveDatabaseSize(ctx context.Context) (int64, error) {
 	return size, nil
 }
 
-// DoltGC runs Dolt garbage collection to reclaim disk space.
-// Pins a single connection to avoid session state loss on pooled *sql.DB.
+// DoltGC runs Dolt's default, generational garbage collection to reclaim disk
+// space. Pins a single connection to avoid session state loss on pooled *sql.DB.
 func (s *DoltStore) DoltGC(ctx context.Context) error {
 	conn, err := s.db.Conn(ctx)
 	if err != nil {
@@ -2878,6 +2879,18 @@ func (s *DoltStore) DoltGC(ctx context.Context) error {
 	}
 	defer conn.Close()
 	return versioncontrolops.DoltGC(ctx, conn)
+}
+
+// DoltGCFull runs a full Dolt garbage collection across all storage
+// generations. Pins a single connection to avoid session state loss on pooled
+// *sql.DB.
+func (s *DoltStore) DoltGCFull(ctx context.Context) error {
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("acquire connection for gc: %w", err)
+	}
+	defer conn.Close()
+	return versioncontrolops.DoltGCFull(ctx, conn)
 }
 
 // ListRemoteRefs returns the names of all cached remote-tracking refs.
