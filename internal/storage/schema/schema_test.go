@@ -643,7 +643,7 @@ func TestEnsureWispIsBlockedForRecomputeNoopsWhenWispsAbsent(t *testing.T) {
 	// with a table-not-found error if wisps is genuinely missing when they
 	// run. The no-op is safe here only because it is never reached with
 	// wisps absent in a real pass: ignored/0001 (or the cursor-reality
-	// repair, cursorContradictedBySchema, when the cursor and schema
+	// repair, cursorRealityFloor, when the cursor and schema
 	// disagree) always materializes wisps before the pass advances this far.
 	// This test exercises the repair function in isolation and is not a
 	// claim that 0007/0015 tolerate a missing wisps table.
