@@ -1890,7 +1890,7 @@ func TestMaybeAutoExport_SecondRunTakesIncrementalPath_ServerMode(t *testing.T) 
 	}
 
 	// Both ChangedIssueIDs call sites must have fired: the orphan guard's
-	// proof-of-deletion probe (missingJSONLIssueIDsInStore, which runs
+	// proof-of-deletion probe (reconcileAutoExportJSONL, which runs
 	// because deleting e2e-b leaves it JSONL-only) and tryIncrementalExport's
 	// own diff. A bare "called at least once" check is NOT sufficient and was
 	// the PR #5806 round-5 review finding: the guard's own call satisfies it

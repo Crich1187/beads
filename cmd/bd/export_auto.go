@@ -549,7 +549,7 @@ func (s *deletedIssueIDSet) has(id string) bool {
 }
 
 // commitHistoryChecker is the narrow slice of storage.VersionControl that
-// missingJSONLIssueIDsInStore needs. It is declared locally and asserted
+// reconcileAutoExportJSONL needs. It is declared locally and asserted
 // separately from storage.DiffStore so a store implementing one but not the
 // other still degrades to the conservative verdict instead of panicking.
 type commitHistoryChecker interface {
@@ -559,7 +559,7 @@ type commitHistoryChecker interface {
 // diffAnchorOnCurrentHistory reports whether anchor is still reachable from
 // the current HEAD. It is the ancestry precondition on trusting a dolt_diff
 // "removed" verdict as proof of a real `bd delete` rather than a history
-// rewind — see missingJSONLIssueIDsInStore. Fails closed: a store that
+// rewind — see reconcileAutoExportJSONL. Fails closed: a store that
 // cannot answer, or an error while asking, yields false so the caller keeps
 // refusing to overwrite.
 func diffAnchorOnCurrentHistory(ctx context.Context, anchor string) bool {
@@ -848,7 +848,7 @@ func exportToFile(ctx context.Context, path string, includeMemories bool) (issue
 // safe to drop when its id is no longer in the store (a TTL-compacted wisp,
 // GH#4988); if the store still has it, dropping it repeats #4069's data
 // loss. Deliberately unfiltered + MaxRows: 0, for the same reason as
-// missingJSONLIssueIDsInStore's store-side query: this guard's failure mode
+// reconcileAutoExportJSONL's store-side query: this guard's failure mode
 // is a permanent wedge, so the query must stay maximally permissive.
 func storeKnownIssueIDs(ctx context.Context) (map[string]struct{}, error) {
 	issues, err := store.SearchIssues(ctx, "", types.IssueFilter{Limit: 0, MaxRows: 0})
