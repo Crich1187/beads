@@ -139,6 +139,49 @@ bd migrate
 bd migrate --yes
 ```
 
+### Upgrading to 1.3.0
+
+A 1.2.2 or 1.1.x database sits at schema v53, and 1.3.0 knows v66 — this
+upgrade crosses **13 migrations** in one step. That is more than a routine
+upgrade, because 1.2.2 was a recovery release that shipped the 1.1 code under a
+higher version number, so there is a release line's worth of schema between the
+two.
+
+The first command you run after installing applies all 13, in place. Expect it
+to take noticeably longer than the commands after it: two of the passes rewrite
+rows rather than reshaping tables. It is crash-resumable and picks up where it
+left off, but let it finish. Progress prints per migration:
+
+```
+Applying migration 0054: add_lease_columns…
+  done (0.4s)
+```
+
+Those lines go to stderr and only when stderr is a terminal, so a piped or CI
+upgrade prints nothing. Silence there is not a stall.
+
+Two things to get right before you start:
+
+- **Back up.** Take the export described under [Remote-backed databases and
+  multiple clones](#remote-backed-databases-and-multiple-clones) below —
+  it applies to a local database too, and it matters more than usual here,
+  since 13 migrations is 13 chances for a drifted database to be caught out.
+- **Upgrade every client that shares a store, together.** A bd binary refuses a
+  database migrated past the schema it knows, rather than proceeding blind. One
+  machine upgrading takes the shared store forward and every client still on
+  1.2.2 stops working. Check for a second binary earlier in your `PATH` with
+  `which -a bd`, and restart any long-running `bd serve`.
+
+If you need to go back, the rollback is a schema-cursor rollback rather than a
+downgrade of the data — see
+[Accidental v1.2.1 Release](/recovery/accidental-1-2-1-release), whose
+procedure is the same for any cursor rollback even though its worked example is
+that release.
+
+`bd info --whats-new` summarizes the behavior changes that land with the
+migration; several commands changed defaults, so read it before your first
+session on the new binary.
+
 ### Remote-backed databases and multiple clones
 
 `bd` refuses to silently apply pending schema migrations to a database that has
