@@ -851,6 +851,220 @@ func TestAutoMigrateSkippedDuringMigrationFreeze(t *testing.T) {
 	}
 }
 
+// TestDoctorMutationBlockedDuringMigrationFreeze covers the freeze half of
+// doctor's mutation gate (#6028). Doctor was the one write-capable command the
+// dc-6jaq gate above never reached: it carries skipStoreAnnotation, so the root
+// PersistentPreRunE returns before its freeze check ever runs, and doctor's own
+// RunE never called CheckReadonly. Its fixers then opened stores directly — two
+// of them by shelling out to a child bd — and mutated straight through an
+// active freeze.
+//
+// One row per writing surface class. The gate fires before doctor's
+// embedded-mode gate, so these refusals need no Dolt server, and the
+// interactive row proves the refusal precedes any prompt (stdin is closed; a
+// hang here is the failure).
+func TestDoctorMutationBlockedDuringMigrationFreeze(t *testing.T) {
+	bd, dir := setupMigrationFreezeWorkspace(t)
+	marker := writeFreezeMarker(t, dir, "migrator", "dolt v2 migration")
+	before := doctorWorkspaceFingerprint(t, dir)
+
+	for _, tt := range doctorMutationSurfaces() {
+		t.Run(tt.name, func(t *testing.T) {
+			stdout, stderr, code := runBDFrozen(t, bd, dir, tt.args...)
+
+			if code != ExitMigrationFrozen {
+				t.Fatalf("exit code = %d, want %d\nstdout:\n%s\nstderr:\n%s", code, ExitMigrationFrozen, stdout, stderr)
+			}
+			for _, want := range []string{
+				"workspace is frozen for migration",
+				"bd " + tt.op + " is blocked by the freeze marker at " + marker,
+				"To resume writes, remove that file.",
+			} {
+				if !strings.Contains(stderr, want) {
+					t.Errorf("stderr missing %q:\n%s", want, stderr)
+				}
+			}
+			assertVendorNeutral(t, stderr)
+			assertDoctorRefusalIsClean(t, stdout)
+			assertDoctorWorkspaceUnchanged(t, dir, before)
+		})
+	}
+}
+
+// TestDoctorPathArgBlockedByTargetFreeze covers the reason doctor's gate takes
+// the resolved target path: doctor is the only write-capable command that
+// operates on a directory named on the command line, so keying the lookup on
+// the caller's cwd alone would let `bd doctor /frozen/repo --fix` walk an
+// entirely unrelated tree and mutate straight through the marker.
+func TestDoctorPathArgBlockedByTargetFreeze(t *testing.T) {
+	target := t.TempDir()
+	bd := setupMigrationFreezeWorkspaceIn(t, target)
+	marker := writeFreezeMarker(t, target, "migrator", "dolt v2 migration")
+	before := doctorWorkspaceFingerprint(t, target)
+
+	// cwd is an unrelated, unfrozen workspace; only the target is frozen.
+	outside := t.TempDir()
+	setupMigrationFreezeWorkspaceIn(t, outside)
+
+	stdout, stderr, code := runBDFrozen(t, bd, outside, "doctor", target, "--fix", "--yes")
+
+	if code != ExitMigrationFrozen {
+		t.Fatalf("exit code = %d, want %d\nstdout:\n%s\nstderr:\n%s", code, ExitMigrationFrozen, stdout, stderr)
+	}
+	if !strings.Contains(stderr, marker) {
+		t.Errorf("refusal should name the target's own marker %q:\n%s", marker, stderr)
+	}
+	assertVendorNeutral(t, stderr)
+	assertDoctorRefusalIsClean(t, stdout)
+	assertDoctorWorkspaceUnchanged(t, target, before)
+}
+
+// TestDoctorPathArgMaintenanceSkippedByTargetFreeze is the diagnosis-side twin:
+// plain `bd doctor <path>` writes .local_version into the *target*, so the skip
+// probe has to key on the target too, not merely on where bd was launched.
+func TestDoctorPathArgMaintenanceSkippedByTargetFreeze(t *testing.T) {
+	target := t.TempDir()
+	bd := setupMigrationFreezeWorkspaceIn(t, target)
+	seedStaleLocalVersion(t, target)
+	writeFreezeMarker(t, target, "migrator", "dolt v2 migration")
+
+	outside := t.TempDir()
+	setupMigrationFreezeWorkspaceIn(t, outside)
+
+	_, stderr, _ := runBDMigrationFreezeWithEnv(t, bd, outside,
+		append(freezeWalkEnv(), doctorMaintenanceEnv()...), "doctor", target)
+
+	if got := readWorkspaceLocalVersion(t, target); got != staleLocalVersion {
+		t.Errorf("%s in the frozen target = %q, want unchanged %q — the maintenance probe keyed on cwd, not on the target",
+			localVersionFile, got, staleLocalVersion)
+	}
+	if strings.Contains(stderr, "auto-migrate:") {
+		t.Errorf("autoMigrateOnVersionBump ran against a frozen target:\n%s", stderr)
+	}
+}
+
+// TestDoctorDiagnosisWorksDuringMigrationFreeze is the constraint that shapes
+// the whole gate: a freeze is exactly when an operator needs to diagnose, so
+// every non-mutating doctor mode must keep running. The gate keys on
+// --fix/--clean and nothing else.
+func TestDoctorDiagnosisWorksDuringMigrationFreeze(t *testing.T) {
+	bd, dir := setupMigrationFreezeWorkspace(t)
+	writeFreezeMarker(t, dir, "migrator", "dolt v2 migration")
+
+	for _, args := range [][]string{
+		{"doctor"},
+		{"doctor", "--check=pollution"},
+		{"doctor", "--check=artifacts"},
+		{"doctor", "--check=conventions"},
+	} {
+		t.Run(strings.Join(args, "_"), func(t *testing.T) {
+			stdout, stderr, code := runBDFrozen(t, bd, dir, args...)
+			if code == ExitMigrationFrozen || strings.Contains(stderr, "frozen for migration") {
+				t.Errorf("bd %v was refused during a freeze but mutates nothing (exit %d):\nstderr:\n%s\nstdout:\n%s",
+					args, code, stderr, stdout)
+			}
+		})
+	}
+}
+
+// TestDoctorDryRunWorksDuringMigrationFreeze pins the dry-run boundary: plain
+// --dry-run only previews and stays available, while --fix --dry-run is
+// refused (the gate reads the mutating flag, not the preview flag — the same
+// posture the freeze gate takes on every other command's --dry-run).
+func TestDoctorDryRunWorksDuringMigrationFreeze(t *testing.T) {
+	bd, dir := setupMigrationFreezeWorkspace(t)
+	writeFreezeMarker(t, dir, "migrator", "dolt v2 migration")
+
+	stdout, stderr, code := runBDFrozen(t, bd, dir, "doctor", "--dry-run")
+	if code == ExitMigrationFrozen || strings.Contains(stderr, "frozen for migration") {
+		t.Errorf("'bd doctor --dry-run' previews only and must not be refused (exit %d):\nstderr:\n%s\nstdout:\n%s", code, stderr, stdout)
+	}
+
+	stdout, stderr, code = runBDFrozen(t, bd, dir, "doctor", "--fix", "--dry-run")
+	if code != ExitMigrationFrozen || !strings.Contains(stderr, "workspace is frozen for migration") {
+		t.Errorf("'bd doctor --fix --dry-run' must be refused (exit %d, want %d):\nstderr:\n%s\nstdout:\n%s",
+			code, ExitMigrationFrozen, stderr, stdout)
+	}
+}
+
+// staleLocalVersion is an implausibly old recorded version: it forces
+// trackBdVersion to see a version "bump" so the maintenance work under test
+// actually does something observable instead of short-circuiting.
+const staleLocalVersion = "0.0.1"
+
+func seedStaleLocalVersion(t *testing.T, dir string) {
+	t.Helper()
+	path := filepath.Join(dir, ".beads", localVersionFile)
+	if err := os.WriteFile(path, []byte(staleLocalVersion+"\n"), 0644); err != nil {
+		t.Fatalf("writing stale %s: %v", localVersionFile, err)
+	}
+}
+
+// readWorkspaceLocalVersion reads .beads/.local_version out of a test
+// workspace (the production readLocalVersion takes the file path directly).
+func readWorkspaceLocalVersion(t *testing.T, dir string) string {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join(dir, ".beads", localVersionFile))
+	if err != nil {
+		t.Fatalf("reading %s: %v", localVersionFile, err)
+	}
+	return strings.TrimSpace(string(data))
+}
+
+// doctorMaintenanceEnv puts doctor on its full diagnosis path. runDiagnostics —
+// where the maintenance calls under test live — sits behind doctor's
+// embedded-mode gate, so the workspace has to look server-backed;
+// BEADS_DOLT_SHARED_SERVER is enough, and no server needs to answer, because
+// the maintenance block runs before doctor opens its shared store. BD_DEBUG
+// surfaces autoMigrateOnVersionBump's own "auto-migrate:" logging, so the
+// absence of that line is direct evidence the function was never entered.
+func doctorMaintenanceEnv() []string {
+	return []string{"BEADS_DOLT_SHARED_SERVER=1", "BD_DEBUG=1"}
+}
+
+// assertDoctorReportedStaleVersionWithoutHealing is the #6028 diagnosis
+// contract in one place: doctor reports the version mismatch as a finding and
+// leaves the store alone.
+func assertDoctorReportedStaleVersionWithoutHealing(t *testing.T, dir, stdout, stderr string) {
+	t.Helper()
+	if got := readWorkspaceLocalVersion(t, dir); got != staleLocalVersion {
+		t.Errorf("%s = %q, want unchanged %q — doctor's diagnosis rewrote it through an active gate",
+			localVersionFile, got, staleLocalVersion)
+	}
+	if strings.Contains(stderr, "auto-migrate:") {
+		t.Errorf("autoMigrateOnVersionBump ran its store-opening body during a gated 'bd doctor' "+
+			"(found an 'auto-migrate:' debug line) — diagnosis must not apply schema migrations:\n%s", stderr)
+	}
+	if !strings.Contains(stdout, "Version Tracking") || !strings.Contains(stdout, staleLocalVersion) {
+		t.Errorf("doctor should still REPORT the stale version %q as a finding, not silently skip it:\n%s",
+			staleLocalVersion, stdout)
+	}
+}
+
+// TestDoctorMaintenanceSkippedDuringMigrationFreeze is the regression test for
+// the sharpest half of #6028: plain `bd doctor` — no --fix, no --clean — wrote
+// to a frozen store. runDiagnostics re-implements PersistentPreRunE's two
+// maintenance side effects (trackBdVersion, autoMigrateOnVersionBump) because
+// doctor skips that hook, but it inherited none of the hook's guards, so it
+// rewrote .beads/.local_version and could auto-apply a schema migration
+// mid-freeze — the exact torn-upgrade write the freeze exists to prevent.
+//
+// This is the doctor-side twin of TestAutoMigrateSkippedDuringMigrationFreeze
+// above, which pins the same two calls on the PersistentPreRunE path.
+func TestDoctorMaintenanceSkippedDuringMigrationFreeze(t *testing.T) {
+	bd, dir := setupMigrationFreezeWorkspace(t)
+	seedStaleLocalVersion(t, dir)
+	writeFreezeMarker(t, dir, "migrator", "dolt v2 migration")
+
+	stdout, stderr, code := runBDMigrationFreezeWithEnv(t, bd, dir,
+		append(freezeWalkEnv(), doctorMaintenanceEnv()...), "doctor")
+
+	assertDoctorReportedStaleVersionWithoutHealing(t, dir, stdout, stderr)
+	if code == ExitMigrationFrozen || strings.Contains(stderr, "frozen for migration") {
+		t.Errorf("plain 'bd doctor' must diagnose during a freeze, not refuse (exit %d):\nstderr:\n%s", code, stderr)
+	}
+}
+
 // TestAutoMigrateStillRunsWithoutFreeze is the companion regression-safety
 // check for the ask-#2 fix: without a freeze marker, the new early gate in
 // PersistentPreRunE must not interfere with autoMigrateOnVersionBump's normal
