@@ -5,7 +5,7 @@ description: Complete reference for bd configuration across config.yaml and data
 
 Complete configuration reference for beads.
 
-Last reviewed: 2026-07-10
+Last reviewed: 2026-08-28
 
 Freshness source: `cmd/bd/main.go`, `cmd/bd/config.go`, and `internal/configfile/`.
 
@@ -456,6 +456,7 @@ Selected commonly-used variables:
 | `BD_NO_PAGER`, `BD_PAGER` | Pager behavior |
 | `BD_NON_INTERACTIVE` | Disable prompts |
 | `BD_DEBUG` | Enable debug logging |
+| `BD_MIGRATION_FREEZE_FILE` | Check this exact path for the freeze marker instead of walking ancestor directories (see [Migration Freeze](#migration-freeze)) |
 | `BEADS_DIR` | Force the active beads workspace directory |
 | `BEADS_ACTOR` | Actor identity (preferred over `BD_ACTOR`, which is a deprecated alias) |
 | `BEADS_IDENTITY` | Sender identity for `bd mail` |
@@ -466,6 +467,32 @@ Selected commonly-used variables:
 Integration secrets follow tracker-specific conventions: `LINEAR_API_KEY`, `GITHUB_TOKEN`, `GITLAB_TOKEN`, `JIRA_API_TOKEN`, `AZURE_DEVOPS_PAT`, `ANTHROPIC_API_KEY`. These are preferred over storing the value in `config.yaml` for git-tracked projects.
 
 `bd config show` will display the source of every effective key, making overrides explicit.
+
+## Migration Freeze
+
+Maintenance that runs outside `bd` — moving a database to a new host, rewriting schema by hand — needs a way to stop writes for its duration without uninstalling the tool. Create a file named `MIGRATION-FREEZE` and every write command refuses to run until you delete it.
+
+bd looks for the marker in the working directory and each of its ancestors, so one file above a tree of repositories freezes all of them at once.
+
+```bash
+touch MIGRATION-FREEZE     # the file's existence is the whole signal
+
+# Optional payload: operator, RFC3339 timestamp, and reason, tab-separated
+# on one line. bd echoes it back in the refusal.
+printf 'alice\t2026-08-16T12:00:00Z\tmoving to the new server\n' > MIGRATION-FREEZE
+
+bd create "new work"
+# ⛔ ERROR: workspace is frozen for migration (by alice).
+#    Reason: moving to the new server
+#    bd create is blocked by the freeze marker at /work/MIGRATION-FREEZE.
+#    To resume writes, remove that file.
+
+rm MIGRATION-FREEZE        # thaw
+```
+
+Blocked commands exit **14** — a stable code scripts branch on to tell "someone is migrating this workspace, come back later" from a generic failure worth an immediate retry. Reads (`bd list`, `bd show`, `bd ready`, …) keep working during a freeze, and a frozen workspace is never rewritten behind your back: version-bump migration and JSONL auto-import are skipped too.
+
+Set `BD_MIGRATION_FREEZE_FILE` to consult one explicit path and skip the ancestor walk. It covers markers that live outside the working tree, and doubles as an opt-out when it points at a path that does not exist.
 
 ## Security: Where Secrets Live
 
