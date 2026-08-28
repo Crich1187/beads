@@ -354,6 +354,40 @@ func printGlobalDatabaseConsentHint(w io.Writer) {
 		schema.SharedConsentCommandGlobal)
 }
 
+// renderTypedOpenError prints the actionable block for the store-open failures
+// that carry one, honoring --json, and reports whether it handled err. A false
+// return means the caller should fall back to its own generic message.
+//
+// Every open path needs this — the Dolt store, the proxied unit-of-work
+// provider, and `bd serve`'s startup. The proxied one used to render every
+// failure as `%v` inside "failed to open uow provider", which turned a
+// multi-line rebuild or migrate-consent guide into one truncated line.
+func renderTypedOpenError(err error) bool {
+	// Schema skew gets dedicated UX with actionable rebuild instructions.
+	var skewErr *schema.SchemaSkewError
+	if errors.As(err, &skewErr) {
+		if jsonOutput {
+			handleSchemaSkewJSON(skewErr)
+		} else {
+			fmt.Fprint(os.Stderr, skewErr.UserMessage())
+		}
+		return true
+	}
+	// #4259 / #5920: the migrate gate blocks a silent in-place migration and
+	// tells the operator to migrate, adopt, or consent.
+	var gateErr *schema.RemoteMigrateGateError
+	if errors.As(err, &gateErr) {
+		if jsonOutput {
+			handleRemoteMigrateGateJSON(gateErr)
+		} else {
+			fmt.Fprint(os.Stderr, gateErr.UserMessage())
+			printGlobalDatabaseConsentHint(os.Stderr)
+		}
+		return true
+	}
+	return false
+}
+
 // isSchemaMigrateVerb reports whether cmd is `bd migrate schema` — the one
 // invocation in which the operator asked for a schema migration by name. That
 // request is the consent the shared-store gate wants for a database with no
@@ -1668,8 +1702,16 @@ var rootCmd = &cobra.Command{
 		// root pre-run, before --dry-run/--inspect has had any effect. Proxied
 		// mode is where that is least visible, not where it is acceptable.
 		if proxiedServerMode {
-			p, err := newProxiedServerUOWProvider(rootCtx, beadsDir, databaseOverride, previewProviderOptions(previewMode)...)
+			p, err := newProxiedServerUOWProvider(rootCtx, beadsDir, databaseOverride,
+				rootProviderOptions(previewMode, useReadOnly)...)
 			if err != nil {
+				// Same typed rendering the store path gets below: a schema
+				// skew or a migration-gate refusal here carries a whole
+				// actionable block, and `%v` inside "failed to open uow
+				// provider" throws all of it away.
+				if rendered := renderTypedOpenError(err); rendered {
+					return SilentExit()
+				}
 				return HandleError("failed to open uow provider: %v", err)
 			}
 			// Fire the workspace's script hooks after commits on the
@@ -1732,26 +1774,7 @@ var rootCmd = &cobra.Command{
 			if handleFreshCloneError(err) {
 				return SilentExit()
 			}
-			// Schema skew gets dedicated UX with actionable rebuild instructions.
-			var skewErr *schema.SchemaSkewError
-			if errors.As(err, &skewErr) {
-				if jsonOutput {
-					handleSchemaSkewJSON(skewErr)
-				} else {
-					fmt.Fprint(os.Stderr, skewErr.UserMessage())
-				}
-				return SilentExit()
-			}
-			// #4259: the remote-migrate gate blocks silent in-place migration of a
-			// remote-backed database and tells the operator to migrate-or-adopt.
-			var gateErr *schema.RemoteMigrateGateError
-			if errors.As(err, &gateErr) {
-				if jsonOutput {
-					handleRemoteMigrateGateJSON(gateErr)
-				} else {
-					fmt.Fprint(os.Stderr, gateErr.UserMessage())
-					printGlobalDatabaseConsentHint(os.Stderr)
-				}
+			if renderTypedOpenError(err) {
 				return SilentExit()
 			}
 			return HandleError("failed to open database: %v", err)

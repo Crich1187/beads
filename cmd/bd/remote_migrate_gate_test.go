@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"os"
 	"strings"
@@ -303,4 +305,64 @@ func TestHandleRemoteMigrateGateJSON_SharedNoRemoteGlobal(t *testing.T) {
 	if len(cmds) != 1 || cmds[0] != schema.SharedConsentCommandGlobal {
 		t.Errorf("commands = %v, want [%q]", cmds, schema.SharedConsentCommandGlobal)
 	}
+}
+
+// TestRenderTypedOpenError pins the rendering every store-open path depends
+// on: the Dolt store open, the proxied unit-of-work provider open, and
+// `bd serve`'s startup all call it, and all three must produce the whole
+// actionable block rather than a one-line `%v`. A gate refusal at `bd serve`
+// startup is the case with no operator watching, so the daemon's log is the
+// only place the remediation can appear.
+func TestRenderTypedOpenError(t *testing.T) {
+	capture := func(fn func() bool) (string, bool) {
+		origStderr := os.Stderr
+		r, w, pipeErr := os.Pipe()
+		if pipeErr != nil {
+			t.Fatal(pipeErr)
+		}
+		os.Stderr = w
+		handled := fn()
+		_ = w.Close()
+		os.Stderr = origStderr
+
+		var buf bytes.Buffer
+		if _, err := io.Copy(&buf, r); err != nil {
+			t.Fatal(err)
+		}
+		_ = r.Close()
+		return buf.String(), handled
+	}
+
+	t.Run("shared-store gate refusal renders the full block", func(t *testing.T) {
+		gate := &schema.RemoteMigrateGateError{
+			CurrentVersion: 53, LatestVersion: 66, Pending: 13,
+			Decision: "shared-no-remote",
+		}
+		out, handled := capture(func() bool {
+			return renderTypedOpenError(fmt.Errorf("uow: init schema: %w", gate))
+		})
+		if !handled {
+			t.Fatal("renderTypedOpenError = false, want true for a wrapped gate refusal")
+		}
+		if out != gate.UserMessage() {
+			t.Errorf("rendered output is not the full UserMessage:\n%s", out)
+		}
+		for _, want := range []string{"co-resident", "bd migrate schema", "Read commands keep working"} {
+			if !strings.Contains(out, want) {
+				t.Errorf("output missing %q:\n%s", want, out)
+			}
+		}
+	})
+
+	t.Run("an ordinary error is left to the caller", func(t *testing.T) {
+		out, handled := capture(func() bool {
+			return renderTypedOpenError(errors.New("connection refused"))
+		})
+		if handled {
+			t.Error("renderTypedOpenError = true, want false for an untyped error")
+		}
+		if out != "" {
+			t.Errorf("nothing should be printed for an untyped error, got:\n%s", out)
+		}
+	})
 }
