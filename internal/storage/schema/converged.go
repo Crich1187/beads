@@ -79,6 +79,22 @@ func alreadyConverged(ctx context.Context, db DBConn, databaseName string, selec
 		return false, nil
 	}
 
+	// The pattern being present does not mean it is in EFFECT. On a legacy
+	// lineage the ignored-lane cursor table is committed at HEAD, where
+	// dolt_ignore's add-delta semantics make the pattern inert and every pull
+	// wedges (gastownhall/beads#4356). MigrateUp untracks it, so a database
+	// in that shape is not converged no matter how at-latest its cursors
+	// read: decline, take the lock, and let the locked pass heal it. Costs
+	// one round trip on the hot path — the HEAD table listing — and the
+	// dolt_ignore follow-up read only ever runs on the legacy shape.
+	needsUntrack, err := ignoredCursorNeedsUntrack(ctx, db, qualifier)
+	if err != nil {
+		return false, err
+	}
+	if needsUntrack {
+		return false, nil
+	}
+
 	// LAST, and deliberately so: everything above is the cheap steady-state
 	// question and short-circuits first. This term closes the window where a
 	// peer is midway through a real migration pass. migrationWorkNeeded only

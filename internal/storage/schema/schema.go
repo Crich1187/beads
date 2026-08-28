@@ -611,6 +611,20 @@ func MigrateUp(ctx context.Context, db DBConn) (int, error) {
 		return 0, err
 	}
 
+	// Asserting the pattern is not enough on a lineage old enough to have
+	// COMMITTED the ignored-lane cursor table: dolt_ignore only exempts
+	// tables that were never tracked, so the pattern above is inert there and
+	// the table stays permanently dirty, wedging every pull
+	// (gastownhall/beads#4356). Untracking it is a one-time repair, but it
+	// belongs here rather than in a numbered migration for the same reason
+	// the seed does — the affected databases are at-latest, so the
+	// short-circuit below would skip it — plus one the seed does not have: a
+	// pull from a not-yet-healed peer can re-introduce the tracked table,
+	// which only a probe that runs at EVERY open can catch.
+	if _, err := healTrackedIgnoredCursorTable(ctx, db); err != nil {
+		return 0, fmt.Errorf("untracking legacy %s: %w", ignoredSource.cursorTable, err)
+	}
+
 	needed, err := migrationWorkNeeded(ctx, db)
 	if err != nil {
 		return 0, fmt.Errorf("checking schema migration work: %w", err)
