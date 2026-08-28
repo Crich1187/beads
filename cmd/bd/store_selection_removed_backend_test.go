@@ -378,6 +378,12 @@ func TestStoreFactoriesRemovedBackendsFailLoud(t *testing.T) {
 					if !strings.Contains(guidance, "export") || !strings.Contains(guidance, "dolt") {
 						t.Fatalf("error should provide safe migration guidance: %v", err)
 					}
+					// With no Dolt data on disk the configured database really is
+					// the only copy, so the export path is right and the D-8 heal
+					// must not be offered — that edit would open an empty store.
+					if strings.Contains(guidance, "to heal") {
+						t.Fatalf("error offered a metadata heal for a workspace with no Dolt data: %v", err)
+					}
 					for _, name := range []string{"embeddeddolt", "dolt", "beads.db"} {
 						path := filepath.Join(beadsDir, name)
 						if _, statErr := os.Stat(path); !os.IsNotExist(statErr) {
