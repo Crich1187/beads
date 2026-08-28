@@ -326,158 +326,68 @@ Focus on workflow-impacting changes agents need to know.
 """
 
 [[steps]]
-id = "bump-version-go"
-title = "Bump version in version.go"
+id = "bump-versions"
+title = "Bump every version reference"
 needs = ["update-info-go"]
 description = """
-Update the Go version constant.
+Run the one script that owns every version reference.
 
 ```bash
-# macOS
-sed -i '' 's/Version = "[^"]*"/Version = "{{version}}"/' cmd/bd/version.go
-
-# Linux
-sed -i 's/Version = "[^"]*"/Version = "{{version}}"/' cmd/bd/version.go
+./scripts/update-versions.sh {{version}}
 ```
+
+This is the ONLY sanctioned way to bump. Hand-rolled sed per file is how the
+set drifts: this formula used to carry its own copies and pointed at a
+`claude-plugin/` path that has not existed since the plugins moved under
+`plugins/beads/`, while missing the copilot plugin, the MCP lockfile and the
+tracked git-hook markers entirely — so it would have failed outright, or
+shipped inconsistent versions, on every step after the stale path.
+
+`scripts/update-versions.sh` rewrites, in one pass:
+
+- `cmd/bd/version.go` — the canonical version everything else is compared to
+- `plugins/beads/.claude-plugin/plugin.json`
+- `plugins/beads/.codex-plugin/plugin.json`
+- `plugins/beads/.copilot-plugin/plugin.json`
+- `.claude-plugin/marketplace.json`
+- `integrations/beads-mcp/pyproject.toml`
+- `integrations/beads-mcp/src/beads_mcp/__init__.py`
+- `integrations/beads-mcp/uv.lock` — via `uv lock`
+- `npm-package/package.json`
+- `.githooks/*` — the `BEGIN`/`END BEADS INTEGRATION v<version>` markers
+- `default.nix`
+- `cmd/bd/winres/winres.json`, `cmd/bd/winres/manifest.xml`
+- `README.md` — the static Alpha badge, if one is present (it is not today;
+  README uses live npm/PyPI/GitHub badges)
+
+Two of those have burned a release before, so check the script's output rather
+than assuming:
+
+- **`uv` must be installed.** Without it the script WARNS and leaves
+  `uv.lock` stale. The release workflow's MCP gate runs `uv sync --locked`,
+  which fails only in the tag-triggered run — after the tag exists and can no
+  longer be rewritten. That burned v1.1.1 and cost v1.1.0 and v1.1.2 their
+  first runs. If you see `uv not found` or `uv lock failed`, stop and fix it:
+  ```bash
+  uv lock --directory integrations/beads-mcp
+  ```
+- **The `.githooks/*` markers are rewritten wholesale**, not matched against
+  the current version, because they can already be drifted when the bump runs
+  (they still said v1.1.0 during the v1.2.0 bump).
+
+Not covered here, by design: `CHANGELOG.md` and `cmd/bd/info.go` (earlier
+steps), and `default.nix`'s `vendorHash` (next step).
 
 Verify:
 ```bash
-grep 'Version = ' cmd/bd/version.go
-```
-"""
-
-[[steps]]
-id = "bump-plugin-json"
-title = "Bump version in plugin JSON files"
-needs = ["bump-version-go"]
-description = """
-Update Claude plugin manifest versions.
-
-```bash
-# macOS/Linux with jq
-jq '.version = "{{version}}"' claude-plugin/.claude-plugin/plugin.json > tmp && mv tmp claude-plugin/.claude-plugin/plugin.json
-jq '.plugins[0].version = "{{version}}"' .claude-plugin/marketplace.json > tmp && mv tmp .claude-plugin/marketplace.json
-```
-
-Verify:
-```bash
-jq -r '.version' claude-plugin/.claude-plugin/plugin.json
-jq -r '.plugins[0].version' .claude-plugin/marketplace.json
-```
-"""
-
-[[steps]]
-id = "bump-mcp-python"
-title = "Bump version in MCP Python package"
-needs = ["bump-plugin-json"]
-description = """
-Update the beads-mcp Python package version.
-
-```bash
-# macOS
-sed -i '' 's/version = "[^"]*"/version = "{{version}}"/' integrations/beads-mcp/pyproject.toml
-sed -i '' 's/__version__ = "[^"]*"/__version__ = "{{version}}"/' integrations/beads-mcp/src/beads_mcp/__init__.py
-
-# Linux
-sed -i 's/version = "[^"]*"/version = "{{version}}"/' integrations/beads-mcp/pyproject.toml
-sed -i 's/__version__ = "[^"]*"/__version__ = "{{version}}"/' integrations/beads-mcp/src/beads_mcp/__init__.py
-```
-
-Verify:
-```bash
-grep 'version = ' integrations/beads-mcp/pyproject.toml | head -1
-grep '__version__ = ' integrations/beads-mcp/src/beads_mcp/__init__.py
-```
-"""
-
-[[steps]]
-id = "bump-npm-package"
-title = "Bump version in npm package"
-needs = ["bump-mcp-python"]
-description = """
-Update the npm package version.
-
-```bash
-# macOS/Linux with jq
-jq '.version = "{{version}}"' npm-package/package.json > tmp && mv tmp npm-package/package.json
-```
-
-Verify:
-```bash
-jq -r '.version' npm-package/package.json
-```
-"""
-
-[[steps]]
-id = "bump-winres"
-title = "Bump version in Windows resource metadata"
-needs = ["bump-npm-package"]
-description = """
-Update Windows PE resource metadata.
-
-```bash
-# macOS
-sed -i '' 's/"file_version": "[^"]*"/"file_version": "{{version}}"/' cmd/bd/winres/winres.json
-sed -i '' 's/"product_version": "[^"]*"/"product_version": "{{version}}"/' cmd/bd/winres/winres.json
-sed -i '' 's/"FileVersion": "[^"]*"/"FileVersion": "{{version}}"/' cmd/bd/winres/winres.json
-sed -i '' 's/"ProductVersion": "[^"]*"/"ProductVersion": "{{version}}"/' cmd/bd/winres/winres.json
-sed -i '' 's/version="[0-9][^"]*\\.0"/version="{{version}}.0"/' cmd/bd/winres/manifest.xml
-
-# Linux
-sed -i 's/"file_version": "[^"]*"/"file_version": "{{version}}"/' cmd/bd/winres/winres.json
-sed -i 's/"product_version": "[^"]*"/"product_version": "{{version}}"/' cmd/bd/winres/winres.json
-sed -i 's/"FileVersion": "[^"]*"/"FileVersion": "{{version}}"/' cmd/bd/winres/winres.json
-sed -i 's/"ProductVersion": "[^"]*"/"ProductVersion": "{{version}}"/' cmd/bd/winres/winres.json
-sed -i 's/version="[0-9][^"]*\\.0"/version="{{version}}.0"/' cmd/bd/winres/manifest.xml
-```
-
-Verify:
-```bash
-grep '{{version}}' cmd/bd/winres/winres.json
-grep 'version="{{version}}.0"' cmd/bd/winres/manifest.xml
-```
-"""
-
-[[steps]]
-id = "bump-readme"
-title = "Check README static version references"
-needs = ["bump-winres"]
-description = """
-README.md currently uses live npm/PyPI/GitHub release badges instead of a static
-Alpha version string. Verify no old static version badge needs updating.
-
-```bash
-rg 'Alpha \\(v|v[0-9]+\\.[0-9]+\\.[0-9]+' README.md || true
-```
-
-If a static release reference is reintroduced later, update it here.
-"""
-
-[[steps]]
-id = "bump-default-nix"
-title = "Bump version in default.nix"
-needs = ["bump-readme"]
-description = """
-Update the Nix package version.
-
-```bash
-# macOS
-sed -i '' 's/version = "[^"]*";/version = "{{version}}";/' default.nix
-
-# Linux
-sed -i 's/version = "[^"]*";/version = "{{version}}";/' default.nix
-```
-
-Verify:
-```bash
-grep 'version = ' default.nix
+git diff --stat
 ```
 """
 
 [[steps]]
 id = "update-vendorhash"
 title = "Update Nix vendorHash if needed"
-needs = ["bump-default-nix"]
+needs = ["bump-versions"]
 description = """
 Update vendorHash if go.mod/go.sum changed since last release.
 
@@ -533,21 +443,34 @@ id = "verify-versions"
 title = "Verify version consistency"
 needs = ["stamp-changelog"]
 description = """
-Confirm all versions match {{version}}.
+Run the gate, not a hand-listed grep pile — the grep list is what drifts.
 
 ```bash
-grep 'Version = ' cmd/bd/version.go
-jq -r '.version' claude-plugin/.claude-plugin/plugin.json
-jq -r '.plugins[0].version' .claude-plugin/marketplace.json
-jq -r '.version' npm-package/package.json
-grep 'version = ' integrations/beads-mcp/pyproject.toml
-grep '__version__ = ' integrations/beads-mcp/src/beads_mcp/__init__.py
-grep 'version = ' default.nix
-grep '{{version}}' cmd/bd/winres/winres.json
-grep 'version="{{version}}.0"' cmd/bd/winres/manifest.xml
+./scripts/check-versions.sh
 ```
 
-All should show {{version}}.
+`scripts/check-versions.sh` reads the canonical version out of
+`cmd/bd/version.go` and compares every gated file against it: the three plugin
+manifests, the marketplace, the MCP pyproject / `__init__.py` / `uv.lock` pin
+(plus `uv lock --check` for freshness when `uv` is present), the npm package,
+and both `BEADS INTEGRATION` markers in every `.githooks/*` file. It exits
+non-zero on any mismatch and names the file. This is the same script the
+release-tag pre-push hook and CI run, so a green run here is the real signal.
+
+It must print `✓ Version files and released-docs policy pass for: {{version}}`
+before you continue. If it fails, re-run the bump rather than patching by
+hand:
+
+```bash
+./scripts/update-versions.sh {{version}}
+```
+
+Two things check-versions.sh does NOT gate — confirm them yourself:
+
+```bash
+grep 'version = ' default.nix          # should be {{version}}
+grep -c '{{version}}' cmd/bd/winres/winres.json   # 4 (base version for a prerelease)
+```
 """
 
 [[steps]]
@@ -581,16 +504,27 @@ Verify: `git tag -l | tail -5`
 
 [[steps]]
 id = "push-main"
-title = "Push to main"
+title = "Push the release branch"
 needs = ["create-tag"]
 description = """
 Push the release commit to origin.
 
+Releases are cut from `release/x.y.z`, not from the tip of `main` — see the
+"Release Branches" section of RELEASING.md. Push the branch you are releasing
+from:
+
 ```bash
-git push origin main
+git push origin release/{{version}}
 ```
 
 If rejected, someone else pushed. Pull, rebase, try again.
+
+After the release ships, every commit that landed only on the release branch
+needs a forward-port PR to `main`, the version bump included:
+
+```bash
+git log --oneline main..release/{{version}}
+```
 """
 
 [[steps]]
