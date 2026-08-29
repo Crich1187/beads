@@ -61,7 +61,9 @@ func TestDeleteJournalsTheRequestingActor(t *testing.T) {
 	run("create", "--silent", "--id", "dja-dependent", "the dependent")
 	run("dep", "add", "dja-dependent", "dja-blocker")
 
-	run("delete", "dja-blocker", "--force", "--yes", "--actor", "alice")
+	// --force is what makes this a real delete rather than a preview, and it is
+	// also what lets it orphan the dependent instead of refusing.
+	run("delete", "dja-blocker", "--force", "--actor", "alice")
 
 	records := decodeEventRecords(t, run("events", "export"))
 	var sawDelete, sawCascadeDepRemove bool
