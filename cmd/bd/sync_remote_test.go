@@ -186,3 +186,54 @@ func TestRedactRemoteURL(t *testing.T) {
 		})
 	}
 }
+
+// TestScrubURLCredentials covers the redaction of credential-bearing URLs that
+// arrive embedded in free-form text — most importantly a `git ls-remote` stderr
+// line that echoes the tokenized remote. Credential-free diagnostics must pass
+// through untouched so the probe error keeps git's actual complaint (#5743).
+func TestScrubURLCredentials(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{
+			// The contingent leak Finding 2 guards: a git build that echoes the
+			// full tokenized URL. The token must go; host and path must stay.
+			name: "tokenized git stderr is scrubbed, host and path kept",
+			in:   "fatal: unable to access 'https://x-access-token:ghp_TESTTOKEN@github.com/org/repo.git/': The requested URL returned error: 403",
+			want: "fatal: unable to access 'https://github.com/org/repo.git/': The requested URL returned error: 403",
+		},
+		{
+			name: "ssh password embedded in text is dropped, user kept",
+			in:   "note: not cloning ssh://alice:hunter2@dolt.example.com/org/db right now",
+			want: "note: not cloning ssh://alice@dolt.example.com/org/db right now",
+		},
+		{
+			name: "two credential URLs in one line are both scrubbed",
+			in:   "https://u:p@a.example.com/x and https://v:q@b.example.com/y",
+			want: "https://a.example.com/x and https://b.example.com/y",
+		},
+		{
+			// The common case: modern git already prints host-only, and DNS/repo
+			// errors carry no userinfo. Nothing must be altered.
+			name: "credential-free git stderr is unchanged",
+			in:   "fatal: repository 'https://github.com/org/repo.git/' not found",
+			want: "fatal: repository 'https://github.com/org/repo.git/' not found",
+		},
+		{
+			name: "plain diagnostic without a URL is unchanged",
+			in:   "fatal: Could not read from remote repository.",
+			want: "fatal: Could not read from remote repository.",
+		},
+		{name: "empty", in: "", want: ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := scrubURLCredentials(tt.in); got != tt.want {
+				t.Errorf("scrubURLCredentials(%q) = %q, want %q", tt.in, got, tt.want)
+			}
+		})
+	}
+}

@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -310,6 +311,23 @@ type BootstrapPlan struct {
 	HasExisting   bool   `json:"has_existing"`
 }
 
+// MarshalJSON renders the plan for `bd bootstrap --json` (and `--dry-run --json`)
+// with the credential-bearing SyncRemote redacted, mirroring the human path
+// (printBootstrapPlan runs it through redactRemoteURL). SyncRemote keeps whatever
+// credentials the user configured — see the field comment — and `--json` writes
+// to stdout, which CI logs and agent transcripts capture, so it must not be
+// emitted verbatim. Redaction is on a copy; executeBootstrapPlan still consumes
+// the raw plan.SyncRemote for the clone. Reason and BlockedRemote are already
+// built display-safe.
+func (p BootstrapPlan) MarshalJSON() ([]byte, error) {
+	// The local type sheds BootstrapPlan's method set so json.Marshal does not
+	// recurse back into this MarshalJSON.
+	type bootstrapPlanJSON BootstrapPlan
+	safe := bootstrapPlanJSON(p)
+	safe.SyncRemote = redactRemoteURL(p.SyncRemote)
+	return json.Marshal(safe)
+}
+
 // bootstrapPlanOutcome maps a printed plan to the command's exit status.
 // Action=="none" was two outcomes wearing one name — "a database already
 // exists, nothing to do" and "bootstrap declined and left you with no
@@ -380,10 +398,8 @@ func detectBootstrapPlan(beadsDir string, cfg *configfile.Config) BootstrapPlan 
 	// sync.remote / refs/dolt/data detection run before treating an existing
 	// shared-server database as "nothing to do", otherwise an unrelated default
 	// "beads" database can mask the real recovery path.
-	beadsDirExists := false
-	if info, err := os.Stat(beadsDir); err == nil && info.IsDir() {
-		beadsDirExists = true
-	}
+	info, statErr := os.Stat(beadsDir)
+	beadsDirExists := statErr == nil && info.IsDir()
 
 	// Check for existing database (path differs between server and embedded mode).
 	// Determine server/shared-server mode from the target workspace itself
@@ -413,98 +429,29 @@ func detectBootstrapPlan(beadsDir string, cfg *configfile.Config) BootstrapPlan 
 		deferredExistingPlan = &dbAction
 	}
 
-	// Check sync.remote (primary) or sync.git-remote (deprecated fallback)
+	// A configured sync.remote (primary) or sync.git-remote (deprecated
+	// fallback) is authoritative: try it first and, when it cannot be cloned,
+	// remember why so an unverifiable remote can become fatal only after local
+	// recovery is exhausted. With no sync.remote, auto-detect Dolt data on git
+	// origin instead.
 	syncRemote := resolveSyncRemote()
-	// Set when sync.remote is configured but unusable. Cloning is off the
-	// table; purely local recovery is not.
 	unusableRemoteReason, unusableRemoteURL := "", ""
 	if syncRemote != "" {
-		if isGitCodeRepoURL(syncRemote) {
-			// A git-forge URL is a *supported* Dolt remote: `bd init` and
-			// `bd dolt remote add` both persist one, and `bd dolt push` stores
-			// the database under refs/dolt/data on it. What must never happen
-			// is cloning it blind, or in a form that reaches Dolt's remotesapi
-			// client. doltRemoteURL owns that routing rule; probe first, and
-			// clone only what the probe actually confirmed (#5743, #5663).
-			routed := doltRemoteURL(syncRemote)
-			hasData, probeErr := probeGitRemoteDoltData(routed)
-			switch {
-			case probeErr != nil:
-				// UNKNOWN, not "no data" — never clone something we could not
-				// verify (init's resolveRemoteHasDoltDataProbe convention).
-				unusableRemoteURL = redactRemoteURL(routed)
-				unusableRemoteReason = fmt.Sprintf("could not verify refs/dolt/data on sync.remote %q: %v",
-					redactRemoteURL(syncRemote), probeErr)
-				// Said here as well as in the final verdict because a local
-				// backup may well rescue this run, and then this is the only
-				// place the user learns the remote could not be reached.
-				fmt.Fprintf(os.Stderr, "note: not cloning — %s; checking local recovery sources\n", unusableRemoteReason)
-			case hasData:
-				plan.SyncRemote = routed
-				plan.Action = "sync"
-				plan.Reason = "sync.remote git repo has Dolt data (refs/dolt/data) — will clone from " + redactRemoteURL(routed)
-				return plan
-			default:
-				// Definitively no Dolt data: the repo was wired before the
-				// first `bd dolt push`. Say so and keep looking, the same way
-				// bd init falls back to a fresh local database. Carry the URL
-				// so the workspace we create still gets wired to it.
-				plan.SyncRemote = routed
-				fmt.Fprintf(os.Stderr, "note: sync.remote %q has no Dolt data yet (refs/dolt/data absent); checking other recovery sources\n",
-					redactRemoteURL(syncRemote))
-			}
-		} else {
-			// User-provided sync.remote — trust the URL format as-is.
-			// normalizeRemoteURL would convert http:// to git+http://,
-			// breaking Dolt remotesapi endpoints (GH#3339). That concern
-			// cannot apply in the branch above: a remotesapi endpoint never
-			// classifies as a git code-repo URL.
-			plan.SyncRemote = syncRemote
-			plan.Action = "sync"
-			plan.Reason = "sync.remote configured — will clone from " + redactRemoteURL(syncRemote)
+		done, reason, url := planConfiguredSyncRemote(&plan, syncRemote)
+		if done {
 			return plan
 		}
+		// Cloning is off the table; purely local recovery is not.
+		unusableRemoteReason, unusableRemoteURL = reason, url
+	} else if originPlan, ok := gitOriginSyncPlan(plan); ok {
+		return originPlan
 	}
 
-	// Auto-detect: probe git origin for Dolt data stored in git
-	// (refs/dolt/data). This only applies to git remotes — Dolt-native
-	// remotes (DoltHub, S3, etc.) must be configured via sync.remote.
-	//
-	// Skipped entirely once sync.remote is configured. sync.remote is the
-	// authoritative remote for this workspace, so hydrating from whatever git
-	// origin happens to be (a fork, an old experiment, the code repo under the
-	// dedicated-data-repo pattern) is not recovery — and finalizeSyncedBootstrap
-	// would then rewrite the team's committed sync.remote to point at it. It
-	// also spares the second identical ls-remote in the common case where
-	// sync.remote IS the git origin, which is what bd init persists.
-	if syncRemote == "" && isGitRepo() && !isBareGitRepo() {
-		if originURL, err := gitOriginGetURL(); err == nil && originURL != "" {
-			if gitOriginHasDoltDataRef() {
-				plan.SyncRemote = normalizeRemoteURL(originURL)
-				plan.Action = "sync"
-				plan.Reason = "Found Dolt data on git origin (refs/dolt/data) — will clone from " + redactRemoteURL(originURL)
-				return plan
-			}
-		}
-	}
-
-	// Check for backup JSONL files (must be non-empty to be useful)
-	backupDir := filepath.Join(beadsDir, "backup")
-	issuesFile := filepath.Join(backupDir, "issues.jsonl")
-	if info, err := os.Stat(issuesFile); err == nil && info.Size() > 0 {
-		plan.BackupDir = backupDir
-		plan.Action = "restore"
-		plan.Reason = "Backup files found — will restore from " + backupDir
-		return plan
-	}
-
-	// Check for git-tracked JSONL (the portable export format)
-	gitJSONL := filepath.Join(beadsDir, "issues.jsonl")
-	if _, err := os.Stat(gitJSONL); err == nil {
-		plan.JSONLFile = gitJSONL
-		plan.Action = "jsonl-import"
-		plan.Reason = "Git-tracked issues.jsonl found — will import from " + gitJSONL
-		return plan
+	// On-disk recovery sources: a non-empty backup JSONL, then a git-tracked
+	// issues.jsonl. When a forge sync.remote had no Dolt data yet, plan already
+	// carries its SyncRemote so the restored/imported workspace stays wired to it.
+	if recoveryPlan, ok := localFileRecoveryPlan(plan, beadsDir); ok {
+		return recoveryPlan
 	}
 
 	if deferredExistingPlan != nil {
@@ -527,6 +474,116 @@ func detectBootstrapPlan(beadsDir string, cfg *configfile.Config) BootstrapPlan 
 	plan.Action = "init"
 	plan.Reason = "No existing database, remote, or backup — will create fresh database"
 	return plan
+}
+
+// planConfiguredSyncRemote resolves a configured sync.remote into plan. done==true
+// means the plan is finished — a clone plan for a trusted remote or a forge repo
+// the probe confirmed carries Dolt data — and the caller returns plan as-is.
+// done==false means keep looking: either the forge repo has no Dolt data yet
+// (plan.SyncRemote is still recorded so a fresh workspace gets wired to it) or the
+// remote could not be verified, in which case the returned reason/url describe the
+// unusable remote so it can become fatal only after local recovery is exhausted.
+func planConfiguredSyncRemote(plan *BootstrapPlan, syncRemote string) (done bool, unusableReason, unusableURL string) {
+	if !isGitCodeRepoURL(syncRemote) {
+		// User-provided sync.remote — trust the URL format as-is.
+		// normalizeRemoteURL would convert http:// to git+http://, breaking Dolt
+		// remotesapi endpoints (GH#3339). That concern cannot apply here: a
+		// remotesapi endpoint never classifies as a git code-repo URL.
+		plan.SyncRemote = syncRemote
+		plan.Action = "sync"
+		plan.Reason = "sync.remote configured — will clone from " + redactRemoteURL(syncRemote)
+		return true, "", ""
+	}
+
+	// A git-forge URL is a *supported* Dolt remote: `bd init` and `bd dolt
+	// remote add` both persist one, and `bd dolt push` stores the database under
+	// refs/dolt/data on it. What must never happen is cloning it blind, or in a
+	// form that reaches Dolt's remotesapi client. doltRemoteURL owns that routing
+	// rule; probe first, and clone only what the probe actually confirmed
+	// (#5743, #5663).
+	routed := doltRemoteURL(syncRemote)
+	hasData, probeErr := probeGitRemoteDoltData(routed)
+	switch {
+	case probeErr != nil:
+		// UNKNOWN, not "no data" — never clone something we could not verify
+		// (init's resolveRemoteHasDoltDataProbe convention).
+		reason := fmt.Sprintf("could not verify refs/dolt/data on sync.remote %q: %v",
+			redactRemoteURL(syncRemote), probeErr)
+		// Said here as well as in the final verdict because a local backup may
+		// well rescue this run, and then this is the only place the user learns
+		// the remote could not be reached.
+		fmt.Fprintf(os.Stderr, "note: not cloning — %s; checking local recovery sources\n", reason)
+		return false, reason, redactRemoteURL(routed)
+	case hasData:
+		plan.SyncRemote = routed
+		plan.Action = "sync"
+		plan.Reason = "sync.remote git repo has Dolt data (refs/dolt/data) — will clone from " + redactRemoteURL(routed)
+		return true, "", ""
+	default:
+		// Definitively no Dolt data: the repo was wired before the first `bd
+		// dolt push`. Say so and keep looking, the same way bd init falls back
+		// to a fresh local database. Carry the URL so the workspace we create
+		// still gets wired to it.
+		plan.SyncRemote = routed
+		fmt.Fprintf(os.Stderr, "note: sync.remote %q has no Dolt data yet (refs/dolt/data absent); checking other recovery sources\n",
+			redactRemoteURL(syncRemote))
+		return false, "", ""
+	}
+}
+
+// gitOriginSyncPlan returns a clone-from-git-origin plan when git origin carries
+// Dolt data (refs/dolt/data), or ok==false otherwise. Only git remotes qualify —
+// Dolt-native remotes (DoltHub, S3, etc.) must be configured via sync.remote.
+//
+// The caller invokes this only when no sync.remote is configured. sync.remote is
+// the authoritative remote for this workspace, so hydrating from whatever git
+// origin happens to be (a fork, an old experiment, the code repo under the
+// dedicated-data-repo pattern) is not recovery — and finalizeSyncedBootstrap would
+// then rewrite the team's committed sync.remote to point at it. Skipping it also
+// spares the second identical ls-remote in the common case where sync.remote IS
+// the git origin, which is what bd init persists.
+func gitOriginSyncPlan(plan BootstrapPlan) (BootstrapPlan, bool) {
+	if !isGitRepo() || isBareGitRepo() {
+		return BootstrapPlan{}, false
+	}
+	originURL, err := gitOriginGetURL()
+	if err != nil || originURL == "" {
+		return BootstrapPlan{}, false
+	}
+	if !gitOriginHasDoltDataRef() {
+		return BootstrapPlan{}, false
+	}
+	plan.SyncRemote = normalizeRemoteURL(originURL)
+	plan.Action = "sync"
+	plan.Reason = "Found Dolt data on git origin (refs/dolt/data) — will clone from " + redactRemoteURL(originURL)
+	return plan, true
+}
+
+// localFileRecoveryPlan returns a restore or jsonl-import plan built from on-disk
+// recovery sources under beadsDir — a non-empty backup/issues.jsonl (restore),
+// else a git-tracked issues.jsonl (the portable export format) — or ok==false
+// when neither is present. plan is taken by value so its already-populated fields
+// (e.g. a forge SyncRemote with no Dolt data yet) ride into the returned plan.
+func localFileRecoveryPlan(plan BootstrapPlan, beadsDir string) (BootstrapPlan, bool) {
+	// Backup JSONL must be non-empty to be useful.
+	backupDir := filepath.Join(beadsDir, "backup")
+	issuesFile := filepath.Join(backupDir, "issues.jsonl")
+	if info, err := os.Stat(issuesFile); err == nil && info.Size() > 0 {
+		plan.BackupDir = backupDir
+		plan.Action = "restore"
+		plan.Reason = "Backup files found — will restore from " + backupDir
+		return plan, true
+	}
+
+	gitJSONL := filepath.Join(beadsDir, "issues.jsonl")
+	if _, err := os.Stat(gitJSONL); err == nil {
+		plan.JSONLFile = gitJSONL
+		plan.Action = "jsonl-import"
+		plan.Reason = "Git-tracked issues.jsonl found — will import from " + gitJSONL
+		return plan, true
+	}
+
+	return BootstrapPlan{}, false
 }
 
 func existingBootstrapDBPlan(beadsDir string, cfg *configfile.Config, isServer, isSharedServer bool) (BootstrapPlan, bool) {
@@ -580,9 +637,10 @@ func existingBootstrapDBPlan(beadsDir string, cfg *configfile.Config, isServer, 
 		if result.Err != nil {
 			// Same "declined, and no database was confirmed" class as a
 			// failed remote probe: report it and exit non-zero rather than
-			// printing a success tick (#5743).
+			// printing a success tick (#5743). Blocked is not hand-set here —
+			// detectBootstrapAction derives it from Action=="none" && !HasExisting
+			// (HasExisting is false on this branch), keeping one owner for the flag.
 			plan.Action = "none"
-			plan.Blocked = true
 			plan.Reason = fmt.Sprintf("Could not verify existing server database %s: %v", cfg.GetDoltDatabase(), result.Err)
 			return plan, true
 		}

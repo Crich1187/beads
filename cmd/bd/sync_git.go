@@ -143,7 +143,11 @@ func gitLsRemoteProbeError(ctx context.Context, err error) error {
 	}
 	var exitErr *exec.ExitError
 	if errors.As(err, &exitErr) {
-		if detail := firstNonEmptyLine(string(exitErr.Stderr)); detail != "" {
+		// git can echo the remote it failed to reach — including a CI token in
+		// https://x-access-token:<token>@host form — so scrub credentials before
+		// this detail reaches plan.Reason, which flows to both stderr and
+		// `bd bootstrap --json`. exitErr itself is only "exit status 128".
+		if detail := scrubURLCredentials(firstNonEmptyLine(string(exitErr.Stderr))); detail != "" {
 			return fmt.Errorf("git ls-remote: %v: %s", exitErr, detail)
 		}
 	}

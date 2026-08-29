@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"regexp"
 	"strings"
 
 	"github.com/steveyegge/beads/internal/beads"
@@ -126,4 +127,20 @@ func redactRemoteURL(raw string) string {
 
 func isDoltSSHScheme(scheme string) bool {
 	return scheme == "ssh" || scheme == "git+ssh"
+}
+
+// urlWithUserinfoRe matches the "scheme://userinfo@host" span of a URL embedded
+// anywhere in free-form text — for example the git stderr line bootstrap folds
+// into a probe error, which can echo the very remote (credentials and all) that
+// git failed to reach. The userinfo run stops at the first "@" and the host run
+// at the first "/" so a trailing path is left for redactRemoteURL to keep.
+var urlWithUserinfoRe = regexp.MustCompile(`[a-zA-Z][a-zA-Z0-9+.-]*://[^@\s'"]*@[^/\s'"]*`)
+
+// scrubURLCredentials redacts credential-bearing URLs embedded anywhere in s by
+// running each match through redactRemoteURL, so the same rule applied to the
+// plan's own URL fields (http(s) drops userinfo, ssh drops only a password) also
+// covers URLs that arrive inside arbitrary text. Text with no "userinfo@" URL is
+// returned unchanged, so credential-free git diagnostics keep their full detail.
+func scrubURLCredentials(s string) string {
+	return urlWithUserinfoRe.ReplaceAllStringFunc(s, redactRemoteURL)
 }

@@ -3,6 +3,7 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -613,6 +614,41 @@ func TestPrintBootstrapPlan_NoneWithoutDB_NoSuccessTick(t *testing.T) {
 			t.Errorf("plan output lost the remote entirely:\n%s", out)
 		}
 	})
+}
+
+// TestBootstrapPlanJSON_RedactsCredentials closes the JSON half of the same
+// credential leak: `bd bootstrap --json` serializes the plan, and BootstrapPlan.
+// MarshalJSON must redact SyncRemote the way printBootstrapPlan redacts the human
+// path. The existing "sync plan does not print credentials" subtest covers only
+// printBootstrapPlan, so without this the JSON gap is invisible. It also pins the
+// "redact on a copy" contract — the plan executeBootstrapPlan clones from must
+// keep its real credentials.
+func TestBootstrapPlanJSON_RedactsCredentials(t *testing.T) {
+	const token = "ghp_SUPERSECRETTOKENVALUE"
+	plan := BootstrapPlan{
+		Action:     "sync",
+		BeadsDir:   "/workspace/.beads",
+		Database:   "beads",
+		SyncRemote: "git+https://x-access-token:" + token + "@github.com/org/repo.git",
+	}
+
+	encoded, err := json.Marshal(plan)
+	if err != nil {
+		t.Fatalf("json.Marshal(plan) failed: %v", err)
+	}
+	out := string(encoded)
+
+	if strings.Contains(out, token) {
+		t.Fatalf("bootstrap plan JSON leaks the token:\n%s", out)
+	}
+	if !strings.Contains(out, "github.com/org/repo.git") {
+		t.Errorf("bootstrap plan JSON dropped the remote host/path entirely:\n%s", out)
+	}
+	// Redaction must not mutate the plan executeBootstrapPlan consumes for the
+	// clone, or the clone would lose the credentials it needs.
+	if !strings.Contains(plan.SyncRemote, token) {
+		t.Errorf("MarshalJSON mutated the source plan's SyncRemote: %q", plan.SyncRemote)
+	}
 }
 
 // TestDetectBootstrapAction_ValidDoltSyncRemoteUnchanged verifies that a valid
