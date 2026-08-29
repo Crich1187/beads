@@ -2420,6 +2420,40 @@ type serverConnFacts struct {
 	alreadyExisted bool
 }
 
+// assertGatewaySessionDatabase verifies the gateway actually placed this
+// session on the database bd asked for, comparing case-insensitively as MySQL
+// does for schema names. A NULL or empty answer means the session is on no
+// database at all, which for a gateway means the same thing as a refusal: the
+// name bd asked for is not provisioned for this credential.
+//
+// The uow provider makes the same assertion for the proxied-server open
+// (uow.assertSessionDatabase); this is the direct-open sibling, kept here
+// rather than shared because internal/storage/dolt does not depend on uow.
+func assertGatewaySessionDatabase(ctx context.Context, db *sql.DB, want string) error {
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to pin gateway connection (database %q): %w", want, err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	var current sql.NullString
+	if err := conn.QueryRowContext(ctx, "SELECT DATABASE()").Scan(&current); err != nil {
+		return fmt.Errorf("failed to read the session database after connecting to gateway server for database %q: %w", want, err)
+	}
+	switch {
+	case !current.Valid || current.String == "":
+		return fmt.Errorf(
+			"the gateway server left this session on no database after requesting %q — either the database is not provisioned on the server or this credential has not been granted access to it; ask the server administrator to provision the database and grant access",
+			want)
+	case strings.EqualFold(current.String, want):
+		return nil
+	default:
+		return fmt.Errorf(
+			"the gateway server connected this session to database %q, not the requested %q — this credential appears to be scoped to %q. The requested database is not provisioned for this credential; ask the server administrator to provision it on the server (and grant this credential access), or re-run init without --database to use the provisioned one",
+			current.String, want, current.String)
+	}
+}
+
 // openServerConnection connects to (and if needed creates) the target database
 // on a dolt sql-server via MySQL protocol. See serverConnFacts for what the
 // returned facts mean and why they are not a single bool.
@@ -2448,13 +2482,25 @@ func openServerConnection(ctx context.Context, cfg *Config) (*sql.DB, string, se
 
 	// A gateway server owns database routing and existence, so bd does not probe or create
 	// it: skip the no-database admin connection (and the SHOW DATABASES / CREATE DATABASE
-	// it would run) and verify the project connection directly — a successful connect IS
-	// the existence proof. connReady must be set before returning the pool, or the defer
-	// above would close the *sql.DB we just handed the caller.
+	// it would run) and verify the project connection directly — a successful connect that
+	// lands on the requested database IS the existence proof. connReady must be set before
+	// returning the pool, or the defer above would close the *sql.DB we just handed the
+	// caller.
 	if cfg.Gateway {
 		if err := db.PingContext(ctx); err != nil {
 			return nil, "", serverConnFacts{}, fmt.Errorf("failed to connect to gateway server %s:%d (database %q): %w",
 				cfg.ServerHost, cfg.ServerPort, cfg.Database, err)
+		}
+		// A connect proves the gateway accepted the credential, NOT that it
+		// honored the database name. A gateway scopes connections by
+		// credential, so it can take a foreign name in the handshake and serve
+		// its own database anyway — and every read below is unqualified, so bd
+		// would read one project's data while believing it was in another's.
+		// On `bd init --database=<other>` that adoption is completely silent:
+		// resolveInitIssuePrefix adopts whatever prefix comes back. One query
+		// closes it.
+		if err := assertGatewaySessionDatabase(ctx, db, cfg.Database); err != nil {
+			return nil, "", serverConnFacts{}, err
 		}
 		connReady = true
 		// Neither fact is established for a gateway database: we did not
