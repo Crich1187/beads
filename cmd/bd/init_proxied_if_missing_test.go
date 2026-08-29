@@ -7,12 +7,12 @@ import (
 	"testing"
 )
 
-// TestProxiedInitIfMissing covers --init-if-missing on the proxied-server
+// TestProxiedServerInitIfMissing covers --init-if-missing on the proxied-server
 // route, where it used to be inert: runInitProxiedServer runs its own
 // already-initialized check and returns before init.go's --init-if-missing
 // block, so a scaffold script re-running init got exit 1 and the "Aborting."
 // banner, and the mismatch guards that protect the flag had never run at all.
-func TestProxiedInitIfMissing(t *testing.T) {
+func TestProxiedServerInitIfMissing(t *testing.T) {
 	requireProxiedServerEnv(t)
 
 	bd := buildEmbeddedBD(t)
