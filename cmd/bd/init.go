@@ -639,6 +639,15 @@ Non-interactive mode (--non-interactive or BD_NON_INTERACTIVE=1):
 				fromJSONL:              fromJSONL,
 				nonInteractive:         nonInteractive,
 			}); err != nil {
+				// runInitProxiedServer runs the same checkExistingBeadsData
+				// the route below does, but it runs it inside itself — so
+				// --init-if-missing used to end here as a plain exit-1
+				// "Aborting.", and its mismatch guards never ran at all. The
+				// check happens before any .beads/ write, so nothing has been
+				// touched by the time we get this error.
+				if initIfMissing && !reinitLocal && errors.Is(err, errWorkspaceAlreadyInitialized) {
+					return resolveInitIfMissingAlreadyInitialized(cmd, database, prefix, quiet)
+				}
 				return err
 			}
 			return nil
@@ -771,26 +780,7 @@ Non-interactive mode (--non-interactive or BD_NON_INTERACTIVE=1):
 				// directory) must still abort rather than be masked as a
 				// successful skip.
 				if initIfMissing && errors.Is(err, errWorkspaceAlreadyInitialized) {
-					// Guard against masking a genuine mismatch: an explicit
-					// --prefix or --database that does not match the existing
-					// workspace must abort, since silently skipping would ignore
-					// the request and reuse a different database. --database is
-					// the authoritative selector, so it is checked even when
-					// --prefix is also set.
-					existing := existingWorkspaceDBName()
-					if cmd.Flags().Changed("database") {
-						if initIfMissingDatabaseMismatch(existing, database) {
-							return fmt.Errorf("workspace already initialized as database %q, but --database %q was requested.\nRemove --database (or pass a matching value) to reuse the existing workspace", existing, database)
-						}
-					} else if cmd.Flags().Changed("prefix") {
-						if initIfMissingPrefixMismatch(existing, prefix) {
-							return fmt.Errorf("workspace already initialized as database %q, but --prefix %q was requested.\nRemove --prefix (or pass a matching value) to reuse the existing workspace", existing, prefix)
-						}
-					}
-					if !quiet {
-						fmt.Fprintln(os.Stderr, "Skipping init: workspace already initialized.")
-					}
-					return nil
+					return resolveInitIfMissingAlreadyInitialized(cmd, database, prefix, quiet)
 				}
 				return fmt.Errorf("%v", err)
 			}
@@ -2760,6 +2750,39 @@ func initIfMissingPrefixMismatch(existingDBName, requestedPrefix string) bool {
 	}
 	requested := dbNameFromPrefix(normalizeIssuePrefix(requestedPrefix))
 	return requested != "" && !strings.EqualFold(existingDBName, requested)
+}
+
+// resolveInitIfMissingAlreadyInitialized decides what --init-if-missing does
+// once the workspace is known to be initialized already: nil for the benign
+// skip (message printed here), or the abort for a request that would be
+// silently ignored by skipping.
+//
+// Guard against masking a genuine mismatch: an explicit --prefix or --database
+// that does not match the existing workspace must abort, since silently
+// skipping would ignore the request and reuse a different database. --database
+// is the authoritative selector, so it is checked even when --prefix is also
+// set.
+//
+// Both init routes share this: the embedded/server route reaches it from its
+// own checkExistingBeadsData, the proxied-server route from the identical check
+// inside runInitProxiedServer. Before that wiring existed, --init-if-missing was
+// simply inert on the proxied route — an already-initialized workspace exited 1
+// with the "Aborting." banner, and the mismatch guards below had never once run.
+func resolveInitIfMissingAlreadyInitialized(cmd *cobra.Command, database, prefix string, quiet bool) error {
+	existing := existingWorkspaceDBName()
+	if cmd.Flags().Changed("database") {
+		if initIfMissingDatabaseMismatch(existing, database) {
+			return fmt.Errorf("workspace already initialized as database %q, but --database %q was requested.\nRemove --database (or pass a matching value) to reuse the existing workspace", existing, database)
+		}
+	} else if cmd.Flags().Changed("prefix") {
+		if initIfMissingPrefixMismatch(existing, prefix) {
+			return fmt.Errorf("workspace already initialized as database %q, but --prefix %q was requested.\nRemove --prefix (or pass a matching value) to reuse the existing workspace", existing, prefix)
+		}
+	}
+	if !quiet {
+		fmt.Fprintln(os.Stderr, "Skipping init: workspace already initialized.")
+	}
+	return nil
 }
 
 // initIfMissingDatabaseMismatch reports whether an explicit --database request
