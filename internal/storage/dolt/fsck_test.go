@@ -2,10 +2,13 @@ package dolt
 
 import (
 	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 )
 
 // TestPrePushFSCK_EmptyCLIDir verifies that prePushFSCK is a no-op when
@@ -126,4 +129,145 @@ func TestFsckCouldNotOpen(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestClassifyFSCKFailure verifies that classifyFSCKFailure maps every failure
+// mode to the correct outcome, and includes negative sentinel checks to guard
+// against misclassification.
+func TestClassifyFSCKFailure(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name         string
+		parentErr    error
+		fsckErr      error
+		output       string
+		wantNil      bool
+		wantIs       error
+		wantIsNot    []error
+		wantContains string
+		wantAbsent   string
+	}{
+		{
+			name:      "non-empty output + DeadlineExceeded -> ErrDanglingReference, not ErrFSCKTimeout",
+			parentErr: context.DeadlineExceeded,
+			fsckErr:   context.DeadlineExceeded,
+			output:    "dangling chunk reference: hash abc123 not found",
+			wantIs:    ErrDanglingReference,
+			wantIsNot: []error{ErrFSCKTimeout},
+		},
+		{
+			name:    "non-empty could-not-open output -> nil",
+			output:  "Could not open dolt database: some reason",
+			wantNil: true,
+		},
+		{
+			name:         "parent canceled -> cancellation error, not dangling or timeout",
+			parentErr:    context.Canceled,
+			fsckErr:      context.Canceled,
+			wantIs:       context.Canceled,
+			wantIsNot:    []error{ErrDanglingReference, ErrFSCKTimeout},
+			wantContains: "interrupted",
+		},
+		{
+			name:         "parent DeadlineExceeded -> ErrFSCKTimeout with caller-timeout guidance",
+			parentErr:    context.DeadlineExceeded,
+			fsckErr:      context.DeadlineExceeded,
+			wantIs:       ErrFSCKTimeout,
+			wantIsNot:    []error{ErrDanglingReference},
+			wantContains: "dolt.auto-push-timeout",
+			wantAbsent:   "BEADS_FSCK_TIMEOUT environment variable",
+		},
+		{
+			name:         "own fsck DeadlineExceeded -> ErrFSCKTimeout with BEADS_FSCK_TIMEOUT guidance",
+			fsckErr:      context.DeadlineExceeded,
+			wantIs:       ErrFSCKTimeout,
+			wantIsNot:    []error{ErrDanglingReference},
+			wantContains: "BEADS_FSCK_TIMEOUT",
+		},
+		{
+			name:      "generic failure with empty output -> ErrDanglingReference",
+			wantIs:    ErrDanglingReference,
+			wantIsNot: []error{ErrFSCKTimeout},
+		},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			err := classifyFSCKFailure(tc.parentErr, tc.fsckErr, tc.output)
+
+			if tc.wantNil {
+				if err != nil {
+					t.Errorf("want nil, got %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatal("want non-nil error, got nil")
+			}
+			if tc.wantIs != nil && !errors.Is(err, tc.wantIs) {
+				t.Errorf("errors.Is(err, %v) = false; err = %v", tc.wantIs, err)
+			}
+			for _, notErr := range tc.wantIsNot {
+				if errors.Is(err, notErr) {
+					t.Errorf("errors.Is(err, %v) = true, want false; err = %v", notErr, err)
+				}
+			}
+			if tc.wantContains != "" && !strings.Contains(err.Error(), tc.wantContains) {
+				t.Errorf("error message %q does not contain %q", err.Error(), tc.wantContains)
+			}
+			if tc.wantAbsent != "" && strings.Contains(err.Error(), tc.wantAbsent) {
+				t.Errorf("error message %q must not contain %q", err.Error(), tc.wantAbsent)
+			}
+		})
+	}
+}
+
+func TestClassifyFSCKFailure_CallerVsOwnTimeout(t *testing.T) {
+	t.Parallel()
+	callerErr := classifyFSCKFailure(context.DeadlineExceeded, context.DeadlineExceeded, "")
+	ownErr := classifyFSCKFailure(nil, context.DeadlineExceeded, "")
+
+	if callerErr == nil || ownErr == nil {
+		t.Fatal("both cases must return non-nil errors")
+	}
+	if !strings.Contains(callerErr.Error(), "dolt.auto-push-timeout") {
+		t.Errorf("caller-deadline message should name dolt.auto-push-timeout; got: %q", callerErr)
+	}
+	if strings.Contains(callerErr.Error(), "BEADS_FSCK_TIMEOUT environment variable") {
+		t.Errorf("caller-deadline message must not say BEADS_FSCK_TIMEOUT environment variable; got: %q", callerErr)
+	}
+	if !strings.Contains(ownErr.Error(), "BEADS_FSCK_TIMEOUT") {
+		t.Errorf("own-timeout message should name BEADS_FSCK_TIMEOUT; got: %q", ownErr)
+	}
+	if strings.Contains(ownErr.Error(), "dolt.auto-push-timeout") {
+		t.Errorf("own-timeout message must not name dolt.auto-push-timeout; got: %q", ownErr)
+	}
+}
+
+func TestFsckTimeoutDuration(t *testing.T) {
+	t.Run("valid duration honored", func(t *testing.T) {
+		t.Setenv(fsckTimeoutEnv, "2m")
+		if got := fsckTimeoutDuration(); got != 2*time.Minute {
+			t.Errorf("want 2m, got %v", got)
+		}
+	})
+	t.Run("bare seconds honored", func(t *testing.T) {
+		t.Setenv(fsckTimeoutEnv, "90")
+		if got := fsckTimeoutDuration(); got != 90*time.Second {
+			t.Errorf("want 90s, got %v", got)
+		}
+	})
+	t.Run("unset returns default", func(t *testing.T) {
+		t.Setenv(fsckTimeoutEnv, "")
+		if got := fsckTimeoutDuration(); got != fsckTimeout {
+			t.Errorf("want %v, got %v", fsckTimeout, got)
+		}
+	})
+	t.Run("invalid returns default", func(t *testing.T) {
+		t.Setenv(fsckTimeoutEnv, "not-a-duration")
+		if got := fsckTimeoutDuration(); got != fsckTimeout {
+			t.Errorf("want %v, got %v", fsckTimeout, got)
+		}
+	})
 }
