@@ -137,6 +137,44 @@ func TestNoticeSharedMigrateRefusalPerDecision(t *testing.T) {
 	})
 }
 
+// TestSharedRefusalPrescribesAWorkingVerb closes the loop the review flagged:
+// the shared-store refusal names a command, and that command must actually run
+// wherever the refusal can appear. In proxied-server mode `bd migrate schema`
+// used to hard-refuse, so the only remedy the gate offered there was a dead
+// end — worse, the root pre-run would have consumed the consent on the open
+// before RunE ever printed "not supported".
+//
+// The pairing is checked structurally rather than by driving a proxied
+// workspace: the command the gate prescribes IS SharedConsentCommand, and the
+// verb that grants consent for it is migrateSchemaCmd.
+func TestSharedRefusalPrescribesAWorkingVerb(t *testing.T) {
+	refusal := &schema.RemoteMigrateGateError{
+		CurrentVersion: 65, LatestVersion: 66, Pending: 1,
+		Decision: "shared-no-remote", Shared: true,
+	}
+
+	if got := refusal.EscapeHint(); got != schema.SharedConsentCommand {
+		t.Fatalf("EscapeHint = %q, want %q", got, schema.SharedConsentCommand)
+	}
+	opts := refusal.Options()
+	if len(opts) != 1 || len(opts[0].Commands) != 1 || opts[0].Commands[0] != schema.SharedConsentCommand {
+		t.Fatalf("Options = %+v, want the single %q remedy", opts, schema.SharedConsentCommand)
+	}
+	if !strings.Contains(refusal.UserMessage(), schema.SharedConsentCommand) {
+		t.Errorf("UserMessage must name the remedy:\n%s", refusal.UserMessage())
+	}
+
+	// The prescribed command is `bd <path of migrateSchemaCmd>`, and that is
+	// exactly the command isSchemaMigrateVerb grants consent for.
+	wantPath := "bd " + strings.TrimPrefix(migrateSchemaCmd.CommandPath(), rootCmd.Name()+" ")
+	if wantPath != schema.SharedConsentCommand {
+		t.Fatalf("the gate prescribes %q but the consenting verb is %q", schema.SharedConsentCommand, wantPath)
+	}
+	if !isSchemaMigrateVerb(migrateSchemaCmd) {
+		t.Fatal("the command the gate prescribes must be the one that grants consent")
+	}
+}
+
 // TestPrintGlobalDatabaseConsentHint pins the one fact the gate's own block
 // cannot know: which database the invocation targeted. Under --global the open
 // hits `beads_global`, so the block's unflagged `bd migrate schema` would

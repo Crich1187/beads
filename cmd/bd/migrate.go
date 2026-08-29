@@ -712,6 +712,10 @@ func stampWorkspaceVersionAfterMigrate(store storage.DoltStorage) {
 // means the schema is reconciled. The applied count is not observable from
 // here (it belongs to an open that has already returned), hence the "current"
 // status rather than a count.
+//
+// No version stamping here, unlike the direct path: reconcileVersionProxiedServer
+// already runs in the root pre-run after a successful provider open, so the
+// marker the gate refusal held back is written as soon as the open succeeds.
 func reportProxiedSchemaMigrate() error {
 	latest := schema.LatestVersion()
 	if jsonOutput {

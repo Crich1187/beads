@@ -306,9 +306,9 @@ func readThroughRefusedMigration(ctx context.Context, conn *sql.Conn, database s
 	fmt.Fprintf(os.Stderr,
 		"Warning: %[1]v\n"+
 			"  Read-only command: continuing on schema v%[2]d without migrating.\n"+
-			"  Writes are blocked until the schema is reconciled. Run 'bd migrate schema'\n"+
+			"  Writes are blocked until the schema is reconciled. Run '%[3]s'\n"+
 			"  once every client of this server is upgraded.\n",
-		gateErr, gateErr.CurrentVersion)
+		gateErr, gateErr.CurrentVersion, schema.SharedConsentCommand)
 	return nil
 }
 
