@@ -2482,9 +2482,10 @@ func openServerConnection(ctx context.Context, cfg *Config) (*sql.DB, string, se
 
 	// A gateway server owns database routing and existence, so bd does not probe or create
 	// it: skip the no-database admin connection (and the SHOW DATABASES / CREATE DATABASE
-	// it would run) and verify the project connection directly — a successful connect IS
-	// the existence proof. connReady must be set before returning the pool, or the defer
-	// above would close the *sql.DB we just handed the caller.
+	// it would run) and verify the project connection directly — a successful connect that
+	// lands on the requested database IS the existence proof. connReady must be set before
+	// returning the pool, or the defer above would close the *sql.DB we just handed the
+	// caller.
 	if cfg.Gateway {
 		if err := db.PingContext(ctx); err != nil {
 			return nil, "", serverConnFacts{}, fmt.Errorf("failed to connect to gateway server %s:%d (database %q): %w",
