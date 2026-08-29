@@ -310,12 +310,15 @@ var (
 		unclassified: "the schema is managed by beads-team-server; ask your operator to run 'bts init' first",
 	}
 	// previewUseDatabaseRemedy: a preview open promised not to mutate anything,
-	// so it neither creates nor migrates; the ordinary open would.
+	// so it neither creates nor migrates where the ordinary open would. That
+	// answers both shapes, so both fields carry it.
 	previewUseDatabaseRemedy = useDatabaseRemedy{
-		missing:      "preview commands (--dry-run, --inspect) never create or migrate a database; run the command without the preview flag first",
-		unclassified: "preview commands (--dry-run, --inspect) never create or migrate a database; run the command without the preview flag first",
+		missing:      previewRemedyText,
+		unclassified: previewRemedyText,
 	}
 )
+
+const previewRemedyText = "preview commands (--dry-run, --inspect) never create or migrate a database; run the command without the preview flag first"
 
 // classifyUseDatabaseError describes a failed USE using only what the server
 // actually said. The old wording called every failure "database %q not found",
