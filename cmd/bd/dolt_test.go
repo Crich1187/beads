@@ -1362,11 +1362,50 @@ func TestPrintNoRemoteGuidance(t *testing.T) {
 	if !strings.Contains(output, "No remote is configured") {
 		t.Error("expected guidance to mention 'No remote is configured'")
 	}
-	if !strings.Contains(output, "skipping") {
-		t.Error("expected guidance to indicate the operation was skipped, not failed")
+	if !strings.Contains(output, "nothing was transferred") {
+		t.Error("expected guidance to state that nothing was transferred")
 	}
 	if !strings.Contains(output, "bd dolt remote add") {
 		t.Error("expected guidance to mention how to add a remote")
+	}
+	if !strings.Contains(output, noRemoteAllowedEnv) {
+		t.Errorf("expected guidance to mention the %s opt-out", noRemoteAllowedEnv)
+	}
+}
+
+// root-yj5cw: a push/pull that transferred nothing because no remote is
+// configured must exit non-zero by default — an exit-0 no-op is
+// indistinguishable from a successful sync, which is how a fleet's only
+// off-host bead backup stopped for days without anyone noticing. Rigs that are
+// deliberately local-only opt back into exit 0 with BD_ALLOW_NO_REMOTE.
+func TestNoRemoteIsFatal(t *testing.T) {
+	tests := []struct {
+		name  string
+		value string
+		set   bool
+		want  bool
+	}{
+		{"unset defaults to fatal", "", false, true},
+		{"empty value is fatal", "", true, true},
+		{"0 stays fatal", "0", true, true},
+		{"false stays fatal", "false", true, true},
+		{"FALSE stays fatal", "FALSE", true, true},
+		{"1 opts out", "1", true, false},
+		{"true opts out", "true", true, false},
+		{"yes opts out", "yes", true, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if tt.set {
+				t.Setenv(noRemoteAllowedEnv, tt.value)
+			} else {
+				t.Setenv(noRemoteAllowedEnv, "")
+			}
+			if got := noRemoteIsFatal(); got != tt.want {
+				t.Errorf("noRemoteIsFatal() with %s=%q = %v, want %v",
+					noRemoteAllowedEnv, tt.value, got, tt.want)
+			}
+		})
 	}
 }
 
@@ -1953,6 +1992,11 @@ func TestNoPushDoesNotSkipDoltPull(t *testing.T) {
 	}
 	store = fake
 
+	// The confirmed no-remote path exits non-zero by default (root-yj5cw), which
+	// would kill the test binary. Opt this rig into the local-only exit-0
+	// behaviour so the command still returns in-process; this test is about
+	// whether pull is attempted under no-push, not about the exit status.
+	t.Setenv(noRemoteAllowedEnv, "1")
 	t.Setenv("BD_NO_PUSH", "true")
 	config.ResetForTesting()
 	t.Cleanup(func() { config.ResetForTesting() })

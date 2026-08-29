@@ -1493,6 +1493,7 @@ var rootCmd = &cobra.Command{
 			logConfigDiscovery(beadsDir, "no metadata.json; host inference (GH#3545) selects server mode")
 			cfg = configfile.DefaultConfig()
 		}
+		}
 		if cfg != nil {
 			warnSharedServerEmbeddedMismatch(cfg)
 			doltCfg.ProxiedServer = cfg.IsDoltProxiedServerMode()
