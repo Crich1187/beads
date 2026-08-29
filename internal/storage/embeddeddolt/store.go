@@ -478,7 +478,8 @@ func (s *EmbeddedDoltStore) GetIssueByExternalRef(ctx context.Context, externalR
 
 func (s *EmbeddedDoltStore) DeleteIssue(ctx context.Context, id string) error {
 	return s.withConn(ctx, true, func(tx *sql.Tx) error {
-		return issueops.DeleteIssueInTx(ctx, tx, id)
+		// storage.DeleteIssue carries no actor, so the journal rows record none.
+		return issueops.DeleteIssueInTx(ctx, tx, id, "")
 	})
 }
 
@@ -961,7 +962,8 @@ func (s *EmbeddedDoltStore) DeleteIssues(ctx context.Context, ids []string, casc
 	var result *types.DeleteIssuesResult
 	err := s.withConn(ctx, !dryRun, func(tx *sql.Tx) error {
 		var err error
-		result, err = issueops.DeleteIssuesInTx(ctx, tx, ids, cascade, force, dryRun)
+		// storage.DeleteIssues carries no actor, so the journal rows record none.
+		result, err = issueops.DeleteIssuesInTx(ctx, tx, ids, cascade, force, dryRun, "")
 		return err
 	})
 	return result, err

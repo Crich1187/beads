@@ -952,7 +952,7 @@ func (r *issueSQLRepositoryImpl) Delete(ctx context.Context, id string, opts dom
 	}
 	// Edges are journaled before the row goes, while its snapshot can still be
 	// read.
-	if err := issueops.RecordDependencyRemovalsForIssuesInTx(ctx, r.runner, []string{id}); err != nil {
+	if err := issueops.RecordDependencyRemovalsForIssuesInTx(ctx, r.runner, []string{id}, ""); err != nil {
 		return fmt.Errorf("db: IssueSQLRepository.Delete %s: journal dependency removals: %w", id, err)
 	}
 	//nolint:gosec // G201: table is a hardcoded constant.
@@ -994,7 +994,7 @@ func (r *issueSQLRepositoryImpl) DeleteByIDs(ctx context.Context, ids []string, 
 	}
 	// Edges are journaled before the rows go, while their source snapshots can
 	// still be read.
-	if err := issueops.RecordDependencyRemovalsForIssuesInTx(ctx, r.runner, actualIDs); err != nil {
+	if err := issueops.RecordDependencyRemovalsForIssuesInTx(ctx, r.runner, actualIDs, ""); err != nil {
 		return 0, fmt.Errorf("db: IssueSQLRepository.DeleteByIDs journal dependency removals: %w", err)
 	}
 	total := 0
