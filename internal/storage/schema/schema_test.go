@@ -23,6 +23,7 @@ import (
 )
 
 func TestPendingMigrationDirtyTablesDetectsMigration0043Dependencies(t *testing.T) {
+	failOnSwallowedAdvisory(t)
 	db, mock, err := sqlmock.New()
 	if err != nil {
 		t.Fatalf("sqlmock.New: %v", err)
@@ -56,6 +57,7 @@ func TestPendingMigrationDirtyTablesDetectsMigration0043Dependencies(t *testing.
 // working-set-reconcile opens can detect it via errors.As and skip the
 // migration instead of failing outright.
 func TestMigrateUpReturnsDirtyTablesErrorForPreExistingDirtyTable(t *testing.T) {
+	failOnSwallowedAdvisory(t)
 	db, mock, err := sqlmock.New()
 	if err != nil {
 		t.Fatalf("sqlmock.New: %v", err)
@@ -66,6 +68,10 @@ func TestMigrateUpReturnsDirtyTablesErrorForPreExistingDirtyTable(t *testing.T) 
 	// else (GH#4378); the rows changed, so a scoped commit lands before the
 	// pass runs (#4566: the seed must not ride the per-step pass commits).
 	expectIgnorePatternSeed(mock, 42)
+	// #4356: the open-time untrack reconcile runs right after the seed and
+	// before the no-work short-circuit. On a healthy database it is two reads
+	// and no writes.
+	expectIgnoredCursorHealNoop(mock)
 	// migrationWorkNeeded: mainSource.atLatest reads the current cursor; v42
 	// is behind LatestVersion(), so the || short-circuits before checking
 	// ignoredSource.atLatest or the content-hash/backfill probes.
@@ -129,6 +135,7 @@ func expectDirtyDoltStatusRow(mock sqlmock.Sqlmock, table string, staged bool) {
 }
 
 func TestIgnoredPendingMigrationDirtyTablesDetectsWispDependencies(t *testing.T) {
+	failOnSwallowedAdvisory(t)
 	db, mock, err := sqlmock.New()
 	if err != nil {
 		t.Fatalf("sqlmock.New: %v", err)
@@ -322,6 +329,7 @@ func TestMigration0053RepairsRigWispsShape(t *testing.T) {
 }
 
 func TestEnsureIssuesRigColumnsAddsOnlyMissing(t *testing.T) {
+	failOnSwallowedAdvisory(t)
 	db, mock, err := sqlmock.New()
 	if err != nil {
 		t.Fatalf("sqlmock.New: %v", err)
@@ -355,6 +363,7 @@ func TestEnsureIssuesRigColumnsAddsOnlyMissing(t *testing.T) {
 }
 
 func TestEnsureWispDependenciesSplitTargetsAddsMissingAndBackfills(t *testing.T) {
+	failOnSwallowedAdvisory(t)
 	db, mock, err := sqlmock.New()
 	if err != nil {
 		t.Fatalf("sqlmock.New: %v", err)
@@ -417,6 +426,7 @@ func TestPreMigrationRepairScopedToMain0047(t *testing.T) {
 }
 
 func TestPreMigrationRepairDispatchesMain47ToWispTableRepair(t *testing.T) {
+	failOnSwallowedAdvisory(t)
 	db, mock, err := sqlmock.New()
 	if err != nil {
 		t.Fatalf("sqlmock.New: %v", err)
@@ -461,6 +471,7 @@ func TestPreMigrationRepairDispatchesMain47ToWispTableRepair(t *testing.T) {
 // commit -- that end-to-end proof belongs in
 // internal/storage/embeddeddolt (cgo-gated, see TestEmbeddedMigrateRepairedDependenciesIDColumnCommitsAtomicallyWithVersion53_4690).
 func TestRunMigrationsSnapshotsDirtyTablesBeforeRepairSoRepairMutationsCommitAtomically(t *testing.T) {
+	failOnSwallowedAdvisory(t)
 	db, mock, err := sqlmock.New()
 	if err != nil {
 		t.Fatalf("sqlmock.New: %v", err)
@@ -535,6 +546,7 @@ func TestRunMigrationsSnapshotsDirtyTablesBeforeRepairSoRepairMutationsCommitAto
 }
 
 func TestEnsureWispTablesForMigration0047CreatesMissingTables(t *testing.T) {
+	failOnSwallowedAdvisory(t)
 	db, mock, err := sqlmock.New()
 	if err != nil {
 		t.Fatalf("sqlmock.New: %v", err)
@@ -561,6 +573,7 @@ func TestEnsureWispTablesForMigration0047CreatesMissingTables(t *testing.T) {
 }
 
 func TestEnsureWispTablesForMigration0047DelegatesSplitTargetRepairWhenWispDependenciesExists(t *testing.T) {
+	failOnSwallowedAdvisory(t)
 	db, mock, err := sqlmock.New()
 	if err != nil {
 		t.Fatalf("sqlmock.New: %v", err)
@@ -608,6 +621,7 @@ func TestPreMigrationRepairScopedToIgnored15(t *testing.T) {
 }
 
 func TestPreMigrationRepairDispatchesIgnored15ToWispIsBlockedRepair(t *testing.T) {
+	failOnSwallowedAdvisory(t)
 	db, mock, err := sqlmock.New()
 	if err != nil {
 		t.Fatalf("sqlmock.New: %v", err)
@@ -640,6 +654,7 @@ func TestPreMigrationRepairDispatchesIgnored15ToWispIsBlockedRepair(t *testing.T
 }
 
 func TestEnsureWispIsBlockedForRecomputeNoopsWhenWispsAbsent(t *testing.T) {
+	failOnSwallowedAdvisory(t)
 	db, mock, err := sqlmock.New()
 	if err != nil {
 		t.Fatalf("sqlmock.New: %v", err)
@@ -671,6 +686,7 @@ func TestEnsureWispIsBlockedForRecomputeNoopsWhenWispsAbsent(t *testing.T) {
 }
 
 func TestEnsureWispIsBlockedForRecomputeNoopsWhenAlreadyPresent(t *testing.T) {
+	failOnSwallowedAdvisory(t)
 	db, mock, err := sqlmock.New()
 	if err != nil {
 		t.Fatalf("sqlmock.New: %v", err)
@@ -758,6 +774,7 @@ const (
 // expectations" failure on top of the real one.
 func newWispIsBlockedDriftDB(t *testing.T, migrationFile string, wantCursorVersion int) *wispIsBlockedDriftDB {
 	t.Helper()
+	failOnSwallowedAdvisory(t)
 	db, mock, err := sqlmock.New()
 	if err != nil {
 		t.Fatalf("sqlmock.New: %v", err)
@@ -933,6 +950,7 @@ func TestIgnored7RecomputeHardFailsWithoutIsBlockedRepair(t *testing.T) {
 }
 
 func TestEnsureDependenciesIDColumnNoopWhenAlreadyFullyBackfilledAndKeyed(t *testing.T) {
+	failOnSwallowedAdvisory(t)
 	db, mock, err := sqlmock.New()
 	if err != nil {
 		t.Fatalf("sqlmock.New: %v", err)
@@ -963,6 +981,7 @@ func TestEnsureDependenciesIDColumnNoopWhenAlreadyFullyBackfilledAndKeyed(t *tes
 }
 
 func TestEnsureDependenciesIDColumnBackfillsMissingIDsDeterministically(t *testing.T) {
+	failOnSwallowedAdvisory(t)
 	db, mock, err := sqlmock.New()
 	if err != nil {
 		t.Fatalf("sqlmock.New: %v", err)
@@ -1020,6 +1039,7 @@ func TestEnsureDependenciesIDColumnBackfillsMissingIDsDeterministically(t *testi
 }
 
 func TestEnsureDependenciesIDColumnDropsExistingPrimaryKeyBeforeAddingID(t *testing.T) {
+	failOnSwallowedAdvisory(t)
 	db, mock, err := sqlmock.New()
 	if err != nil {
 		t.Fatalf("sqlmock.New: %v", err)
@@ -1060,6 +1080,7 @@ func TestEnsureDependenciesIDColumnDropsExistingPrimaryKeyBeforeAddingID(t *test
 }
 
 func TestEnsureDependenciesIDColumnFailsClearlyOnTargetlessRowInsteadOfBrickingNotNullModify(t *testing.T) {
+	failOnSwallowedAdvisory(t)
 	db, mock, err := sqlmock.New()
 	if err != nil {
 		t.Fatalf("sqlmock.New: %v", err)
@@ -2134,6 +2155,7 @@ func doltSQLString(value string) string {
 }
 
 func TestStageSchemaTablesSkipsIgnoredTables(t *testing.T) {
+	failOnSwallowedAdvisory(t)
 	db, mock, err := sqlmock.New()
 	if err != nil {
 		t.Fatalf("sqlmock.New: %v", err)
@@ -2163,6 +2185,7 @@ func TestStageSchemaTablesSkipsIgnoredTables(t *testing.T) {
 }
 
 func TestUnstageIgnoredTablesResetsExistingIgnoredTables(t *testing.T) {
+	failOnSwallowedAdvisory(t)
 	db, mock, err := sqlmock.New()
 	if err != nil {
 		t.Fatalf("sqlmock.New: %v", err)
@@ -2370,6 +2393,7 @@ type wispsAbsentDB struct {
 
 func newWispsAbsentDB(t *testing.T) *wispsAbsentDB {
 	t.Helper()
+	failOnSwallowedAdvisory(t)
 	db, mock, err := sqlmock.New()
 	if err != nil {
 		t.Fatalf("sqlmock.New: %v", err)
