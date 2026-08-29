@@ -598,23 +598,41 @@ func TestMigrationFreezeUndeterminableFailsClosed(t *testing.T) {
 // displayed rather than deferring to PersistentPostRunE, so the guard there
 // does not cover it. Showing a tip must never write into a frozen workspace.
 func TestRecordTipShownSkippedDuringFreeze(t *testing.T) {
-	saved := commandFreeze
-	t.Cleanup(func() { commandFreeze = saved })
+	// These are the same process globals PersistentPostRunE reads to decide
+	// whether to apply a deferred tip write, and a later test in this package
+	// invokes that hook with no store open. Restore all three or this test
+	// hands it a pending write and a nil store to dereference.
+	savedFreeze, savedFlag, savedIDs := commandFreeze, commandDidWriteTipMetadata, commandTipIDsShown
+	t.Cleanup(func() {
+		commandFreeze, commandDidWriteTipMetadata, commandTipIDsShown = savedFreeze, savedFlag, savedIDs
+	})
 
-	writer := &fakeTipMetadataWriter{}
+	// recordTipShown has two branches: with dolt auto-commit on it records the
+	// write for PostRunE to apply, otherwise it writes immediately. A freeze
+	// has to stop both, so assert on both signals rather than on whichever
+	// branch this process's resolved config happens to select.
+	reset := func() *fakeTipMetadataWriter {
+		commandDidWriteTipMetadata = false
+		commandTipIDsShown = make(map[string]struct{})
+		return &fakeTipMetadataWriter{}
+	}
+	recorded := func(w *fakeTipMetadataWriter) bool {
+		return w.calls > 0 || commandDidWriteTipMetadata || len(commandTipIDsShown) > 0
+	}
+
+	frozen := reset()
 	commandFreeze = migration.Result{Path: filepath.Join(t.TempDir(), migration.FileName)}
-	recordTipShown(writer, "some-tip")
-	if writer.calls != 0 {
-		t.Errorf("recordTipShown wrote %d metadata keys during a freeze, want 0", writer.calls)
-	}
-	if commandDidWriteTipMetadata {
-		t.Errorf("recordTipShown recorded a pending tip write during a freeze")
+	recordTipShown(frozen, "some-tip")
+	if recorded(frozen) {
+		t.Errorf("recordTipShown recorded a tip write during a freeze (calls=%d, pending=%v, ids=%d)",
+			frozen.calls, commandDidWriteTipMetadata, len(commandTipIDsShown))
 	}
 
+	thawed := reset()
 	commandFreeze = migration.Result{}
-	recordTipShown(writer, "some-tip")
-	if writer.calls == 0 {
-		t.Errorf("recordTipShown wrote nothing with no freeze active — the guard must not be unconditional")
+	recordTipShown(thawed, "some-tip")
+	if !recorded(thawed) {
+		t.Errorf("recordTipShown recorded nothing with no freeze active — the guard must not be unconditional")
 	}
 }
 
