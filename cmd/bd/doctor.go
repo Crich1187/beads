@@ -371,7 +371,7 @@ func validateDoctorWorkspaceBackend(path string) error {
 	if err != nil {
 		return fmt.Errorf("failed to load %s: %w; no storage database was opened or modified; fix or restore metadata.json and retry", configfile.ConfigPath(beadsDir), err)
 	}
-	return validateConfiguredBackend(cfg)
+	return validateConfiguredBackend(cfg, beadsDir)
 }
 
 // printLegacyUpgradeDiagnostic preserves doctor as a store-free repair path:

@@ -36,7 +36,7 @@ func guardLegacyUpgradeWorkspace(beadsDir string) error {
 	// Validate read-only discovery metadata before any caller can use Load,
 	// which migrates legacy config.json to metadata.json. Removed and unknown
 	// backends must fail without changing the only pointer to their data.
-	if err := validateConfiguredBackend(cfg); err != nil {
+	if err := validateConfiguredBackend(cfg, beadsDir); err != nil {
 		return err
 	}
 	serverMode := cfg != nil && strings.EqualFold(cfg.DoltMode, configfile.DoltModeServer)

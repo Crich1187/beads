@@ -152,7 +152,7 @@ func newDoltStoreFromConfig(ctx context.Context, beadsDir string) (s storage.Dol
 		// metadata.json (cfg == nil, err == nil) keeps the embedded default.
 		return nil, fmt.Errorf("load %s: %w (refusing to fall back to the embedded store)", configfile.ConfigPath(beadsDir), err)
 	}
-	if err := validateConfiguredBackend(cfg); err != nil {
+	if err := validateConfiguredBackend(cfg, beadsDir); err != nil {
 		return nil, err
 	}
 	cfg = normalizeLoadedConfig(cfg)
@@ -260,7 +260,7 @@ func openNonMutatingStoreFromConfig(ctx context.Context, beadsDir string, previe
 		// "database not found" the embedded open would produce.
 		return nil, fmt.Errorf("load %s: %w (refusing to fall back to the embedded store)", configfile.ConfigPath(beadsDir), err)
 	}
-	if err := validateConfiguredBackend(cfg); err != nil {
+	if err := validateConfiguredBackend(cfg, beadsDir); err != nil {
 		return nil, err
 	}
 	cfg = normalizeLoadedConfig(cfg)

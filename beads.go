@@ -36,12 +36,17 @@ import (
 // safe to repeat.
 type Storage = beads.Storage
 
-func configuredBackendUnavailable(backend string) error {
+// configuredBackendUnavailable is the public open path's fail-closed refusal for
+// metadata naming a removed or unrecognized backend. beadsDir and cfg let the
+// refusal detect an already-present Dolt database and name the exact
+// metadata.json edit that heals the workspace, instead of the export-and-
+// reinitialize path that would destroy it.
+func configuredBackendUnavailable(backend, beadsDir string, cfg *configfile.Config) error {
 	switch backend {
 	case configfile.BackendPostgres, configfile.BackendMySQL, configfile.BackendSQLite:
-		return configfile.RemovedBackendError(backend)
+		return configfile.RemovedBackendErrorAt(backend, beadsDir, cfg)
 	default:
-		return configfile.UnknownBackendError(backend)
+		return configfile.UnknownBackendErrorAt(backend, beadsDir, cfg)
 	}
 }
 
