@@ -27,6 +27,7 @@ var _ storage.DoltStorage = (*EmbeddedDoltStore)(nil)
 var _ storage.StoreLocator = (*EmbeddedDoltStore)(nil)
 var _ storage.ActiveDatabaseSizer = (*EmbeddedDoltStore)(nil)
 var _ storage.GarbageCollector = (*EmbeddedDoltStore)(nil)
+var _ storage.FullGarbageCollector = (*EmbeddedDoltStore)(nil)
 var _ storage.Flattener = (*EmbeddedDoltStore)(nil)
 var _ storage.Compactor = (*EmbeddedDoltStore)(nil)
 var _ storage.SchemaMigrator = (*EmbeddedDoltStore)(nil)
@@ -681,10 +682,19 @@ func (s *EmbeddedDoltStore) Close() error {
 	return nil
 }
 
-// DoltGC runs Dolt garbage collection to reclaim disk space.
+// DoltGC runs Dolt's default, generational garbage collection to reclaim disk
+// space.
 func (s *EmbeddedDoltStore) DoltGC(ctx context.Context) error {
 	return s.withMutatingDBConn(ctx, func(db versioncontrolops.DBConn) error {
 		return versioncontrolops.DoltGC(ctx, db)
+	})
+}
+
+// DoltGCFull runs a full Dolt garbage collection across all storage
+// generations.
+func (s *EmbeddedDoltStore) DoltGCFull(ctx context.Context) error {
+	return s.withMutatingDBConn(ctx, func(db versioncontrolops.DBConn) error {
+		return versioncontrolops.DoltGCFull(ctx, db)
 	})
 }
 
