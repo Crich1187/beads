@@ -1456,6 +1456,13 @@ paths:
         `await_id`.
 
 
+        The per-type `storage-class.<type>` keys in `config.yaml` are CLI-door
+        policy that `bd create` resolves before it calls the role, so they do not
+        reach any create on this surface — this operation, `issues:batchCreate`
+        and `issues:batchApply` all mint the unset (versioned) class no matter
+        what those keys say on the server's machine.
+
+
         `comments` and an inline `dependencies` list on the issue itself — the
         role refuses both, because edges belong to the request's own
         `dependencies` member where their direction can be stated.
