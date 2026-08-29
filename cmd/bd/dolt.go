@@ -249,14 +249,47 @@ func printAncestorPKMismatchGuidance(err error) {
 	fmt.Fprintln(w, "  https://github.com/gastownhall/beads/blob/main/docs/RECOVERY.md#pk-fork-refused")
 }
 
+// noRemoteAllowedEnv opts a rig that is intentionally local-only back into an
+// exit-0 no-op sync. Without it, a push or pull that transferred nothing exits
+// non-zero (see finishNoRemote).
+const noRemoteAllowedEnv = "BD_ALLOW_NO_REMOTE"
+
+// finishNoRemote handles the confirmed "no Dolt remote is configured" case for
+// op ("push" or "pull"). It prints the setup guidance and then exits non-zero.
+//
+// This used to exit 0 on the grounds that the absence of a remote is a valid
+// configuration. It is — but the exit status is also the only signal an agent,
+// cron job, or CI step has that the sync actually moved data, and a silent
+// exit 0 makes a rig whose off-host backup has stopped indistinguishable from
+// one that is up to date. Operators who really are local-only say so
+// explicitly: `no-push: true` in config (handled earlier, before any sync is
+// attempted) or BD_ALLOW_NO_REMOTE=1.
+func finishNoRemote(op string) {
+	printNoRemoteGuidance()
+	if !noRemoteIsFatal() {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "\nError: %s transferred nothing — no Dolt remote is configured.\n", op)
+	fmt.Fprintf(os.Stderr, "Configure a remote, or set %s=1 (or no-push: true) if this rig is intentionally local-only.\n", noRemoteAllowedEnv)
+	os.Exit(1)
+}
+
+// noRemoteIsFatal reports whether a confirmed no-remote push/pull should exit
+// non-zero. Split out from finishNoRemote so the policy is testable without
+// calling os.Exit.
+func noRemoteIsFatal() bool {
+	return !envTruthyValue(os.Getenv(noRemoteAllowedEnv))
+}
+
 // printNoRemoteGuidance prints an informational message (to stdout) when
-// push or pull is attempted but no Dolt remote is configured. Exits 0 because
-// the absence of a remote is a valid configuration — not an error.
+// push or pull is attempted but no Dolt remote is configured. It does not
+// decide the exit status; finishNoRemote does.
 func printNoRemoteGuidance() {
-	fmt.Println("No remote is configured — skipping.")
+	fmt.Println("No remote is configured — nothing was transferred.")
 	fmt.Println("")
 	fmt.Println("For solo use, pushing is optional — your issues are stored locally")
-	fmt.Println("in .beads/ and versioned by Dolt automatically.")
+	fmt.Println("in .beads/ and versioned by Dolt automatically. If that is deliberate,")
+	fmt.Println("set BD_ALLOW_NO_REMOTE=1 (or no-push: true) so this exits 0.")
 	fmt.Println("")
 	fmt.Println("To set up remote sync (for backup or team sharing):")
 	fmt.Println("  bd dolt remote add origin <url>")
@@ -382,7 +415,7 @@ The remote must already exist (see 'bd dolt remote add').`,
 		}
 		if pushErr != nil {
 			if isConfirmedNoRemote(ctx, st, pushErr) {
-				printNoRemoteGuidance()
+				finishNoRemote("push")
 				return
 			}
 			fmt.Fprintf(os.Stderr, "Error: %v\n", pushErr)
@@ -441,7 +474,7 @@ The remote must already exist (see 'bd dolt remote add').`,
 		fmt.Println("Pulling from Dolt remote...")
 		if err := st.Pull(ctx); err != nil {
 			if isConfirmedNoRemote(ctx, st, err) {
-				printNoRemoteGuidance()
+				finishNoRemote("pull")
 				return
 			}
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)

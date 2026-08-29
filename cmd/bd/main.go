@@ -1012,7 +1012,22 @@ var rootCmd = &cobra.Command{
 		// Load config to get database name and server connection settings
 		cfg, cfgErr := configfile.Load(beadsDir)
 		if cfgErr != nil {
-			fmt.Fprintf(os.Stderr, "warning: failed to load beads config from %s: %v\n", beadsDir, cfgErr)
+			// Fail closed. configfile.Load only returns an error when a
+			// config file exists but cannot be read, parsed, or migrated —
+			// a brand-new store with no config at all returns (nil, nil) and
+			// is handled below, so `bd init` is unaffected. Continuing here
+			// used to warn and then fall through to the DefaultDoltDatabase
+			// guess, which silently retargets every command at a different
+			// SQL database than the one the operator configured: writes land
+			// in a phantom "beads" database that has no remote and is never
+			// pushed, and the only symptom is a warning line nobody reads.
+			// A config we cannot read is not a config we may guess around.
+			return HandleError("failed to load beads config from %s: %v\n\n"+
+				"Refusing to fall back to the default database name %q: that would "+
+				"silently operate on a different database than the one configured.\n"+
+				"Fix or remove %s, then retry.",
+				beadsDir, cfgErr, configfile.DefaultDoltDatabase,
+				filepath.Join(beadsDir, configfile.ConfigFileName))
 		}
 		if cfg != nil {
 			warnSharedServerEmbeddedMismatch(cfg)
@@ -1077,10 +1092,9 @@ var rootCmd = &cobra.Command{
 				cmdCtx.ServerMode = doltCfg.ServerMode
 			}
 		}
-		// If config parse failed (cfgErr != nil), still default the database
-		// name so the store-open error is about the real problem (the parse
-		// failure warning already printed) rather than a confusing "database
-		// name must not be empty" downstream.
+		// Belt-and-braces: a parse failure now returns above, so the only way
+		// to reach here with an empty name is a config that loaded cleanly and
+		// left dolt_database unset — the documented default case.
 		if doltCfg.Database == "" {
 			doltCfg.Database = configfile.DefaultDoltDatabase
 		}
