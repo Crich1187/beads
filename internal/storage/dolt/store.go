@@ -3671,6 +3671,35 @@ func (s *DoltStore) prePushFSCK(ctx context.Context) error {
 	return nil
 }
 
+func classifyFSCKFailure(parentErr, fsckErr error, output string) error {
+	if output != "" {
+		if fsckCouldNotOpen(output) {
+			return nil
+		}
+		log.Printf("pre-push fsck could not run, skipping integrity check: %s", output)
+		return nil
+	}
+	if errors.Is(parentErr, context.Canceled) {
+		return fmt.Errorf("pre-push integrity check interrupted: %w", parentErr)
+	}
+	if errors.Is(parentErr, context.DeadlineExceeded) {
+		return fmt.Errorf("%w: the surrounding operation's deadline expired during the "+
+			"pre-push integrity check; to extend it, raise the caller timeout "+
+			"(for auto-push: the dolt.auto-push-timeout config); "+
+			"note that BEADS_FSCK_TIMEOUT cannot extend the caller deadline",
+			ErrFSCKTimeout)
+	}
+	if errors.Is(fsckErr, context.DeadlineExceeded) {
+		return fmt.Errorf("%w: fsck did not complete within the configured timeout; "+
+			"the push was aborted without checking integrity (the store is not necessarily corrupt); "+
+			"large stores can be shrunk with `dolt gc` (or `CALL DOLT_GC()` on a running sql-server); "+
+			"the timeout can be raised via the BEADS_FSCK_TIMEOUT environment variable",
+			ErrFSCKTimeout)
+	}
+	return fmt.Errorf("%w: aborting push to prevent propagating corrupt chunks",
+		ErrDanglingReference)
+}
+
 // classifyFSCKFailure maps a failed dolt fsck exit into one of six outcomes,
 // evaluated in priority order:
 //
