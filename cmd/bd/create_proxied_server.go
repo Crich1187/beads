@@ -226,6 +226,7 @@ func buildCreateIssueFromInput(in createInput) *types.Issue {
 		EstimatedMinutes:   in.estimatedMinutes,
 		Ephemeral:          in.ephemeral,
 		NoHistory:          in.noHistory,
+		StorageClass:       in.storageClass,
 		CreatedBy:          in.createdBy,
 		Owner:              in.owner,
 		MolType:            in.molType,
