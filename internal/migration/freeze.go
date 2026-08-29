@@ -108,7 +108,7 @@ func lookupEnvOverride() (Result, bool) {
 	if override == "" {
 		return Result{}, false
 	}
-	switch found, err := statMarker(override); {
+	switch found, err := statMarker(override, true); {
 	case err != nil:
 		return Result{FromEnv: true, Err: err}, true
 	case found:
@@ -134,7 +134,7 @@ func walkAll(starts []string) Result {
 		for {
 			if !seen[dir] {
 				seen[dir] = true
-				switch found, statErr := statMarker(filepath.Join(dir, FileName)); {
+				switch found, statErr := statMarker(filepath.Join(dir, FileName), false); {
 				case statErr != nil:
 					return Result{Err: statErr}
 				case found && !inUntrustedDir(dir):
@@ -157,11 +157,59 @@ func walkAll(starts []string) Result {
 // archive. Any other stat failure — a permission error on the marker or on a
 // directory above it — is returned, because "bd cannot tell" must not read as
 // "not frozen".
-func statMarker(path string) (bool, error) {
+//
+// trusted separates the operator-named EnvFreezeFile path from one the untrusted
+// ancestor walk stumbled onto, which decides how a symlink is treated. os.Lstat
+// does not follow links, so a symlink is neither regular nor absent; left alone
+// it would silently fail OPEN — the one direction a write gate must never take.
+// On the trusted path a symlink is honored (resolved with os.Stat, so a link to
+// a real regular marker still freezes): the operator named it, and an
+// indirection like `current -> releases/N` is exactly what EnvFreezeFile is
+// for. On the untrusted walk a symlink is NOT followed — anything the walk
+// merely passed through could otherwise redirect the gate — but the skip is
+// announced on stderr so it is visible rather than a silent bypass.
+func statMarker(path string, trusted bool) (bool, error) {
 	info, err := os.Lstat(path)
+	if err != nil {
+		return classifyMarkerStatErr(path, err)
+	}
 	switch {
-	case err == nil:
-		return info.Mode().IsRegular(), nil
+	case info.Mode().IsRegular():
+		return true, nil
+	case info.Mode()&os.ModeSymlink != 0:
+		return statSymlinkMarker(path, trusted)
+	default:
+		// A directory, device, socket, or similar named MIGRATION-FREEZE is not
+		// a marker.
+		return false, nil
+	}
+}
+
+// statSymlinkMarker decides a symlink found where a marker was expected. On the
+// untrusted walk it refuses to follow but warns, so an ignored would-be marker
+// never disappears in silence. On the operator-named path it follows the link
+// with os.Stat and honors a regular target; a dangling or non-regular target is
+// simply not a marker, and an unreadable one stays fail-closed.
+func statSymlinkMarker(path string, trusted bool) (bool, error) {
+	if !trusted {
+		fmt.Fprintf(os.Stderr,
+			"bd: ignoring symlinked %s at %s; a freeze marker must be a regular file (set %s to honor a symlink)\n",
+			FileName, path, EnvFreezeFile)
+		return false, nil
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return classifyMarkerStatErr(path, err)
+	}
+	return info.Mode().IsRegular(), nil
+}
+
+// classifyMarkerStatErr maps a stat/lstat error to the (found, err) a marker
+// lookup reports: a genuinely-absent path (ENOENT/EINVAL, or ENOTDIR when a
+// component of the path is not a directory) is "not a marker"; anything else is
+// undeterminable and returned so the caller treats it as frozen.
+func classifyMarkerStatErr(path string, err error) (bool, error) {
+	switch {
 	case errors.Is(err, fs.ErrNotExist), errors.Is(err, fs.ErrInvalid):
 		return false, nil
 	case errors.Is(err, syscall.ENOTDIR):

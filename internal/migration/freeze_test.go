@@ -1,6 +1,7 @@
 package migration
 
 import (
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -26,6 +27,32 @@ func writeMarker(t *testing.T, dir, content string) string {
 		t.Fatalf("writing marker at %s: %v", path, err)
 	}
 	return path
+}
+
+// captureStderr runs f with os.Stderr redirected to a pipe and returns what it
+// wrote. These tests run sequentially (no t.Parallel), so swapping the
+// process-global stderr for the duration of one call is safe here.
+func captureStderr(t *testing.T, f func()) string {
+	t.Helper()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	old := os.Stderr
+	os.Stderr = w
+	defer func() { os.Stderr = old }()
+
+	f()
+
+	if err := w.Close(); err != nil {
+		t.Fatalf("closing stderr pipe: %v", err)
+	}
+	os.Stderr = old
+	out, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatalf("reading captured stderr: %v", err)
+	}
+	return string(out)
 }
 
 // TestFindFromWalkTerminates covers the walk's not-found exit. FindFrom takes
@@ -242,6 +269,92 @@ func TestNonRegularMarkerIsNotAFreeze(t *testing.T) {
 
 	if res := FindFrom(nested); res.Frozen() {
 		t.Errorf("FindFrom(%q) = %+v, want not frozen — a directory is not a marker", nested, res)
+	}
+}
+
+// TestEnvOverrideFollowsSymlink is the fail-open regression on the authoritative
+// path: an operator who points BD_MIGRATION_FREEZE_FILE through an indirection
+// symlink (the `current -> releases/N` pattern the variable exists for) must
+// still be frozen when the link resolves to a real marker. os.Lstat alone would
+// see the link, not the regular file it targets, and wave the write through.
+func TestEnvOverrideFollowsSymlink(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink creation needs privilege on Windows")
+	}
+	dir := t.TempDir()
+	target := filepath.Join(dir, "real-marker")
+	if err := os.WriteFile(target, []byte("alice\t\tmigrating\n"), 0644); err != nil {
+		t.Fatalf("writing target marker: %v", err)
+	}
+	link := filepath.Join(dir, "current-freeze")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatalf("creating symlink: %v", err)
+	}
+	t.Chdir(t.TempDir())
+	t.Setenv(EnvFreezeFile, link)
+
+	res := Find()
+	if !res.Frozen() {
+		t.Fatalf("Find() with %s at a symlink to a real marker = %+v, want frozen — the authoritative path must follow the link", EnvFreezeFile, res)
+	}
+	if res.Path != link {
+		t.Errorf("Path = %q, want the operator-named path %q", res.Path, link)
+	}
+	if !res.FromEnv {
+		t.Errorf("FromEnv = false, want true")
+	}
+}
+
+// TestEnvOverrideDanglingSymlinkNotFrozen keeps the opt-out honest: a symlink
+// whose target does not exist is the same as naming a missing path — no marker,
+// no freeze — not an undeterminable failure that would fail closed.
+func TestEnvOverrideDanglingSymlinkNotFrozen(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink creation needs privilege on Windows")
+	}
+	dir := t.TempDir()
+	link := filepath.Join(dir, "current-freeze")
+	if err := os.Symlink(filepath.Join(dir, "no-such-target"), link); err != nil {
+		t.Fatalf("creating dangling symlink: %v", err)
+	}
+	t.Chdir(t.TempDir())
+	t.Setenv(EnvFreezeFile, link)
+
+	res := Find()
+	if res.Frozen() {
+		t.Errorf("Find() with %s at a dangling symlink = %+v, want not frozen", EnvFreezeFile, res)
+	}
+}
+
+// TestWalkSymlinkMarkerIgnoredWithWarning is the untrusted-walk half of the
+// symlink rule: a symlink named MIGRATION-FREEZE that the ancestor walk hits is
+// NOT followed — otherwise anything the walk merely passed through could
+// redirect the gate — but the skip must be announced, not a silent fail-open.
+func TestWalkSymlinkMarkerIgnoredWithWarning(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink creation needs privilege on Windows")
+	}
+	pinNoOverride(t)
+	root := t.TempDir()
+	target := filepath.Join(t.TempDir(), "real-marker")
+	if err := os.WriteFile(target, nil, 0644); err != nil {
+		t.Fatalf("writing target marker: %v", err)
+	}
+	if err := os.Symlink(target, filepath.Join(root, FileName)); err != nil {
+		t.Fatalf("creating symlink marker: %v", err)
+	}
+	nested := filepath.Join(root, "repo")
+	if err := os.MkdirAll(nested, 0755); err != nil {
+		t.Fatalf("creating %s: %v", nested, err)
+	}
+
+	var res Result
+	stderr := captureStderr(t, func() { res = FindFrom(nested) })
+	if res.Frozen() {
+		t.Errorf("FindFrom(%q) = %+v, want not frozen — a symlinked marker on the untrusted walk is not followed", nested, res)
+	}
+	if !strings.Contains(stderr, FileName) || !strings.Contains(stderr, "symlink") {
+		t.Errorf("stderr = %q, want a warning naming the ignored symlinked %s so the skip is not silent", stderr, FileName)
 	}
 }
 
