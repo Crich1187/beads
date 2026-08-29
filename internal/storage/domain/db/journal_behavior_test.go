@@ -90,7 +90,7 @@ func (s *testSuite) TestEventsJournal_UOWPlumbing() {
 	s.Require().NoError(err)
 	_, err = ir.Close(ctx, "bd-mj-1", domain.CloseRowParams{Reason: "done"}, "actor", domain.IssueTableOpts{})
 	s.Require().NoError(err)
-	s.Require().NoError(ir.Delete(ctx, "bd-mj-2", domain.IssueTableOpts{}))
+	s.Require().NoError(ir.Delete(ctx, "bd-mj-2", domain.IssueTableOpts{}, "actor"))
 
 	got := s.readJournal()
 	wantOps := []string{
@@ -243,7 +243,7 @@ func (s *testSuite) TestEventsJournal_NoPhantomDeletes() {
 	s.Require().NoError(err)
 
 	// Delete a mix: two real ids and two that do not exist.
-	n, err := ir.DeleteByIDs(ctx, []string{"bd-pd-1", "bd-pd-missing-a", "bd-pd-2", "bd-pd-missing-b"}, domain.IssueTableOpts{})
+	n, err := ir.DeleteByIDs(ctx, []string{"bd-pd-1", "bd-pd-missing-a", "bd-pd-2", "bd-pd-missing-b"}, domain.IssueTableOpts{}, "actor")
 	s.Require().NoError(err)
 	s.Equal(2, n, "only the two present ids are deleted")
 
@@ -339,7 +339,7 @@ func (s *testSuite) TestEventsJournal_ReplayFromZeroReconstructsLiveSet() {
 	}, "actor", domain.DepInsertOpts{}))
 	_, err := ir.Close(ctx, "bd-rp-2", domain.CloseRowParams{Reason: "done"}, "actor", domain.IssueTableOpts{})
 	s.Require().NoError(err)
-	s.Require().NoError(ir.Delete(ctx, "bd-rp-4", domain.IssueTableOpts{}))
+	s.Require().NoError(ir.Delete(ctx, "bd-rp-4", domain.IssueTableOpts{}, "actor"))
 
 	// Replay: create/update/close/comment/dep_* set the snapshot, delete drops it.
 	replay := map[string]*types.Issue{}
