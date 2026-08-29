@@ -2767,7 +2767,8 @@ func initIfMissingPrefixMismatch(existingDBName, requestedPrefix string) bool {
 // own checkExistingBeadsData, the proxied-server route from the identical check
 // inside runInitProxiedServer. Before that wiring existed, --init-if-missing was
 // simply inert on the proxied route — an already-initialized workspace exited 1
-// with the "Aborting." banner, and the mismatch guards below had never once run.
+// with the "Aborting." banner, and the two mismatch guards this delegates to had
+// never once run.
 func resolveInitIfMissingAlreadyInitialized(cmd *cobra.Command, database, prefix string, quiet bool) error {
 	existing := existingWorkspaceDBName()
 	if cmd.Flags().Changed("database") {
