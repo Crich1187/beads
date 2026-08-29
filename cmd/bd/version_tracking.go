@@ -292,25 +292,56 @@ func autoMigrateOnVersionBump(beadsDir string) {
 // must not swallow into a one-line stderr notice.
 //
 // Every other failure here is genuinely best-effort — the command's own store
-// open will report anything that matters. A shared-store gate refusal is
-// different: it is the whole point of the version bump (there ARE pending
-// migrations), it will not be reported by a read command's own open (read-only
-// opens never touch the schema), and it is the moment gastownhall/beads#5920
-// used to silently promote the cursor for every co-resident client. Now
-// nothing is promoted, so say what happened and what to do about it.
+// open will report anything that matters. A gate refusal is different: it is
+// the whole point of the version bump (there ARE pending migrations), it will
+// not be reported by a read command's own open (read-only opens never touch
+// the schema), and it is the moment gastownhall/beads#5920 used to silently
+// promote the cursor for every co-resident client. Now nothing is promoted, so
+// say what happened and what to do about it.
 //
 // It fires once per version bump, because .local_version is consumed in the
-// same pre-run. The per-command surfaces are the write-open refusal itself and
-// the docs; this line exists so the upgrade is not silent.
+// same pre-run — which is exactly why the remedy it names has to be right for
+// THIS refusal. The gate returns one error type for several very different
+// decisions, and the remote-backed ones are not unlocked by the migrate verb
+// at all (a clone whose remote is already migrated must adopt, not migrate),
+// so the line is chosen per decision rather than printed unconditionally.
 func noticeSharedMigrateRefusal(err error) {
 	var gateErr *schema.RemoteMigrateGateError
 	if !errors.As(err, &gateErr) {
 		return
 	}
+	// --json puts a machine-readable gate block on this same stream when the
+	// command's own open is refused a moment later; prose prepended to it
+	// makes the documented contract unparseable. The human-output sibling
+	// maybeShowUpgradeNotification takes the same care.
+	if jsonOutput {
+		return
+	}
+
+	consent := schema.SharedConsentCommand
+	if globalFlag {
+		consent = schema.SharedConsentCommandGlobal
+	}
+	var remedy string
+	switch gateErr.Decision {
+	case "shared-no-remote":
+		remedy = fmt.Sprintf("Run '%s' once every client of this server is upgraded; reads keep working meanwhile.", consent)
+	case "adopt", "adopt-ff":
+		// The remote is already migrated: migrating here would fork it, and
+		// the verb consent deliberately does not unlock this arm.
+		remedy = "Another clone has already migrated this database — adopt it with 'bd bootstrap' rather than migrating here; reads keep working meanwhile."
+	case "fork-skew":
+		remedy = "This database and its remote already applied different content for the same migration (#4259) — run 'bd doctor' and follow its migration-content-skew guidance; do not migrate."
+	default:
+		// The blunt remote-backed stop, including the shared-store
+		// first-mover suppression. Its full block names the designated-
+		// migrator and adopt paths with their preconditions, and picking one
+		// here would be guessing.
+		remedy = "This database has a remote — run 'bd migrate' to see the migrate-or-adopt options before choosing; reads keep working meanwhile."
+	}
 	fmt.Fprintf(os.Stderr,
-		"bd upgraded to v%s: %d schema migration(s) pending on this shared database — not auto-applying (#5920).\n"+
-			"Run 'bd migrate schema' once every client of this server is upgraded; reads keep working meanwhile.\n",
-		Version, gateErr.Pending)
+		"bd upgraded to v%s: %d schema migration(s) pending on this database — not auto-applying (#5920).\n%s\n",
+		Version, gateErr.Pending, remedy)
 }
 
 // recordedWorkspaceVersion reads the marker through the role's accessor on a

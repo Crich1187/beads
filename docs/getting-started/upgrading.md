@@ -250,8 +250,9 @@ A server-mode database is served to every `bd` client connected to that
 `dolt sql-server`, so a schema migration is not a local event: it promotes the
 schema version for **all** of them at once, and clients still running an older
 `bd` refuse the database until they are upgraded too. `bd` therefore never
-auto-migrates a shared database on a version bump, with or without a remote
-configured ([#5920](https://github.com/gastownhall/beads/issues/5920)).
+auto-migrates a shared database on a version bump — with or without a remote
+configured, though the two cases consent differently
+([#5920](https://github.com/gastownhall/beads/issues/5920)).
 
 Upgrade one server's clients like this:
 
@@ -260,8 +261,8 @@ Upgrade one server's clients like this:
 #    an upgraded client reads the old schema, it just cannot write to it.
 bd version                     # on each client, confirm the new version
 
-# 2. Once, from any one client: consent to the migration.
-bd migrate schema
+# 2. Once, from a workspace already set up against this server: consent.
+bd migrate schema              # add --global for the shared global database
 
 # 3. Confirm.
 bd doctor
@@ -271,9 +272,15 @@ Between steps 1 and 2, an upgraded client reads normally and its writes are
 refused with the gate's guidance. Nothing is silently promoted, so there is no
 deadline — but the window is a degraded one, so keep it short.
 
-`bd serve` refuses to start against a database with pending migrations, for the
-same reason and with the same fix: reconcile the schema first, then start the
-daemon.
+**If the shared server also has a Dolt remote**, step 2 is not enough. Two
+hazards now apply at once — the co-resident lockout above and the cross-clone
+fork of [Remote-backed databases](#remote-backed-databases-and-multiple-clones)
+— so `bd` requires the stronger designated-migrator consent it describes:
+`bd migrate --force`, from exactly one machine, followed by `bd dolt push`. If
+another clone has already migrated and pushed, adopt its database with
+`bd bootstrap` instead of migrating. On a shared server, adopting also promotes
+the schema for every client of that server, so step 1 still comes first either
+way.
 
 <Warning>
 Migrating is one-way for the fleet: after step 2, a client still on the older
@@ -281,6 +288,11 @@ Migrating is one-way for the fleet: after step 2, a client still on the older
 — the gate cannot see the other clients' versions and will take your word for
 it.
 </Warning>
+
+A new client **joining** a server whose schema is behind is refused before its
+workspace is written, so there is nothing to run `bd migrate schema` from
+there: do step 2 from a client that is already set up, or join and migrate in
+one step with `BD_ALLOW_REMOTE_MIGRATE=1 bd init …`.
 
 ## Cross-era Upgrades
 

@@ -271,6 +271,52 @@ func TestSharedStoreGateSuppressesSmartAutoArms(t *testing.T) {
 		}
 	})
 
+	// A refusal that came from a shared store carries consequences its #4259
+	// decisions were never annotated for: every remedy lands on the database
+	// the whole server is serving. adopt-ff is the sharp case — its risk is
+	// otherwise literally "none", which an agent would read as free.
+	t.Run("shared refusals annotate the fleet-wide risk", func(t *testing.T) {
+		for _, decision := range []string{gateDecisionAdopt, gateDecisionAdoptFastForward} {
+			shared := (&RemoteMigrateGateError{Decision: decision, Shared: true}).Options()
+			if len(shared) != 1 {
+				t.Fatalf("%s: expected one option, got %+v", decision, shared)
+			}
+			if !strings.Contains(shared[0].Risk, "co-resident") {
+				t.Errorf("%s: shared risk must name the co-resident consequence, got %q", decision, shared[0].Risk)
+			}
+			local := (&RemoteMigrateGateError{Decision: decision}).Options()
+			if strings.Contains(local[0].Risk, "co-resident") {
+				t.Errorf("%s: a non-shared refusal must keep its original risk, got %q", decision, local[0].Risk)
+			}
+		}
+		// "Risk: none" is only ever correct off a shared store.
+		ff := (&RemoteMigrateGateError{Decision: gateDecisionAdoptFastForward, Shared: true}).Options()
+		if strings.HasPrefix(ff[0].Risk, "none") {
+			t.Errorf("adopt-ff on a shared store must not report no risk, got %q", ff[0].Risk)
+		}
+	})
+
+	t.Run("shared is set on the remote-backed arms too", func(t *testing.T) {
+		resetConsent(t)
+		t.Setenv(SmartGateEnv, "0")
+		t.Setenv(AllowRemoteMigrateEnv, "0")
+		db, mock, _ := sqlmock.New()
+		defer db.Close()
+		expectSharedGateProbe(mock, 1, 1)
+
+		err := CheckSharedStoreMigrateGate(context.Background(), db, "", nil, nil)
+		var gateErr *RemoteMigrateGateError
+		if !errors.As(err, &gateErr) {
+			t.Fatalf("expected a gate error, got %v", err)
+		}
+		if !gateErr.Shared {
+			t.Error("a refusal from the shared gate must be marked Shared, whatever its decision")
+		}
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Fatalf("unmet expectations: %v", err)
+		}
+	})
+
 	t.Run("auto fast-forward is never executed", func(t *testing.T) {
 		resetConsent(t)
 		t.Setenv(SmartGateEnv, "1")

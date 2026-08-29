@@ -196,8 +196,8 @@ type DatabaseSelector func(ctx context.Context, conn DBConn, databaseName string
 type MigrationGate func(context.Context, *sql.Conn) error
 
 // WithMigrationGate installs a pre-migration gate for callers whose migration
-// runs entirely inside MigrateUpWithLock — the proxied/`bd serve` provider,
-// which has no separate pre-open gate hook the way internal/storage/dolt does.
+// runs entirely inside MigrateUpWithLock, with no separate pre-open gate hook
+// of the kind internal/storage/dolt runs in its own retry loop.
 //
 // It runs after the migration lock is acquired and after any locked
 // preparation, immediately before MigrateUp. That placement is the whole
