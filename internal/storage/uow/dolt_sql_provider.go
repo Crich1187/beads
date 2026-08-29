@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -247,9 +248,15 @@ func (p *doltSQLProvider) verifyTeamServerSchema(ctx context.Context, conn *sql.
 		if isSerializationError(err) {
 			return fmt.Errorf("uow: switching to database: %w", err)
 		}
-		return backoff.Permanent(fmt.Errorf(
-			"uow: database %q not found — the schema is managed by beads-team-server; ask your operator to run 'bts init' first: %w",
-			database, err))
+		return backoff.Permanent(classifyUseDatabaseError(err, database, teamServerUseDatabaseRemedy))
+	}
+	// A USE that returns no error is not proof the session moved: see
+	// assertSessionDatabase.
+	if err := assertSessionDatabase(ctx, conn, database); err != nil {
+		if isSerializationError(err) {
+			return err
+		}
+		return backoff.Permanent(err)
 	}
 	if err := checkTeamServerSchema(ctx, conn, database); err != nil {
 		if isSerializationError(err) {
@@ -276,11 +283,99 @@ func (p *doltSQLProvider) attachPreviewDatabase(ctx context.Context, conn *sql.C
 		if isSerializationError(err) {
 			return fmt.Errorf("uow: switching to database: %w", err)
 		}
-		return backoff.Permanent(fmt.Errorf(
-			"uow: database %q not found — preview commands (--dry-run, --inspect) never create or migrate a database; run the command without the preview flag first: %w",
-			database, err))
+		return backoff.Permanent(classifyUseDatabaseError(err, database, previewUseDatabaseRemedy))
 	}
 	return nil
+}
+
+// useDatabaseRemedy carries the advice classifyUseDatabaseError appends to the
+// two failure shapes whose remedy depends on which open path asked: a database
+// the server says is absent, and a failure it could not classify at all. Denial
+// needs no variant — a refused credential is refused the same way everywhere,
+// and only the server administrator can change that.
+type useDatabaseRemedy struct {
+	// missing is appended when the server reports the database does not exist.
+	missing string
+	// unclassified is appended when the driver error is neither a denial nor an
+	// absence, so the message must not claim to know which.
+	unclassified string
+}
+
+var (
+	// teamServerUseDatabaseRemedy: the schema on this path is owned by the team
+	// server, so bd never creates the database — an absent one is a
+	// provisioning request, not something a retry can fix.
+	teamServerUseDatabaseRemedy = useDatabaseRemedy{
+		missing:      "it must be provisioned on the server; ask the server administrator to create it, then re-run init",
+		unclassified: "the schema is managed by beads-team-server; ask your operator to run 'bts init' first",
+	}
+	// previewUseDatabaseRemedy: a preview open promised not to mutate anything,
+	// so it neither creates nor migrates; the ordinary open would.
+	previewUseDatabaseRemedy = useDatabaseRemedy{
+		missing:      "preview commands (--dry-run, --inspect) never create or migrate a database; run the command without the preview flag first",
+		unclassified: "preview commands (--dry-run, --inspect) never create or migrate a database; run the command without the preview flag first",
+	}
+)
+
+// classifyUseDatabaseError describes a failed USE using only what the server
+// actually said. The old wording called every failure "database %q not found",
+// including the access-denied errors a scoped credential gets — which sent
+// operators off to provision a database that already existed and only needed a
+// grant. A server hides existence from a credential it has not granted the
+// database (see isDatabaseNotFoundError), so on a denial bd must name both
+// possibilities instead of picking one.
+func classifyUseDatabaseError(err error, database string, remedy useDatabaseRemedy) error {
+	switch {
+	case isAccessDeniedError(err):
+		return fmt.Errorf(
+			"uow: access to database %q was denied for this credential — either the database is not provisioned on the server or this credential has not been granted access to it; ask the server administrator to provision the database and grant access: %w",
+			database, err)
+	case isDatabaseNotFoundError(err):
+		return fmt.Errorf("uow: database %q does not exist on the server — %s: %w", database, remedy.missing, err)
+	default:
+		return fmt.Errorf("uow: could not switch to database %q — %s: %w", database, remedy.unclassified, err)
+	}
+}
+
+// rowQuerier is the subset of *sql.Conn, *sql.DB, and *sql.Tx that
+// assertSessionDatabase needs, so the assertion can be tested against a stub.
+type rowQuerier interface {
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}
+
+// assertSessionDatabase verifies the server actually placed this session on the
+// database bd asked for.
+//
+// A front door that scopes connections by credential — a gateway, a proxy that
+// rewrites routing — can accept a foreign database name in the handshake or a
+// USE for it and serve its own database anyway. Nothing later on the open path
+// notices: bd's identity reads are unqualified, so they return the SESSION's
+// database while bd attributes them to the REQUESTED one. That is how
+// `bd init --database=<other>` ends up reporting a prefix conflict against a
+// database it never reached, and — with no --prefix to disagree — how a
+// workspace silently adopts another project's identity and then reads and
+// writes that project's data.
+//
+// Schema names compare case-insensitively, matching MySQL. A NULL or empty
+// answer means the session is on no database at all, which is the same
+// not-provisioned-or-not-granted situation classifyUseDatabaseError describes.
+func assertSessionDatabase(ctx context.Context, q rowQuerier, want string) error {
+	var current sql.NullString
+	if err := q.QueryRowContext(ctx, "SELECT DATABASE()").Scan(&current); err != nil {
+		return fmt.Errorf("uow: reading the session database after selecting %q: %w", want, err)
+	}
+	switch {
+	case !current.Valid || current.String == "":
+		return fmt.Errorf(
+			"uow: the server left this session on no database after selecting %q — either the database is not provisioned on the server or this credential has not been granted access to it; ask the server administrator to provision the database and grant access",
+			want)
+	case strings.EqualFold(current.String, want):
+		return nil
+	default:
+		return fmt.Errorf(
+			"uow: the server connected this session to database %q, not the requested %q — this credential appears to be scoped to %q. The requested database is not provisioned for this credential; ask the server administrator to provision it on the server (and grant this credential access), or re-run init without --database to use the provisioned one",
+			current.String, want, current.String)
+	}
 }
 
 // bootstrapPreparer carries the sticky fresh-bootstrap state across the backoff
@@ -343,6 +438,14 @@ func (b *bootstrapPreparer) prepare(ctx context.Context, conn *sql.Conn) (*schem
 				err:       fmt.Errorf("uow: creating database: %w", err),
 				retryable: true,
 			}
+		case isAccessDeniedError(err):
+			// A server that provisions databases itself denies CREATE to the
+			// credentials it hands out. Say so instead of surfacing the raw
+			// driver error, and do not retry or fall back: bd must not go
+			// looking for another way to create a database it was refused.
+			return nil, &bootstrapPreparationError{err: fmt.Errorf(
+				"uow: creating database %q was denied for this credential — this server provisions databases server-side; ask the server administrator to provision it, then re-run init: %w",
+				b.database, err)}
 		default:
 			return nil, &bootstrapPreparationError{err: fmt.Errorf("uow: creating database: %w", err)}
 		}
@@ -376,6 +479,18 @@ func buildDSN(ep proxy.Endpoint, database, user, password, tlsConfigName string)
 		TLSConfigName:   tlsConfigName,
 		ClientFoundRows: true,
 	}.String()
+}
+
+// assertSessionDatabaseOnPool runs assertSessionDatabase on a connection pinned
+// out of pool. A pool hands out a different connection per call, so the
+// assertion has to name the connection it is asserting about.
+func assertSessionDatabaseOnPool(ctx context.Context, pool *sql.DB, want string) error {
+	conn, err := pool.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("uow: pin connection: %w", err)
+	}
+	defer func() { _ = conn.Close() }()
+	return assertSessionDatabase(ctx, conn, want)
 }
 
 func openDB(ctx context.Context, dsn string) (*sql.DB, error) {
@@ -416,6 +531,15 @@ func openAndInitSchema(ctx context.Context, ep proxy.Endpoint, database, rootUse
 	dbConn, err := openDB(ctx, buildDSN(ep, database, rootUser, rootPassword, tlsConfigName))
 	if err != nil {
 		return nil, err
+	}
+
+	// This pool names the database in the MySQL handshake and never issues a
+	// USE, so nothing has yet checked that the server honored the name. Every
+	// unqualified read the caller makes — project identity above all — belongs
+	// to whatever database this session actually landed on, so assert it once
+	// here, on a pinned connection, before handing the pool out.
+	if err := assertSessionDatabaseOnPool(ctx, dbConn, database); err != nil {
+		return nil, errors.Join(err, dbConn.Close())
 	}
 
 	return &doltSQLProvider{
