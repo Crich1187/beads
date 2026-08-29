@@ -480,13 +480,7 @@ func TestIgnoredCursorHealConvergesFromEveryCrashState(t *testing.T) {
 				mustExecOn(t, ctx, conn, "DROP TABLE IF EXISTS ignored_schema_migrations")
 				mustExecOn(t, ctx, conn, "CALL DOLT_ADD('-f', 'ignored_schema_migrations')")
 				mustExecOn(t, ctx, conn, "CALL DOLT_COMMIT('--skip-empty', '-m', 'schema: untrack legacy ignored_schema_migrations so dolt_ignore can apply (gastownhall/beads#4356)')")
-				mustExecOn(t, ctx, conn, `CREATE TABLE IF NOT EXISTS ignored_schema_migrations (
-	version INT PRIMARY KEY,
-	applied_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-	content_hash CHAR(64)
-)`)
-				mustExecOn(t, ctx, conn, "INSERT IGNORE INTO ignored_schema_migrations (version, applied_at, content_hash) "+
-					"SELECT version, applied_at, content_hash FROM "+untrackScratchTable)
+				restoreCursorFromScratch(t, ctx, conn)
 			},
 		},
 	} {
@@ -505,13 +499,153 @@ func TestIgnoredCursorHealConvergesFromEveryCrashState(t *testing.T) {
 	}
 }
 
+// backupCursorRows manufactures the repair's scratch table. It derives both
+// the shape and the column list from the live cursor table (CREATE ... LIKE,
+// SELECT *) rather than restating them: a hand-copied DDL here is a fourth
+// place the cursor shape would have to be kept in sync, and the point of the
+// crash matrix is to exercise the real shape, whatever it currently is.
 func backupCursorRows(t *testing.T, ctx context.Context, conn *sql.Conn) {
 	t.Helper()
-	mustExecOn(t, ctx, conn, `CREATE TABLE IF NOT EXISTS `+untrackScratchTable+` (
-	version INT PRIMARY KEY,
-	applied_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-	content_hash CHAR(64)
-)`)
-	mustExecOn(t, ctx, conn, "INSERT IGNORE INTO "+untrackScratchTable+" (version, applied_at, content_hash) "+
-		"SELECT version, applied_at, content_hash FROM ignored_schema_migrations")
+	mustExecOn(t, ctx, conn, "CREATE TABLE IF NOT EXISTS "+untrackScratchTable+" LIKE ignored_schema_migrations")
+	mustExecOn(t, ctx, conn, "INSERT IGNORE INTO "+untrackScratchTable+" SELECT * FROM ignored_schema_migrations")
+}
+
+// restoreCursorFromScratch recreates the cursor table from the scratch copy,
+// the way the repair's own restore phase does.
+func restoreCursorFromScratch(t *testing.T, ctx context.Context, conn *sql.Conn) {
+	t.Helper()
+	mustExecOn(t, ctx, conn, "CREATE TABLE IF NOT EXISTS ignored_schema_migrations LIKE "+untrackScratchTable)
+	mustExecOn(t, ctx, conn, "INSERT IGNORE INTO ignored_schema_migrations SELECT * FROM "+untrackScratchTable)
+}
+
+// untrackCursorInPlace performs the repair by hand, leaving the scratch table
+// behind — the "restored, scratch left behind" crash state.
+func untrackCursorInPlace(t *testing.T, ctx context.Context, conn *sql.Conn) {
+	t.Helper()
+	backupCursorRows(t, ctx, conn)
+	mustExecOn(t, ctx, conn, "DROP TABLE IF EXISTS ignored_schema_migrations")
+	mustExecOn(t, ctx, conn, "CALL DOLT_ADD('-f', 'ignored_schema_migrations')")
+	mustExecOn(t, ctx, conn, "CALL DOLT_COMMIT('--skip-empty', '-m', 'schema: untrack legacy ignored_schema_migrations so dolt_ignore can apply (gastownhall/beads#4356)')")
+	restoreCursorFromScratch(t, ctx, conn)
+}
+
+// TestIgnoredCursorHealNeverResurrectsRolledBackVersions is the guard on the
+// resume path's blast radius.
+//
+// The sanctioned recovery from a bad release is a cursor ROLLBACK: delete the
+// affected rows from ignored_schema_migrations so the corrected migration
+// series re-applies on the next open. A scratch table left behind by an
+// interrupted repair holds a snapshot from BEFORE that rollback, so a resume
+// that unioned it back into a live cursor table would restore exactly the
+// versions the operator deleted — with their original applied_at — and the
+// corrected migrations would be silently skipped forever. The reconcile must
+// treat a live cursor table as the truth and the scratch as junk to remove.
+func TestIgnoredCursorHealNeverResurrectsRolledBackVersions(t *testing.T) {
+	ctx := t.Context()
+	f := newLegacyTrackedFixture(t, "rollback")
+
+	// A timestamp no migration pass could ever mint, so the row's provenance
+	// after the reopen is unambiguous: this exact value means it came from the
+	// stale backup, anything else means the migration genuinely re-applied.
+	const staleApplied = "2000-01-01 00:00:00"
+
+	var rolledBack int
+	f.withRawConn(t, func(conn *sql.Conn) {
+		// An interrupted repair: untracked and restored, scratch still there.
+		untrackCursorInPlace(t, ctx, conn)
+		// The operator then rolls the cursor back to re-apply a corrected
+		// ignored migration. The scratch still remembers the deleted version.
+		if err := conn.QueryRowContext(ctx,
+			"SELECT MAX(version) FROM ignored_schema_migrations").Scan(&rolledBack); err != nil {
+			t.Fatalf("reading the cursor high-water mark: %v", err)
+		}
+		mustExecOn(t, ctx, conn, "DELETE FROM ignored_schema_migrations WHERE version = ?", rolledBack)
+		mustExecOn(t, ctx, conn,
+			"UPDATE "+untrackScratchTable+" SET applied_at = ? WHERE version = ?", staleApplied, rolledBack)
+		var stillInScratch int
+		if err := conn.QueryRowContext(ctx,
+			"SELECT COUNT(*) FROM "+untrackScratchTable+" WHERE version = ?", rolledBack).Scan(&stillInScratch); err != nil {
+			t.Fatalf("reading the scratch table: %v", err)
+		}
+		if stillInScratch != 1 {
+			t.Fatalf("scratch table does not hold the rolled-back version %d; the hazard is not reproduced", rolledBack)
+		}
+	})
+
+	f.reopenAndClose(t)
+
+	f.withRawConn(t, func(conn *sql.Conn) {
+		// The version is expected BACK — that is the whole point of a cursor
+		// rollback. What must not happen is it coming back from the backup:
+		// then the migration never re-ran, and the corrected body that the
+		// rollback existed to apply is skipped forever while the cursor claims
+		// it succeeded.
+		var appliedAt string
+		if err := conn.QueryRowContext(ctx,
+			"SELECT applied_at FROM ignored_schema_migrations WHERE version = ?", rolledBack).Scan(&appliedAt); err != nil {
+			t.Fatalf("reading the rolled-back cursor row after the reconcile: %v", err)
+		}
+		if strings.HasPrefix(appliedAt, "2000-01-01") {
+			t.Errorf("cursor version %d carries the stale backup's applied_at (%s): the reconcile resurrected it instead of letting the corrected migration re-apply",
+				rolledBack, appliedAt)
+		}
+		if tablePresent(t, ctx, conn, untrackScratchTable) {
+			t.Errorf("%s survived; it is not dolt_ignore'd, so the next pull's auto-commit would replicate it fleet-wide", untrackScratchTable)
+		}
+		if dirty := dirtyTableNames(t, ctx, conn); len(dirty) > 0 {
+			t.Errorf("working set is dirty after the reconcile: %v", dirty)
+		}
+	})
+}
+
+// The operator veto is re-read on the resume path, not inherited from whatever
+// open crashed: someone who resolved a crashed repair by deliberately
+// versioning the cursor table must not have stale rows pushed back into it.
+// The scratch is still cleaned up — it is bd's own junk either way.
+func TestIgnoredCursorHealResumeRespectsOperatorOverride(t *testing.T) {
+	ctx := t.Context()
+	f := newLegacyTrackedFixture(t, "resumeoverride")
+
+	f.withRawConn(t, func(conn *sql.Conn) {
+		untrackCursorInPlace(t, ctx, conn)
+		mustExecOn(t, ctx, conn, "REPLACE INTO dolt_ignore VALUES ('ignored_schema_migrations', false)")
+		mustExecOn(t, ctx, conn, "CALL DOLT_COMMIT('-Am', 'operator: version the cursor table on purpose')")
+	})
+
+	f.reopenAndClose(t)
+
+	f.withRawConn(t, func(conn *sql.Conn) {
+		if tablePresent(t, ctx, conn, untrackScratchTable) {
+			t.Errorf("%s survived an override-suppressed resume; the cleanup is always correct", untrackScratchTable)
+		}
+		if got := len(cursorRows(t, ctx, conn)); got != len(f.cursorRows) {
+			t.Errorf("cursor rows = %d, want %d", got, len(f.cursorRows))
+		}
+	})
+}
+
+// A broad house pattern next to the exact override is the shape that made the
+// naive "any matching ignored=1 row" predicate destructive: Dolt resolves
+// dolt_ignore most-specific-first, so it keeps the table TRACKED here, and a
+// heal would drop and commit away a lineage the operator chose to keep.
+func TestIgnoredCursorHealRespectsOverrideUnderBroaderPattern(t *testing.T) {
+	ctx := t.Context()
+	f := newLegacyTrackedFixture(t, "broadoverride")
+
+	f.withRawConn(t, func(conn *sql.Conn) {
+		mustExecOn(t, ctx, conn, `REPLACE INTO dolt_ignore VALUES ('ignored\_%', true)`)
+		mustExecOn(t, ctx, conn, "REPLACE INTO dolt_ignore VALUES ('ignored_schema_migrations', false)")
+		mustExecOn(t, ctx, conn, "CALL DOLT_COMMIT('-Am', 'operator: version the cursor table under a broad house pattern')")
+	})
+
+	f.reopenAndClose(t)
+
+	f.withRawConn(t, func(conn *sql.Conn) {
+		if !trackedAtHead(t, ctx, conn, "ignored_schema_migrations") {
+			t.Error("the reconcile untracked a table Dolt keeps tracked for the operator; the committed lineage is gone")
+		}
+		if n := untrackCommitCount(t, ctx, conn); n != 0 {
+			t.Errorf("commits referencing #4356 = %d, want 0 under an operator override", n)
+		}
+	})
 }

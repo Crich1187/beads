@@ -621,10 +621,33 @@ func MigrateUp(ctx context.Context, db DBConn) (int, error) {
 	// short-circuit below would skip it — plus one the seed does not have: a
 	// pull from a not-yet-healed peer can re-introduce the tracked table,
 	// which only a probe that runs at EVERY open can catch.
-	if _, err := healTrackedIgnoredCursorTable(ctx, db); err != nil {
+	healed, err := healTrackedIgnoredCursorTable(ctx, db)
+	if err != nil {
 		return 0, fmt.Errorf("untracking legacy %s: %w", ignoredSource.cursorTable, err)
 	}
 
+	// A heal counts toward the returned total because every caller of this
+	// function asks the same question of it — did this pass change the
+	// database? — and a heal answers yes emphatically: it runs DDL and moves
+	// HEAD. Reporting 0 told DoltStore.Open not to rebuild the pool it had
+	// already pinned to the pre-migration session root (be-itm5: that
+	// connection serves stale reads and does not self-heal on retry), and
+	// told `bd migrate` to print "already at vN" and skip commandDidWrite
+	// immediately after minting a fleet-visible commit. The heal's own log
+	// line, not this counter, is what tells an operator WHAT happened.
+	reconciled := 0
+	if healed {
+		reconciled = 1
+	}
+
+	applied, err := migrateUpAfterReconcile(ctx, db, seedChanged)
+	return applied + reconciled, err
+}
+
+// migrateUpAfterReconcile is MigrateUp's migration pass proper, split out so
+// the open-time reconciles above it have exactly one place to contribute to
+// the reported total.
+func migrateUpAfterReconcile(ctx context.Context, db DBConn, seedChanged bool) (int, error) {
 	needed, err := migrationWorkNeeded(ctx, db)
 	if err != nil {
 		return 0, fmt.Errorf("checking schema migration work: %w", err)
@@ -1153,6 +1176,13 @@ type migrationFile struct {
 	version int
 	name    string
 }
+
+// cursorTableColumns are the columns bootstrapSQL creates, in order. The
+// #4356 untrack reconcile copies cursor rows out to a scratch table and back
+// by NAME, so a column added to bootstrapSQL without being added here would be
+// silently dropped from every database that reconcile repairs.
+// TestCursorTableColumnsMatchBootstrapSQL is what keeps the two together.
+var cursorTableColumns = []string{"version", "applied_at", "content_hash"}
 
 func (m migrationSource) bootstrapSQL() string {
 	return fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (

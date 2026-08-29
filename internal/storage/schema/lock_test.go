@@ -42,6 +42,7 @@ func TestIsMigrationLockError(t *testing.T) {
 }
 
 func TestMigrateUpRunsWithoutAdvisoryLock(t *testing.T) {
+	failOnSwallowedAdvisory(t)
 	db, mock, err := sqlmock.New()
 	if err != nil {
 		t.Fatalf("create sql mock: %v", err)
@@ -63,6 +64,7 @@ func TestMigrateUpRunsWithoutAdvisoryLock(t *testing.T) {
 }
 
 func TestMigrateUpWithLockUsesDatabaseScopedLockOnly(t *testing.T) {
+	failOnSwallowedAdvisory(t)
 	db, mock, err := sqlmock.New()
 	if err != nil {
 		t.Fatalf("create sql mock: %v", err)
@@ -99,6 +101,7 @@ func TestMigrateUpWithLockUsesDatabaseScopedLockOnly(t *testing.T) {
 }
 
 func TestMigrateUpWithLockPreparationErrorReleasesAndJoinsReleaseFailure(t *testing.T) {
+	failOnSwallowedAdvisory(t)
 	db, mock, err := sqlmock.New()
 	if err != nil {
 		t.Fatalf("create sql mock: %v", err)
@@ -153,6 +156,7 @@ func TestMigrateUpWithLockPreparationErrorReleasesAndJoinsReleaseFailure(t *test
 // capture (`tail -1` in a triage script) cannot see only the generic release
 // wrapper. Classification is unchanged from the case above.
 func TestMigrateUpWithLockMigrationErrorNotMaskedByReleaseFailure(t *testing.T) {
+	failOnSwallowedAdvisory(t)
 	db, mock, err := sqlmock.New()
 	if err != nil {
 		t.Fatalf("create sql mock: %v", err)
@@ -227,6 +231,7 @@ func TestMigrateUpWithLockMigrationErrorNotMaskedByReleaseFailure(t *testing.T) 
 // copied database is never healed (1 pattern instead of 5, wisp churn in
 // dolt_status, dirty-gate block on subsequent migrations).
 func TestMigrateUpSeedsIgnorePatternsWhenNoWorkNeeded(t *testing.T) {
+	failOnSwallowedAdvisory(t)
 	db, mock, err := sqlmock.New()
 	if err != nil {
 		t.Fatalf("create sql mock: %v", err)
@@ -273,6 +278,7 @@ func TestMigrateUpSeedsIgnorePatternsWhenNoWorkNeeded(t *testing.T) {
 // the no-work short-circuit must NOT stage or commit dolt_ignore — sqlmock
 // fails the test on any unexpected DOLT_ADD/DOLT_COMMIT call.
 func TestMigrateUpSkipsSeedCommitWhenNothingChanged(t *testing.T) {
+	failOnSwallowedAdvisory(t)
 	db, mock, err := sqlmock.New()
 	if err != nil {
 		t.Fatalf("create sql mock: %v", err)
@@ -612,6 +618,7 @@ func expectFreshBootstrapIdentityMatch(mock sqlmock.Sqlmock) {
 // as *DirtyTablesError and no DOLT_RESET runs (sqlmock's ordered expectations
 // fail the test on any unexpected reset call).
 func TestMigrateUpWithLockDirtyGuardStaysFatalWithoutHeal(t *testing.T) {
+	failOnSwallowedAdvisory(t)
 	db, mock, err := sqlmock.New()
 	if err != nil {
 		t.Fatalf("create sql mock: %v", err)
@@ -655,6 +662,7 @@ func TestMigrateUpWithLockDirtyGuardStaysFatalWithoutHeal(t *testing.T) {
 // interrupted bootstrap's working-set debris and the pass re-runs to
 // completion on the same session.
 func TestMigrateUpWithLockFreshBootstrapHealResetsAndRetries(t *testing.T) {
+	failOnSwallowedAdvisory(t)
 	db, mock, err := sqlmock.New()
 	if err != nil {
 		t.Fatalf("create sql mock: %v", err)
@@ -832,6 +840,7 @@ func TestMigrateUpWithLockFreshBootstrapHealProbeFailuresStayFatal(t *testing.T)
 }
 
 func TestMigrateUpWithLockFreshBootstrapHealCapabilityIsOneShot(t *testing.T) {
+	failOnSwallowedAdvisory(t)
 	db, mock, err := sqlmock.New()
 	if err != nil {
 		t.Fatalf("create sql mock: %v", err)
@@ -859,9 +868,11 @@ func TestMigrateUpWithLockFreshBootstrapHealCapabilityIsOneShot(t *testing.T) {
 	mock.ExpectQuery(regexp.QuoteMeta("CALL DOLT_RESET('--hard')")).
 		WillReturnRows(sqlmock.NewRows([]string{"status"}))
 	// The reset returns to the v60 HEAD used by expectDirtyGuardRefusal. The
-	// rerun repeats main's unconditional ignore-pattern seed before reaching
-	// migrationWorkNeeded, where the injected transient failure occurs.
+	// rerun repeats main's unconditional ignore-pattern seed and the #4356
+	// reconcile gate before reaching migrationWorkNeeded, where the injected
+	// transient failure occurs.
 	expectIgnorePatternSeedNoop(mock, LatestVersion()-2)
+	expectIgnoredCursorHealNoop(mock)
 	expectCursorProbe(mock, "schema_migrations", true)
 	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM schema_migrations", "version", LatestVersion()-2)
 	mock.ExpectQuery("(?s)SELECT s\\.table_name, s\\.staged\\s+FROM dolt_status s").
