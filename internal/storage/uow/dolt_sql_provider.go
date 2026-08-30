@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -44,6 +45,10 @@ type doltSQLProvider struct {
 	// non-mutating preview (--dry-run, --inspect). The open creates no
 	// database and applies no migration; see providerOptions.preview.
 	preview bool
+	// readOnly: the command that opened this provider only reads. Unlike
+	// preview it still bootstraps and migrates normally — it only changes what
+	// happens when the migration gate REFUSES; see providerOptions.readOnly.
+	readOnly bool
 	// eventsJournalEnabled activates the durable events journal for THIS
 	// provider instance only. See SetEventsJournalEnabled.
 	eventsJournalEnabled atomic.Bool
@@ -105,11 +110,25 @@ type providerOptions struct {
 	// the same contract embeddeddolt.OpenForPreviewCommand gives the embedded
 	// path.
 	preview bool
+	// readOnly opens for a command that only reads (bd list, show, …). It is
+	// deliberately weaker than preview: the open still creates and migrates as
+	// usual, because a read command on a fresh or behind workspace has always
+	// been served by the ordinary open. It changes exactly one thing — when
+	// the shared-store migration gate refuses, the open warns and attaches to
+	// the database at its current schema instead of failing, so reads keep
+	// working through the upgrade window. That is the same warn-and-continue
+	// contract embeddeddolt gives its read-only-command intent.
+	readOnly bool
 }
 
 // WithPreview opens the provider for a non-mutating preview command.
 func WithPreview() ProviderOption {
 	return func(o *providerOptions) { o.preview = true }
+}
+
+// WithReadOnly opens the provider for a command that only reads.
+func WithReadOnly() ProviderOption {
+	return func(o *providerOptions) { o.readOnly = true }
 }
 
 func applyProviderOptions(opts []ProviderOption) providerOptions {
@@ -231,9 +250,65 @@ func (p *doltSQLProvider) initSchemaAttempt(ctx context.Context, database string
 	}
 	if _, err := schema.MigrateUpWithLock(ctx, conn, database,
 		schema.WithDatabaseSelector(selectProbeDatabase),
-		schema.WithLockedPreparation(p.serverEndpoint, preparer.prepare)); err != nil {
+		schema.WithLockedPreparation(p.serverEndpoint, preparer.prepare),
+		// This provider serves a shared database by definition — an external
+		// or proxied sql-server, or `bd serve`'s own daemon — so the same
+		// refusal server mode gets applies here (gastownhall/beads#5920,
+		// #5043). Passing it as a lock option rather than calling the gate
+		// before MigrateUpWithLock is what keeps the steady-state open free:
+		// the converged fast path returns before the lock, and the gate, are
+		// ever reached. Preparation has already CREATEd and USEd the
+		// database by the time it runs, so a fresh bootstrap reads version 0
+		// and passes.
+		schema.WithMigrationGate(func(ctx context.Context, c *sql.Conn) error {
+			return schema.CheckSharedStoreMigrateGate(ctx, c, "", nil, nil)
+		})); err != nil {
+		var gateErr *schema.RemoteMigrateGateError
+		if errors.As(err, &gateErr) {
+			if p.readOnly {
+				return readThroughRefusedMigration(ctx, conn, database, gateErr)
+			}
+			// Explicit, though classifyInitSchemaError would reach the same
+			// verdict: a refusal must never be retried, because the retry
+			// would be an attempt to perform the migration it just refused.
+			return backoff.Permanent(gateErr)
+		}
 		return classifyInitSchemaError(err)
 	}
+	return nil
+}
+
+// readThroughRefusedMigration serves a read command from a database the
+// migration gate refused to migrate: warn, attach at the current schema, and
+// carry on. Writes remain refused (they open without WithReadOnly), so the
+// database cannot be quietly written at a schema this binary believes is
+// behind.
+//
+// This mirrors what embedded mode has done since bd-578h9.5 for its
+// read-only-command intent. Without it, extending the gate to the proxied path
+// would newly brick every read on a workspace waiting for its operator to
+// consent — which is the opposite of the contract the gate's own message
+// promises ("read commands keep working against the current schema").
+// It is a free function rather than a provider method on purpose: it needs no
+// provider state, and the parity test that enumerates doltSQLProvider's method
+// set as the capability surface a caller can reach through a
+// UnitOfWorkProvider would otherwise demand the notifying wrapper answer a
+// startup helper.
+func readThroughRefusedMigration(ctx context.Context, conn *sql.Conn, database string, gateErr *schema.RemoteMigrateGateError) error {
+	if err := db.NewDDLSQLRepository(conn).UseDatabase(ctx, database); err != nil {
+		if isSerializationError(err) {
+			return fmt.Errorf("uow: switching to database: %w", err)
+		}
+		// The gate refused AND the database cannot even be attached: report
+		// the refusal, which is the actionable half.
+		return backoff.Permanent(gateErr)
+	}
+	fmt.Fprintf(os.Stderr,
+		"Warning: %[1]v\n"+
+			"  Read-only command: continuing on schema v%[2]d without migrating.\n"+
+			"  Writes are blocked until the schema is reconciled. Run '%[3]s'\n"+
+			"  once every client of this server is upgraded.\n",
+		gateErr, gateErr.CurrentVersion, schema.SharedConsentCommand)
 	return nil
 }
 
@@ -520,6 +595,7 @@ func openAndInitSchema(ctx context.Context, ep proxy.Endpoint, database, rootUse
 		teamServer:        teamServer,
 		expectedProjectID: expectedProjectID,
 		preview:           opts.preview,
+		readOnly:          opts.readOnly,
 	}
 
 	if err := initProvider.initSchema(ctx, database); err != nil {
@@ -552,5 +628,6 @@ func openAndInitSchema(ctx context.Context, ep proxy.Endpoint, database, rootUse
 		teamServer:        teamServer,
 		expectedProjectID: expectedProjectID,
 		preview:           opts.preview,
+		readOnly:          opts.readOnly,
 	}, nil
 }

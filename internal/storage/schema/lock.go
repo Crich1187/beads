@@ -196,8 +196,9 @@ type DatabaseSelector func(ctx context.Context, conn DBConn, databaseName string
 type MigrationGate func(context.Context, *sql.Conn) error
 
 // WithMigrationGate installs a pre-migration gate for callers whose migration
-// runs entirely inside MigrateUpWithLock, with no separate pre-open gate hook
-// of the kind internal/storage/dolt runs in its own retry loop.
+// runs entirely inside MigrateUpWithLock — the proxied/`bd serve` provider,
+// which has no separate pre-open gate hook of the kind internal/storage/dolt
+// runs in its own retry loop.
 //
 // It runs after the migration lock is acquired and after any locked
 // preparation, immediately before MigrateUp. That placement is the whole
@@ -304,7 +305,14 @@ func MigrateUpWithLock(ctx context.Context, conn *sql.Conn, databaseName string,
 		}
 	}
 
-	if o.migrationGate != nil {
+	// Fresh-bootstrap heal authority is proof that THIS logical open performed
+	// the exact bare CREATE DATABASE for the incarnation now being migrated —
+	// so creating it was consent for its schema, and the gate has nothing to
+	// protect. Checking the capability rather than re-reading the version is
+	// what makes that hold across a retry: a first pass that died part-way
+	// leaves a non-zero cursor behind, and a version-only test would then have
+	// the init refuse to finish migrating the database it just created.
+	if o.migrationGate != nil && o.freshBootstrapHeal == nil {
 		if gateErr := o.migrationGate(ctx, conn); gateErr != nil {
 			return 0, gateErr
 		}

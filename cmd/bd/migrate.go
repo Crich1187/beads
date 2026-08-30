@@ -701,6 +701,36 @@ func stampWorkspaceVersionAfterMigrate(store storage.DoltStorage) {
 	}
 }
 
+// reportProxiedSchemaMigrate is `bd migrate schema`'s proxied-server arm. The
+// provider open already reconciled the schema under this verb's consent, so
+// there is nothing left to do but say so — and say it in the same shape the
+// direct path uses, since a caller parsing --json should not have to branch on
+// the workspace's storage mode.
+//
+// The open reports its own failures: a gate refusal or a failed migration
+// aborts the command in root pre-run and never reaches RunE, so arriving here
+// means the schema is reconciled. The applied count is not observable from
+// here (it belongs to an open that has already returned), hence the "current"
+// status rather than a count.
+//
+// No version stamping here, unlike the direct path: reconcileVersionProxiedServer
+// already runs in the root pre-run after a successful provider open, so the
+// marker the gate refusal held back is written as soon as the open succeeds.
+func reportProxiedSchemaMigrate() error {
+	latest := schema.LatestVersion()
+	if jsonOutput {
+		return outputJSON(map[string]interface{}{
+			"status":         "current",
+			"latest_version": latest,
+			"mode":           "proxied-server",
+			"note":           "schema reconciled during provider open",
+		})
+	}
+	fmt.Printf("%s\n", ui.RenderPass(fmt.Sprintf(
+		"✓ Schema reconciled during provider open (proxied-server mode); schema now at v%d", latest)))
+	return nil
+}
+
 func handleToSeparateBranch(branch string, dryRun bool) error {
 	b := strings.TrimSpace(branch)
 	if b == "" || strings.ContainsAny(b, " \t\n") {
@@ -862,7 +892,12 @@ Example:
 	SilenceErrors: true,
 	RunE: func(cmd *cobra.Command, _ []string) error {
 		if usesProxiedServer() {
-			return HandleErrorRespectJSON("migrate schema is not supported in proxied-server mode")
+			// Proxied mode has no store-level SchemaMigrator to call: the
+			// provider open IS the migration, and by the time RunE runs it has
+			// already happened — with this verb's consent, which the root
+			// pre-run set before the open (schema.SetSharedMigrateConsent).
+			// So report, rather than refuse a verb that just did its job.
+			return reportProxiedSchemaMigrate()
 		}
 		CheckReadonly("migrate schema")
 

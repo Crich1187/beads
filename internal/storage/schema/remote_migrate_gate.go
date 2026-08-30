@@ -129,11 +129,11 @@ const (
 	gateDecisionAdoptFastForward = "adopt-ff"
 	gateDecisionForkSkew         = "fork-skew"
 	// gateDecisionSharedNoRemote (gastownhall/beads#5920): the database is
-	// shared with co-resident bd clients (a dolt sql-server) and has NO
-	// remote, so there is no fork to reason about — but migrating still
-	// promotes the schema cursor for every client at once and locks out each
-	// one still on an older binary. Unlocked by the migrate verb, --force, or
-	// AllowRemoteMigrateEnv.
+	// shared with co-resident bd clients (a dolt sql-server, directly or
+	// through proxied-server mode) and has NO remote, so there is no fork to
+	// reason about — but migrating still promotes the schema cursor for every
+	// client at once and locks out each one still on an older binary. Unlocked
+	// by the migrate verb, --force, or AllowRemoteMigrateEnv.
 	gateDecisionSharedNoRemote = "shared-no-remote"
 )
 
@@ -257,10 +257,10 @@ func (e *RemoteMigrateGateError) userBody() string {
 			"  uncommitted local changes to discard.\n"
 	case gateDecisionSharedNoRemote:
 		return "\n" +
-			"  This database is served to multiple clients (a dolt sql-server).\n" +
-			"  Applying schema migrations promotes the schema version for EVERY\n" +
-			"  client at once: bd clients still running an older version will refuse\n" +
-			"  this database until they are upgraded.\n" +
+			"  This database is served to multiple clients (dolt sql-server /\n" +
+			"  proxied-server mode). Applying schema migrations promotes the schema\n" +
+			"  version for EVERY client at once: bd clients still running an older\n" +
+			"  version will refuse this database until they are upgraded.\n" +
 			"\n" +
 			"  To migrate (explicit consent):\n" +
 			"    1. Upgrade bd on every client of this server first (or accept that\n" +
@@ -498,9 +498,9 @@ func CheckRemoteMigrateGateForRemoteWithRemoteCheckAndAdopt(ctx context.Context,
 }
 
 // CheckSharedStoreMigrateGate is the gate for a database that is served to
-// co-resident bd clients — today, an internal/storage/dolt sql-server store.
-// It adds two refusals on top of the remote-backed #4259 flow
-// (gastownhall/beads#5920):
+// co-resident bd clients — an internal/storage/dolt sql-server store, or the
+// proxied/`bd serve` unit-of-work provider. It adds two refusals on top of the
+// remote-backed #4259 flow (gastownhall/beads#5920):
 //
 //   - With NO remote, where the ordinary gate allows a silent in-place
 //     migration, it refuses unless the operator consented (the migrate verb,

@@ -294,6 +294,17 @@ workspace is written, so there is nothing to run `bd migrate schema` from
 there: do step 2 from a client that is already set up, or join and migrate in
 one step with `BD_ALLOW_REMOTE_MIGRATE=1 bd init …`.
 
+The same rules apply in **proxied-server mode**, which is a shared server
+reached through a local proxy. Two differences worth knowing:
+
+- read commands print a warning and keep serving the current schema, rather
+  than the read simply not touching it;
+- `bd serve` refuses to start against a database with pending migrations,
+  because a daemon has no operator to consent for it. Reconcile the schema
+  first with step 2, then start the daemon — or, for an unattended service,
+  put `BD_ALLOW_REMOTE_MIGRATE=1` in its environment as an explicit, auditable
+  standing consent.
+
 ## Cross-era Upgrades
 
 If you're upgrading from a much older version of bd, inspect the storage layout

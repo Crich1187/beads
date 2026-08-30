@@ -976,6 +976,57 @@ func TestMigrateUpWithLockMigrationGate(t *testing.T) {
 		}
 	})
 
+	// Regression: the gate must not fire on an init that CREATED this
+	// database. Gating on the version alone was not enough — a first pass that
+	// died part-way leaves a non-zero cursor, so the retry read "existing
+	// database, migrations pending" and the init refused to finish migrating
+	// the database it had just created (caught by uow's #5012 self-heal test).
+	// Heal authority is the durable proof of creation, so it is what the skip
+	// keys on.
+	t.Run("fresh-bootstrap heal authority skips the gate", func(t *testing.T) {
+		db, mock, err := sqlmock.New()
+		if err != nil {
+			t.Fatalf("create sql mock: %v", err)
+		}
+		defer db.Close()
+
+		ctx := context.Background()
+		conn, err := db.Conn(ctx)
+		if err != nil {
+			t.Fatalf("pin mock connection: %v", err)
+		}
+		defer conn.Close()
+
+		lockName := MigrationLockName("testdb")
+		mock.ExpectQuery(regexp.QuoteMeta("SELECT GET_LOCK(?, ?)")).
+			WithArgs(lockName, migrationLockAcquireTimeoutSeconds).
+			WillReturnRows(sqlmock.NewRows([]string{"locked"}).AddRow(1))
+		expectOnePendingMigration(t, mock)
+		mock.ExpectQuery(regexp.QuoteMeta("SELECT RELEASE_LOCK(?)")).
+			WithArgs(lockName).
+			WillReturnRows(sqlmock.NewRows([]string{"released"}).AddRow(1))
+
+		gated := 0
+		applied, err := MigrateUpWithLock(ctx, conn, "testdb",
+			WithFreshBootstrapHeal(testFreshBootstrapHealCapability(), testBootstrapEndpoint),
+			WithMigrationGate(func(context.Context, *sql.Conn) error {
+				gated++
+				return errors.New("the gate must not run on a database this init created")
+			}))
+		if err != nil {
+			t.Fatalf("MigrateUpWithLock() error = %v", err)
+		}
+		if applied != 1 {
+			t.Fatalf("MigrateUpWithLock() applied = %d, want 1", applied)
+		}
+		if gated != 0 {
+			t.Fatalf("gate calls = %d, want 0 — creating a database is consent for its schema", gated)
+		}
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Fatalf("unmet SQL expectations: %v", err)
+		}
+	})
+
 	t.Run("converged fast path never reaches the gate", func(t *testing.T) {
 		db, mock, err := sqlmock.New()
 		if err != nil {
