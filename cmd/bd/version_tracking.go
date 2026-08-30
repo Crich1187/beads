@@ -210,17 +210,7 @@ func autoMigrateOnVersionBump(beadsDir string) {
 		return
 	}
 
-	// GH#2137: If upgrading from pre-0.56, the dolt database may have been
-	// created by the old embedded Dolt mode. Recover by reinitializing.
-	if previousVersion != "" && doctor.CompareVersions(previousVersion, "0.56.0") < 0 {
-		recovered, recErr := doltserver.RecoverPreV56DoltDir(dbPath)
-		if recErr != nil {
-			debug.Logf("auto-migrate: pre-v56 recovery failed: %v", recErr)
-		}
-		if recovered {
-			debug.Logf("auto-migrate: rebuilt pre-v56 dolt database at %s", dbPath)
-		}
-	}
+	recoverPreV56IfNeeded(previousVersion, dbPath)
 
 	// Open database using factory (respects backend config from metadata.json)
 	// Use rootCtx if available and not canceled, otherwise use Background
@@ -285,6 +275,39 @@ func autoMigrateOnVersionBump(beadsDir string) {
 		debug.Logf("auto-migrate: successfully migrated database from %s to version %s", result.Previous, result.Current)
 	default:
 		debug.Logf("auto-migrate: database already at version %s", Version)
+	}
+}
+
+// recoverPreV56IfNeeded rebuilds a Dolt database left behind by the pre-0.56
+// embedded mode (GH#2137) — which means deleting .dolt — but only when the
+// recorded predecessor is an actual semantic version older than 0.56.0.
+//
+// The validity check is not redundant with the comparison. CompareVersions
+// scans every dot-separated part with %d and leaves whatever it cannot read at
+// 0, so any non-semver string writeLocalVersion has recorded compares as
+// pre-0.56 and routes a current workspace into this destructive path:
+// Homebrew's "HEAD-<shortsha>" from a --HEAD install (#5603), and the
+// v-prefixed Go pseudo-version a `go install`-built bd stamps (#5650). Neither
+// is a pre-0.56 workspace; both would lose their database.
+//
+// IsValidSemver rejects exactly the shapes CompareVersions misreads, so this
+// gate can only remove predecessors from the recovery set, never add one: a
+// stamp that reaches RecoverPreV56DoltDir today and still parses keeps its
+// recovery unchanged.
+func recoverPreV56IfNeeded(previousVersion, dbPath string) {
+	if !doctor.IsValidSemver(previousVersion) {
+		return
+	}
+	if doctor.CompareVersions(previousVersion, "0.56.0") >= 0 {
+		return
+	}
+
+	recovered, recErr := doltserver.RecoverPreV56DoltDir(dbPath)
+	if recErr != nil {
+		debug.Logf("auto-migrate: pre-v56 recovery failed: %v", recErr)
+	}
+	if recovered {
+		debug.Logf("auto-migrate: rebuilt pre-v56 dolt database at %s", dbPath)
 	}
 }
 

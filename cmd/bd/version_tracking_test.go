@@ -395,6 +395,69 @@ func TestMaybeShowUpgradeNotification(t *testing.T) {
 	}
 }
 
+// writePreV56DoltFixture builds the workspace shape RecoverPreV56DoltDir
+// destroys: a .dolt/ directory with no .bd-dolt-ok compatibility marker. It
+// returns a path inside .dolt/ whose survival tells the caller whether the
+// recovery ran.
+func writePreV56DoltFixture(t *testing.T) (doltDir, sentinel string) {
+	t.Helper()
+	doltDir = t.TempDir()
+	sentinel = filepath.Join(doltDir, ".dolt", "sentinel.txt")
+	if err := os.MkdirAll(filepath.Dir(sentinel), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(sentinel, []byte("live workspace data"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return doltDir, sentinel
+}
+
+// TestRecoverPreV56IfNeeded_OnlySemverPredecessorsAreRecovered pins the
+// destructive edge from #5603/#5625: CompareVersions reads any unparsable
+// version part as 0, so a non-semver predecessor compares as pre-0.56 and
+// hands a live workspace to a path that deletes .dolt. The Homebrew --HEAD
+// stamp and the v-prefixed Go pseudo-version from #5650 are both such
+// predecessors and both reach this call today.
+func TestRecoverPreV56IfNeeded_OnlySemverPredecessorsAreRecovered(t *testing.T) {
+	tests := []struct {
+		name         string
+		previous     string
+		wantRecovery bool
+	}{
+		{name: "brew HEAD stamp", previous: "HEAD-f925f3f"},
+		{name: "bare brew HEAD stamp", previous: "HEAD"},
+		{name: "brew HEAD stamp with revision", previous: "HEAD-f925f3f_1"},
+		{name: "go pseudo-version", previous: "v1.1.1-0.20260805093327-bf97b73749ac"},
+		{name: "unreadable witness", previous: "not-a-version"},
+		{name: "no predecessor", previous: ""},
+		{name: "current release", previous: "1.1.2"},
+		{name: "0.56.0 itself", previous: "0.56.0"},
+		{name: "pre-0.56 release", previous: "0.55.4", wantRecovery: true},
+		{name: "pre-0.56 pre-release", previous: "0.55.4-rc.1", wantRecovery: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			doltDir, sentinel := writePreV56DoltFixture(t)
+
+			recoverPreV56IfNeeded(tt.previous, doltDir)
+
+			_, err := os.Stat(sentinel)
+			if tt.wantRecovery {
+				// The reinitializing `dolt init` may fail in a bare
+				// environment; the removal that precedes it is the assertion.
+				if !os.IsNotExist(err) {
+					t.Fatalf("predecessor %q: expected pre-v56 recovery to rebuild .dolt, but %s survived", tt.previous, sentinel)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("predecessor %q: pre-v56 recovery deleted a live .dolt: %v", tt.previous, err)
+			}
+		})
+	}
+}
+
 func TestAutoMigrateOnVersionBump_NoUpgrade(t *testing.T) {
 	// Save original state
 	origUpgradeDetected := versionUpgradeDetected
