@@ -1474,6 +1474,7 @@ Non-interactive mode (--non-interactive or BD_NON_INTERACTIVE=1):
 					printBootstrapRemoteBehindGuidance(os.Stderr, gateErr, syncURL, "bd init")
 				} else {
 					fmt.Fprint(os.Stderr, gateErr.UserMessage())
+					printInitJoinGuidance(os.Stderr, gateErr)
 				}
 				return &exitError{Code: 1}
 			}
@@ -3436,6 +3437,15 @@ func initGlobalDatabaseConfig(ctx context.Context, projectCfg *dolt.Config, quie
 	globalStore, err := newDoltStore(ctx, globalCfg)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: failed to open global database: %v\n", err)
+		// The gate's own block prescribes `bd migrate schema`, which migrates
+		// the PROJECT database — on this path that leaves the global database
+		// exactly as refused. Name the command that actually reaches it
+		// (#5920); this warning is the only place the global refusal surfaces.
+		if schema.IsRemoteMigrateGateError(err) {
+			fmt.Fprintf(os.Stderr,
+				"  The global database is shared by every workspace on this server. To migrate it, run:\n        %s\n",
+				schema.SharedConsentCommandGlobal)
+		}
 		return
 	}
 	defer func() { _ = globalStore.Close() }()

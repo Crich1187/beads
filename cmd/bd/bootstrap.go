@@ -1002,6 +1002,28 @@ func executeSyncAction(ctx context.Context, plan BootstrapPlan, cfg *configfile.
 	return nil
 }
 
+// printInitJoinGuidance corrects the one thing the gate's shared-store block
+// gets wrong when `bd init` is the caller: it says to run `bd migrate schema`,
+// but this init failed before writing metadata.json, so there is no workspace
+// here to run it from (gastownhall/beads#5920). A client JOINING an existing,
+// behind shared server has to be told where the command actually works.
+//
+// Only the shared-store arm needs this. The remote-backed refusals from init
+// are already handled by printBootstrapRemoteBehindGuidance above, and their
+// remedies are not workspace-local in the same way.
+func printInitJoinGuidance(w io.Writer, e *schema.RemoteMigrateGateError) {
+	if e.Decision != "shared-no-remote" {
+		return
+	}
+	fmt.Fprintf(w,
+		"\n  This workspace was NOT created — bd init stopped before writing\n"+
+			"  .beads/metadata.json, so `%s` cannot be run from here yet.\n"+
+			"  Either run it from a workspace already set up against this server, or\n"+
+			"  join and migrate in one step once every client is upgraded:\n"+
+			"        %s=1 bd init …\n",
+		schema.SharedConsentCommand, schema.AllowRemoteMigrateEnv)
+}
+
 // printBootstrapRemoteBehindGuidance explains a remote-migrate gate refusal in
 // bootstrap terms. The gate's generic remedy ("adopt the migrated database:
 // bd bootstrap") is wrong from inside a bootstrap-style clone — the database

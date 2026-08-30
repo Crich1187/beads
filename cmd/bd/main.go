@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -326,6 +327,40 @@ func isForcedMigrate(cmd *cobra.Command) bool {
 	}
 	force, _ := cmd.Flags().GetBool("force")
 	return force
+}
+
+// printGlobalDatabaseConsentHint adds the one thing the gate's own block
+// cannot know: which database this invocation was aimed at. Under --global the
+// open targets `beads_global`, so the block's `bd migrate schema` would
+// migrate the PROJECT database and leave the refusal in place — the working
+// remedy is the same verb with the same flag.
+func printGlobalDatabaseConsentHint(w io.Writer) {
+	if !globalFlag {
+		return
+	}
+	fmt.Fprintf(w,
+		"\n  This command targeted the global database (--global), so run the\n"+
+			"  migrate step with the same flag:\n"+
+			"        %s\n",
+		schema.SharedConsentCommandGlobal)
+}
+
+// isSchemaMigrateVerb reports whether cmd is `bd migrate schema` — the one
+// invocation in which the operator asked for a schema migration by name. That
+// request is the consent the shared-store gate wants for a database with no
+// remote (#5920); see schema.SetSharedMigrateConsent.
+//
+// Deliberately just this one command, not the `bd migrate` tree. Bare
+// `bd migrate` reconciles version/repo-id/clone-id metadata and never applies
+// a migration itself, and its flag modes are further from schema work still:
+// `bd migrate --update-repo-id` is repo-fingerprint surgery after a git remote
+// change, and treating it as consent would let a repo-ID update promote the
+// schema for every co-resident client as a side effect. `bd migrate sync`,
+// `bd migrate hooks`, and the mode-switch verbs consent to nothing either.
+// The operator who does want to migrate has the verb this names, and
+// `--force` still unlocks from either migrate command.
+func isSchemaMigrateVerb(cmd *cobra.Command) bool {
+	return cmd == migrateSchemaCmd
 }
 
 // forcedMigratePreviewFlag returns the name of a preview flag (--dry-run,
@@ -1456,6 +1491,14 @@ var rootCmd = &cobra.Command{
 		// root command ever be re-run in-process (tests, a future server mode).
 		schema.SetForceAllowRemoteMigrate(forcedMigrate)
 
+		// Typing `bd migrate schema` is consent to migrate a shared database
+		// that has no remote (#5920): there is no cross-clone fork to risk,
+		// only the co-resident lockout the operator is asking to accept. A
+		// preview withholds it — `bd migrate schema --dry-run` must not
+		// migrate on the way to printing what it would do. Same set-or-clear
+		// discipline as the --force override above.
+		schema.SetSharedMigrateConsent(isSchemaMigrateVerb(cmd) && !previewMode)
+
 		// Auto-migrate database on version bump (bd-jgxi).
 		// Runs for ALL non-preview commands (including read-only ones) because
 		// the migration opens its own store connection, writes the version
@@ -1685,6 +1728,7 @@ var rootCmd = &cobra.Command{
 					handleRemoteMigrateGateJSON(gateErr)
 				} else {
 					fmt.Fprint(os.Stderr, gateErr.UserMessage())
+					printGlobalDatabaseConsentHint(os.Stderr)
 				}
 				return SilentExit()
 			}
