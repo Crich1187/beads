@@ -573,6 +573,39 @@ which dumps the entire release history.)
   database** (missing / denied / wrong-session attribution); `--init-if-missing`
   is honored in proxied-server mode.
 
+- **The aux row re-key survives dolt#11131-class encoding drift** instead of
+  failing mid-upgrade with a raw `invalid hash length` error. Drifted tables are
+  skipped with a warning, recorded clone-locally in `aux_row_rekey_drifted`, and
+  re-keyed on a later pass, rather than leaving the database unopenable. This
+  already reached 1.1.x and v1.2.2 users — it is the [1.1.2] fix — and lands on
+  the main line here, so a store upgrading from v1.2.2 is not newly exposed
+  (#5064, #4380). Diagnosis and fix by @marcodelpin, carried and reworked by
+  @maphew.
+
+- **Server mode honors `Config.LenientOpen`**, so the dirty-table guard's
+  documented recovery is executable. The refusal tells you to run
+  `bd dolt commit` / `bd vc commit`, but against an external Dolt server those
+  commands could not open the store to do it — the flag reached server mode and
+  `newServerMode` never read it, while the field's own doc comment said "Ignored
+  in server mode". That left the #4566 deadlock intact for exactly the case with
+  no way out: embedded mode can move the database directory aside and
+  `bd bootstrap`, and there is no equivalent against a shared server. Fixed by
+  @Toady00 (#5783, #5781).
+
+- **`bd bootstrap` probes git remotes for Dolt data instead of rejecting them
+  outright** (#6037, #5743, #5663). `bd init` deliberately persists a
+  git-origin-derived `sync.remote` into the tracked `.beads/config.yaml` — a git
+  origin is a valid Dolt remote before `refs/dolt/data` exists, because the first
+  `bd dolt push` creates that ref on the same remote — but bootstrap classified
+  those URLs as code-repo URLs and returned before the origin auto-detect that
+  would have hydrated the clone, `git+https://` and `git+ssh://` included.
+  Committed `sync.remote` values from earlier releases hydrate again. The failure
+  was silent because one outcome code covered both "a database already exists,
+  nothing to do" and "I refused and left you with nothing": bootstrap printed
+  `✓ Database already exists`, exited 0, and created nothing, after which
+  `bd init --reinit-local` pointed back at `bd bootstrap` in a closed loop.
+  Bootstrap now exits non-zero whenever it declines to set up a database.
+
 - **`--set-metadata` again stores numbers/booleans/null as typed JSON scalars**
   (v1.2.2 behavior); string-forcing lives on `--metadata-json`. Values written by
   in-window dev builds are left as strings; re-apply the flag to retype a key.
@@ -817,7 +850,9 @@ which dumps the entire release history.)
 
 <!-- PROVISIONAL: the four entries below are the proposed changelog lines from
      #6055 and #6056, which were still OPEN when this rollup was written.
-     DELETE THIS BLOCK before tagging if either PR does not land. -->
+     The RC is gated on both merging, so this fence comes off at RC-prep time:
+     drop these two comment lines once they have landed, or delete the whole
+     block (entries included) if either PR does not land. -->
 
 - Proxied-server mode (and `bd serve`) ran schema migrations on every store
   open without consulting any migration gate, so an upgraded client silently
