@@ -61,6 +61,39 @@ func TestPRCIGateRequiresPolicyAndLintWrappers(t *testing.T) {
 	}
 }
 
+func TestPRComplexityReportIsAdvisoryAndBestEffort(t *testing.T) {
+	workflow := readCIWorkflow(t, "pr.yml")
+	job := workflow.job(t, "complexity-report")
+	if job.RunsOn != "ubuntu-latest" || job.TimeoutMinutes != 0 || job.ContinueOnError {
+		t.Errorf("complexity job must have no job timeout/continue-on-error: runs-on=%q timeout=%d continue=%v", job.RunsOn, job.TimeoutMinutes, job.ContinueOnError)
+	}
+	if contains(job.Needs, "ci-gate") {
+		t.Errorf("complexity report unexpectedly depends on ci-gate: %v", job.Needs)
+	}
+	for _, name := range []string{"Set up Go", "Install gocyclo", "Generate complexity report", "Annotate unavailable complexity report", "Upload complexity report"} {
+		step := job.step(t, name)
+		if step.TimeoutMinutes <= 0 || step.ContinueOnError != true {
+			t.Errorf("complexity step %q is not bounded/best-effort: timeout=%d continue=%v", name, step.TimeoutMinutes, step.ContinueOnError)
+		}
+	}
+	checkout := job.Steps[0]
+	if checkout.TimeoutMinutes <= 0 || checkout.ContinueOnError != true {
+		t.Errorf("complexity checkout is not bounded/best-effort: timeout=%d continue=%v", checkout.TimeoutMinutes, checkout.ContinueOnError)
+	}
+	report := job.step(t, "Generate complexity report")
+	if report.ID != "generate-complexity" || report.If != "always()" || !strings.Contains(report.Run, "complexity.sh diff") || !strings.Contains(report.Run, "COMPLEXITY_BASE_REF=origin/main") {
+		t.Errorf("complexity report step missing diff/always contract: id=%q if=%q run=%q", report.ID, report.If, report.Run)
+	}
+	annotate := job.step(t, "Annotate unavailable complexity report")
+	if annotate.If != "always()" || !strings.Contains(annotate.Run, "::warning") {
+		t.Errorf("complexity annotation step missing always/warning contract: if=%q run=%q", annotate.If, annotate.Run)
+	}
+	gate := workflow.job(t, "ci-gate")
+	if contains(gate.Needs, "complexity-report") {
+		t.Errorf("ci-gate must not require advisory complexity report: %v", gate.Needs)
+	}
+}
+
 func TestPRWorkflowExercisesWindowsBenchmarkEnvScrubbing(t *testing.T) {
 	workflow := readCIWorkflow(t, "pr.yml")
 	job := workflow.job(t, "pr-preflight-platforms")
