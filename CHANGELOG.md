@@ -276,6 +276,35 @@ which dumps the entire release history.)
 
 ### Changed
 
+- Shared Dolt databases (sql-server mode) no longer auto-apply schema
+  migrations on a version bump. Migrating a shared database promotes the
+  schema for every connected bd client at once and locks out clients still
+  on an older binary, so bd now refuses without explicit consent: run
+  `bd migrate schema` once after upgrading every client, or set
+  `BD_ALLOW_REMOTE_MIGRATE=1` in scripted use. Reads keep working on the
+  current schema meanwhile. Embedded (single-user) databases still
+  auto-migrate silently, unchanged. (#5920)
+
+- The smart migration gate's "auto-migrate as safe first-mover" and
+  auto-fast-forward arms are now embedded-only. On a shared server the gate
+  always stops for consent, because neither argument can observe the other
+  clients attached to that server. (#5920, #4516)
+
+- The newly exported Go packages (`backend`, `backend/conformance`, `beadserrors`,
+  `issueops`, `journalops`, `memoryops`, `schema`, `test/conformance`) are marked
+  EXPERIMENTAL: they are not yet covered by the project's compatibility promise and
+  may change in a minor release. Pin an exact beads version and re-run the
+  conformance suite on every bump.
+
+- **The optimistic-concurrency token is now a JSON string** — responses carry
+  `revision` as an opaque decimal string and `expected_version` must be sent as
+  that string. JSON-number tokens exceeded JavaScript's 2^53 integer precision.
+  This member never shipped in a tagged release.
+
+- CI: migration-test and upgrade-smoke now seed and assert wisp-plane data
+  (wisps, wisp deps/comments, leases, events, ignored-track cursor) across
+  v1.0.1/v1.1.x/v1.2.2 → candidate upgrades.
+
 - **`--profile` is now `--cpu-profile`, with no alias**
   ([#5126](https://github.com/gastownhall/beads/pull/5126), bd-ugz). The
   persistent flag that writes a CPU profile is spelled `--cpu-profile`; the old
@@ -360,20 +389,25 @@ which dumps the entire release history.)
   injected. Symlinked and git-tracked hook paths are refused outright, before
   anything is written.
 
-- **Write commands now refuse to run while a MIGRATION-FREEZE sentinel sits
-  at the town root** (dc-6jaq), mirroring the gate the gt CLI already applies
-  to `gt mail send`/`nudge`/`sling`/`assign`. `bd create`/`update`/`close`/
-  `remember`/`import` and every other command gated by `CheckReadonly`
-  (~120 call sites, `bd q` included) now print `⛔ town is frozen for
-  migration (by <operator>)` and exit 1 instead of writing to a store mid-
-  migration. The check runs twice: once early in the root command, before
-  version-bump auto-migration or JSONL auto-import can touch the store, and
-  again at each write command's own chokepoint. Read commands (`list`,
-  `show`, `ready`, …) keep working during a freeze — the same early check
-  also skips version tracking and auto-migration for them, so a frozen store
-  is never rewritten just because someone ran a read. `--dry-run`/`--inspect`
-  previews are blocked at the per-command chokepoint instead, same as strict
-  `--readonly` already blocks them. Clear the freeze with `gt migrate thaw`.
+- **Write commands refuse to run while a migration freeze marker is present**
+  (dc-6jaq). When a file named `MIGRATION-FREEZE` exists in the workspace
+  directory, the working directory, or any ancestor of either — or at the
+  path named by `BD_MIGRATION_FREEZE_FILE`, which is authoritative when set
+  — `bd create`/`update`/`close`/`remember`/`import` and every other write
+  command (~120 call sites, `bd q` included), plus the destructive
+  `bd init --reinit-local` and `bd bootstrap`, print `⛔ workspace is frozen
+  for migration` naming the marker's path and exit **14**, a distinct code
+  scripts can branch on, instead of writing to a store mid-migration.
+  Operators freeze a workspace by creating the file (optionally
+  `operator<TAB>RFC3339 timestamp<TAB>reason` on one line, echoed back in
+  the refusal) and thaw it by removing the file. Read commands (`list`,
+  `show`, `ready`, …) keep working during a freeze, and bd's own maintenance
+  stands down with them — version tracking, auto-migration, JSONL
+  auto-import, Dolt auto-commit, auto-backup, auto-export and auto-push are
+  all skipped, so a frozen store is never rewritten just because someone ran
+  a read. A running `bd serve` is not gated: stop it before freezing. If bd
+  cannot tell whether a marker is present, it refuses rather than assuming
+  the workspace is open.
 
 - **`bd dep add` names the implicit `type=blocks` default, but only to an
   interactive operator** (#5854). Creating an edge with no `-t/--type` silently
@@ -479,6 +513,73 @@ which dumps the entire release history.)
   or mixed runs, `__` and `---` included, are unaffected and still collapse.
 
 ### Fixed
+
+- **Server-mode issue mutations no longer revert concurrent writers' committed
+  rows** ([#5740](https://github.com/gastownhall/beads/pull/5740)). The
+  issue-mutation path ran `DOLT_ADD`/`DOLT_COMMIT` inside its still-open SQL
+  transaction; `DOLT_ADD` stages the whole table as of the transaction's
+  BEGIN-time root, and the Dolt commit was minted before the commit-time merge
+  that reconciles concurrent writers — so a mutation could silently write every
+  row another session had committed during its window back to that session's
+  BEGIN-time value, seen in production as claims reverting minutes after they
+  were made. The Dolt commit now runs after the SQL transaction commits, against
+  the post-merge working set. Its failure is logged rather than returned: the
+  data is durably committed by then and rides the next Dolt commit, and treating
+  an applied mutation as failed is what made retries double-apply and claim
+  verification disown claims the caller held. Reported and fixed by
+  @nova-submodules.
+
+- **Removed-backend rejection now detects an existing Dolt database** and gives
+  the exact `metadata.json` heal (change `"backend"` to `"dolt"`, or delete the
+  field) instead of a destructive export/reinitialize path. Workspaces that bd
+  v1.2.x opened as Dolt despite a stale `"backend"` value are one edit from
+  healthy, and the message now says so. Rejection remains fail-closed and
+  read-only — no storage database is opened or modified — and still exits 1.
+  (Detection helper ported from @steveyegge's #4740.)
+
+- `bd migrate` no longer aborts with a duplicate-primary-key error when the same
+  dependency edge exists in two typed target columns; duplicate edges are now
+  merged deterministically (issue-ref wins over wisp/external), renaming an issue
+  no longer leaves its dependency rows on a stale primary key, and databases left
+  half-rekeyed by earlier binaries are detected and repaired on the next
+  migration pass (#5268).
+
+- **Legacy tracked `ignored_schema_migrations` self-heals** by untracking it at
+  open time, unwedging `bd dolt pull` on upgraded databases (#4356).
+
+- **A v1.1.x/v1.2.x ignored-migration cursor is believed** when
+  `leases.granted_node` is merely not yet migrated, so upgrades apply only the
+  pending ignored tail instead of replaying `ignored/0007` and silently
+  restamping `wisps.updated_at` (#5981 class, #5366 follow-up).
+
+- **Auto-export heals after `bd delete` instead of permanently refusing** — the
+  orphan guard proves deletions against the store's own history (embedded and
+  server modes), stores wedged by earlier binaries recover on first run, and
+  `export-state.json` is now versioned (#5896).
+
+- **`bd flatten` and `bd compact` now finish with a full Dolt GC** (all
+  generations), so re-running them on a previously-GC'd store actually reclaims
+  the orphaned history and retires orphaned `--as-of` addresses; `bd gc` gains
+  `--full` and hints when a default pass reclaims little (#5907).
+
+- **`--storage-class` is honored on the proxied-server and `--file` routes** and
+  rejected as a plan-wide `--graph` flag; it was silently ignored there.
+
+- **Delete and cascade `dep_remove` journal rows are attributed to the
+  requesting actor** (#5985); `bd events export`/`tail` now say when the journal
+  is disabled.
+
+- **Truthful errors when a server-scoped credential cannot reach the requested
+  database** (missing / denied / wrong-session attribution); `--init-if-missing`
+  is honored in proxied-server mode.
+
+- **`--set-metadata` again stores numbers/booleans/null as typed JSON scalars**
+  (v1.2.2 behavior); string-forcing lives on `--metadata-json`. Values written by
+  in-window dev builds are left as strings; re-apply the flag to retype a key.
+
+- **`bd create --json` (and `POST /v0/beads/issues`) again echo sub-second
+  RFC3339Nano timestamps**; reads (`show`/`list`) remain second-precision as in
+  v1.2.2.
 
 - **`bd purge` and `bd prune` select candidates by TIER, so a typed wisp is
   ephemeral however it was minted**
@@ -714,7 +815,64 @@ which dumps the entire release history.)
   `ParentID`. Programmatic callers that set them got unfiltered results back and
   no error — a full list where a scoped one was asked for.
 
+<!-- PROVISIONAL: the four entries below are the proposed changelog lines from
+     #6055 and #6056, which were still OPEN when this rollup was written.
+     DELETE THIS BLOCK before tagging if either PR does not land. -->
+
+- Proxied-server mode (and `bd serve`) ran schema migrations on every store
+  open without consulting any migration gate, so an upgraded client silently
+  migrated a shared database — including from read-only commands. The gate now
+  runs on that path too: read commands warn and continue on the current
+  schema, writes refuse, and `bd serve` fails to start until the schema is
+  reconciled. (#5043)
+
+- `bd migrate schema` now works in proxied-server mode instead of refusing.
+  The migration runs during the provider open under the verb's consent. (#5043)
+
+- Migration-gate and schema-skew failures on the proxied open path and at
+  `bd serve` startup now print their full actionable block instead of a
+  single truncated line. (#5043)
+
+- **`bd doctor` now honors strict `--readonly` and the migration freeze**
+  (#6028). `bd doctor --fix` / `--clean` refuse to mutate under either gate —
+  the freeze refusal exits 14 and names the marker, and there is no doctor-side
+  override — and plain `bd doctor` diagnosis no longer rewrites `.local_version`
+  or auto-applies schema migrations while a freeze is active or `--readonly` is
+  set; it reports the pending migration instead. Both gates key on the directory
+  doctor was pointed at, not just the one it was launched in. Diagnosis itself
+  keeps working under a freeze.
+
+<!-- END PROVISIONAL -->
+
+### Security
+
+- **Release binaries now build with Go 1.26.7** instead of 1.26.5, closing seven
+  standard-library advisories reachable from `bd`: quadratic `net/url` path
+  resolution, `html/template` JavaScript-regexp context tracking, unbounded
+  post-handshake `crypto/tls` messages, a missing `ReadHeaderTimeout` on
+  `net/http`'s unencrypted HTTP/2 check, unbounded recursion in `encoding/xml`
+  and `encoding/asn1`, and the `x/net/idna` Punycode bug in `net/http`'s
+  vendored copy. `bd serve` and bd's outbound TLS calls exercise these paths.
+  The `go` directive stays at 1.26.5, so nothing changes for code importing the
+  beads module.
+
+- **Dependency bumps clearing all 25 open advisories.** `golang.org/x/crypto`
+  0.55.0, `golang.org/x/mod` 0.40.0, `klauspost/compress` 1.18.7,
+  `moby/go-archive` 0.3.3, `kin-openapi` 0.144.0 with `oapi-codegen` 2.7.1, and
+  a refreshed `integrations/beads-mcp/uv.lock`. None of the fixed code was
+  reachable from the shipped `bd` binary: the go-archive and x/crypto/ssh paths
+  are testcontainers-only, the compress bug is in the `s2` codec bd does not
+  link, and the kin-openapi critical is in `openapi3filter` middleware that
+  enters the graph only through the `tool` directive for spec codegen. No
+  behavior change; no dolt bump was required.
+
 ### Documentation
+
+- **Known limitation: multi-rig prefix routing (`routes.jsonl`) is not
+  supported with proxied-server rigs** — cross-rig bead gates stay pending,
+  `bd close` of a bead gate in proxied-server mode requires `bd gate check`
+  or `--force`, and routed lookups cannot open proxied-server targets
+  (#5861).
 
 - **The heartbeat/re-home invariant and the two states it can strand are now
   documented where the code lives** (wy-sp2l4): a heartbeat proves the holder
