@@ -65,6 +65,14 @@ func TestIsSchemaMigrateVerbScope(t *testing.T) {
 // returns one error type for several decisions whose correct actions differ,
 // and the migrate verb does not unlock the remote-backed ones at all.
 func TestNoticeSharedMigrateRefusalPerDecision(t *testing.T) {
+	// The notice self-suppresses under --json, so if jsonOutput arrives here
+	// already true, every case below reads as "the notice printed nothing" —
+	// which is exactly how a leak from an earlier test in the package
+	// presents, and is how this test failed in full-package runs while passing
+	// under a narrow -run. Pin it, so a failure here can only ever be about
+	// this code.
+	pinJSONOutput(t, false)
+
 	for _, tt := range []struct {
 		decision string
 		want     string
@@ -100,9 +108,7 @@ func TestNoticeSharedMigrateRefusalPerDecision(t *testing.T) {
 	// --json puts a machine-readable gate block on this same stream a moment
 	// later; prose prepended to it makes the documented contract unparseable.
 	t.Run("suppressed in json mode", func(t *testing.T) {
-		orig := jsonOutput
-		jsonOutput = true
-		defer func() { jsonOutput = orig }()
+		pinJSONOutput(t, true)
 		out := captureNoticeStderr(t, func() {
 			noticeSharedMigrateRefusal(&schema.RemoteMigrateGateError{
 				CurrentVersion: 65, LatestVersion: 66, Pending: 1,
