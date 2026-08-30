@@ -17,21 +17,27 @@ withheld. Read the upgrade notes before installing.
 
 ### Upgrade notes
 
-**The first invocation migrates your schema, in place, from v53 to v66.** A
-v1.2.2 (or any 1.1.x) database sits at main-series schema v53; this binary
-knows v66, so the first command that opens the store applies 13 main-series
-migrations, `0054_add_lease_columns` through `0066_add_events_journal_actor`.
-Two of those passes rewrite rows rather than just reshaping tables — the
-aux-row id rekey and the `events` dolt_ignore flip described under **Changed** —
-so on a large store the first invocation is *noticeably* slower than the ones
-after it. It is crash-resumable and picks up where it left off, but do not
-interrupt it if you can avoid it.
+**On an embedded or local store, the first invocation migrates your schema, in
+place, from v53 to v66.** A v1.2.2 (or any 1.1.x) database sits at main-series
+schema v53; this binary knows v66, so the first command that opens the store
+applies 13 main-series migrations, `0054_add_lease_columns` through
+`0066_add_events_journal_actor`. Two of those passes rewrite rows rather than
+just reshaping tables — the aux-row id rekey and the `events` dolt_ignore flip
+described under **Changed** — so on a large store the first invocation is
+*noticeably* slower than the ones after it. It is crash-resumable and picks up
+where it left off, but do not interrupt it if you can avoid it.
+
+**A shared Dolt sql-server is never auto-migrated** (#5920, #6048): migrating it
+promotes the schema for every client at once, so it waits for explicit consent
+via `bd migrate schema`. Remote-backed stores keep their existing
+designated-migrator gate. Upgrade all of that server's clients *first* — see
+[Shared servers](https://beads.gascity.com/getting-started/upgrading#shared-servers).
 
 **The counter restarts partway through, and that is not a loop.** The
 clone-local (dolt_ignored) series runs after the main one, through the same
-printer and its own numbering, and it moves 0011 → 0025 on this upgrade. So the
-run is about **27 migrations**, not 13, and what you see on stderr is 13 lines
-counting up to 0066 followed by 14 lines starting again at 0012:
+printer and its own numbering, and it moves 0011 → 0026 on this upgrade. So the
+run is about **28 migrations**, not 13, and what you see on stderr is 13 lines
+counting up to 0066 followed by 15 lines starting again at 0012:
 
 ```
 Applying migration 0065: widen_wisp_comments_text…
@@ -566,9 +572,9 @@ which dumps the entire release history.)
   `EmbeddedDoltStore` implements neither `DiffStore` nor `StateHasher`, so in
   the default embedded mode the incremental path is inert (`incremental
   skipped — store does not implement DiffStore`) and every cycle is still a
-  full export. The deletion-proof guard below is likewise server-mode only, so
-  [#5896](https://github.com/gastownhall/beads/issues/5896) stays open for
-  embedded mode, where `bd delete` still wedges auto-export.
+  full export. The deletion-proof guard below started out server-mode only for
+  the same reason; [#5896](https://github.com/gastownhall/beads/issues/5896) is
+  now closed for embedded mode too — see the store-history heal entry below.
 
   **Caveat: the diff anchor only advances on real commits.** In server mode
   dolt auto-commit is off, so with no commits being made the anchor stays put

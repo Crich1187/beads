@@ -175,10 +175,12 @@ bd backup sync                         # take the snapshot
 
 #### What the migration looks like
 
-The first command you run after installing applies the whole set, in place. The
-main series runs 0054 → 0066 (13 migrations), and then the clone-local series
-runs through the same printer with its own numbering, 0012 → 0025 — so it is
-about **27 migrations**, and the counter visibly restarts partway through:
+On an embedded or local store, the first command you run after installing
+applies the whole set, in place. (A shared `dolt sql-server` is never
+auto-migrated — see [Shared servers](#shared-servers) below.) The main series
+runs 0054 → 0066 (13 migrations), and then the clone-local series runs through
+the same printer with its own numbering, 0012 → 0026 — so it is about
+**28 migrations**, and the counter visibly restarts partway through:
 
 ```
 Applying migration 0065: widen_wisp_comments_text…
@@ -202,6 +204,10 @@ client still on 1.2.2 stops working. Check for a second binary earlier in your
 `PATH` with `which -a bd`, and restart any long-running `bd serve` — noting that
 `bd --readonly serve` is now refused outright, so a server scripted with that
 flag will not come back up until you drop it.
+
+If the store is a shared `dolt sql-server` rather than a local one, follow
+[Shared servers](#shared-servers) below: 1.3.0 will not migrate it without
+explicit consent, precisely so the fleet upgrade can come first.
 
 If you need to go back, the rollback is a schema-cursor rollback rather than a
 downgrade of the data — see
