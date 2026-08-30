@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/steveyegge/beads/internal/configfile"
+	"github.com/steveyegge/beads/internal/doltretry"
 	"github.com/steveyegge/beads/internal/githooksenv"
 	"github.com/steveyegge/beads/internal/gittraceenv"
 	"github.com/steveyegge/beads/internal/lockfile"
@@ -72,19 +73,24 @@ func BootstrapFromRemoteWithDB(ctx context.Context, doltDir, remoteURL, database
 	// Clone into <doltDir>/<database>/ so the embedded driver can find it.
 	// `dolt clone <url> <target>` creates <target>/.dolt/ directly.
 	cloneTarget := filepath.Join(doltDir, database)
-	// Record whether the target already existed before this clone attempt.
-	// If it did, the failed-clone cleanup below must never touch it: it
-	// wasn't created by us, so it could be a pre-existing Dolt repo (e.g.
-	// from an earlier bootstrap that a stale/empty doltExists() check
-	// missed) that we must not delete.
 	targetPreExisted := pathExists(cloneTarget)
-	cmd := bootstrapCloneCmd(ctx, remoteURL, cloneTarget)
-	if output, err := cmd.CombinedOutput(); err != nil {
-		if targetPreExisted {
+	if targetPreExisted {
+		cmd := bootstrapCloneCmd(ctx, remoteURL, cloneTarget)
+		if output, err := cmd.CombinedOutput(); err != nil {
 			return false, fmt.Errorf("dolt clone failed: %w\nOutput: %s\nClone target %q already existed before this attempt; left untouched to avoid deleting a pre-existing Dolt repo", err, output, cloneTarget)
 		}
-		cleaned, cleanupErr := removeFailedCloneTargetWithRetry(cloneTarget)
-		return false, formatFailedCloneTargetError(err, output, cloneTarget, cleaned, cleanupErr)
+		fmt.Fprintf(os.Stderr, "Bootstrapped from remote: %s\n", remoteURL)
+		return true, nil
+	}
+
+	if err := doltretry.CloneWithRetry(ctx, cloneTarget, func() error {
+		cmd := bootstrapCloneCmd(ctx, remoteURL, cloneTarget)
+		if output, err := cmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("dolt clone failed: %w\nOutput: %s", err, output)
+		}
+		return nil
+	}); err != nil {
+		return false, err
 	}
 
 	fmt.Fprintf(os.Stderr, "Bootstrapped from remote: %s\n", remoteURL)
