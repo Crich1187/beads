@@ -1279,6 +1279,10 @@ Non-interactive mode (--non-interactive or BD_NON_INTERACTIVE=1):
 			}
 		}
 		if syncFromRemote {
+			// A raw https:// forge URL would route through Dolt's remotesapi
+			// client and spin forever (#4421); its git+ form routes through
+			// the git remote factory. Non-forge URLs are untouched (GH#3339).
+			syncURL = doltRemoteURL(syncURL)
 			cloneCfg := initTimeCloneConfig(initServerMode, serverHost, serverPort, serverSocket, serverUser, dbName)
 			disposition, err := runInitRemoteClone(syncURL, func(remoteURL string) error {
 				return cloneFromRemoteWithMode(ctx, beadsDir, remoteURL, dbName, cloneCfg, initRemoteCloneMode(initServerMode, externalServer))
@@ -1494,8 +1498,14 @@ Non-interactive mode (--non-interactive or BD_NON_INTERACTIVE=1):
 		// falling back to JSONL-as-sync. Gateway mode skips it: the hosted
 		// server owns the database, so DOLT_REMOTE('add', ...) must not run
 		// against it (see shouldWriteInitDoltRemote).
+		// The URL is routed here too, not just on the clone path: the
+		// no-Dolt-data-yet case (the pre-first-push wiring this is for) never
+		// clones, so without routing a raw https forge URL would be stored
+		// verbatim in dolt_remotes and the *first* `bd dolt push` would take
+		// it to the remotesapi client — the #4421 storm, one leg further down
+		// (#5743).
 		if shouldWriteInitDoltRemote(doltCfg.Gateway, syncURL, syncFromRemote, syncURLFromConfig, syncURLFromGitOrigin, isDoltLocalOnly()) {
-			configureInitDoltRemote(ctx, store, syncURL, quiet)
+			configureInitDoltRemote(ctx, store, doltRemoteURL(syncURL), quiet)
 		}
 
 		// === CONFIGURATION METADATA (Pattern A: Fatal) ===
@@ -1730,7 +1740,9 @@ Non-interactive mode (--non-interactive or BD_NON_INTERACTIVE=1):
 			// Must run AFTER createConfigYaml which creates the file.
 			// Persist the effective remote so future bootstrap and hooks know
 			// Dolt, not JSONL, is the cross-machine sync path. Plain git
-			// origins are valid here: the first push creates refs/dolt/data.
+			// origins are valid here: the first push creates refs/dolt/data,
+			// and bootstrap resolves such a URL by probing refs/dolt/data
+			// rather than rejecting it (#5743).
 			if err := persistInitSyncRemote(beadsDir, initRemote, syncURL, syncFromRemote, syncURLFromConfig, syncURLFromGitOrigin); err != nil {
 				return fmt.Errorf("failed to persist sync.remote to config.yaml: %v", err)
 			}
