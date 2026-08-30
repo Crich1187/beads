@@ -121,6 +121,13 @@ func getVersionsSince(sinceVersion string) []VersionChange {
 		return versionChanges
 	}
 
+	// A brew --HEAD stamp names no changelog entry; without this the
+	// unknown-version fallback below would report the entire release history
+	// as new after every --HEAD reinstall.
+	if doctor.IsBrewHeadVersion(sinceVersion) {
+		return []VersionChange{}
+	}
+
 	// Find the index of sinceVersion
 	// versionChanges is ordered newest-first: [0.23.0, 0.22.1, 0.22.0, 0.21.0]
 	startIdx := -1
@@ -155,6 +162,16 @@ func getVersionsSince(sinceVersion string) []VersionChange {
 	return result
 }
 
+// displayVersion formats a version stamp for user-facing messages: semver
+// stamps get the conventional "v" prefix, while a brew --HEAD stamp is shown
+// verbatim ("vHEAD-f925f3f" reads as a typo).
+func displayVersion(version string) string {
+	if doctor.IsBrewHeadVersion(version) {
+		return version
+	}
+	return "v" + version
+}
+
 // maybeShowUpgradeNotification displays a one-time upgrade notification if version changed.
 // This is called by commands like 'bd ready' and 'bd list' to inform users of upgrades.
 func maybeShowUpgradeNotification() {
@@ -167,7 +184,7 @@ func maybeShowUpgradeNotification() {
 	upgradeAcknowledged = true
 
 	// Display notification
-	fmt.Printf("🔄 bd upgraded from v%s to v%s since last use\n", previousVersion, Version)
+	fmt.Printf("🔄 bd upgraded from %s to %s since last use\n", displayVersion(previousVersion), displayVersion(Version))
 	fmt.Println("💡 Run 'bd upgrade review' to see what changed")
 	if usesSQLServer() {
 		fmt.Println("💊 Run 'bd doctor' to verify upgrade completed cleanly")
@@ -375,8 +392,8 @@ func noticeSharedMigrateRefusal(err error) {
 		remedy = "This database has a remote — run 'bd migrate' to see the migrate-or-adopt options before choosing; reads keep working meanwhile."
 	}
 	fmt.Fprintf(os.Stderr,
-		"bd upgraded to v%s: %d schema migration(s) pending on this database — not auto-applying (#5920).\n%s\n",
-		Version, gateErr.Pending, remedy)
+		"bd upgraded to %s: %d schema migration(s) pending on this database — not auto-applying (#5920).\n%s\n",
+		displayVersion(Version), gateErr.Pending, remedy)
 }
 
 // recordedWorkspaceVersion reads the marker through the role's accessor on a

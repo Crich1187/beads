@@ -46,6 +46,18 @@ func TestGetVersionsSince(t *testing.T) {
 			expectedCount: 0,
 			description:   "Should return empty slice when already on latest in changelog",
 		},
+		{
+			name:          "brew HEAD stamp returns empty",
+			sinceVersion:  "HEAD-f925f3f",
+			expectedCount: 0,
+			description:   "A --HEAD stamp names no changelog entry and must not dump the full history",
+		},
+		{
+			name:          "bare brew HEAD stamp returns empty",
+			sinceVersion:  "HEAD",
+			expectedCount: 0,
+			description:   "A bare HEAD stamp names no changelog entry and must not dump the full history",
+		},
 	}
 
 	for _, tt := range tests {
@@ -54,6 +66,28 @@ func TestGetVersionsSince(t *testing.T) {
 			if len(result) != tt.expectedCount {
 				t.Errorf("getVersionsSince(%q) returned %d versions, want %d: %s",
 					tt.sinceVersion, len(result), tt.expectedCount, tt.description)
+			}
+		})
+	}
+}
+
+func TestDisplayVersion(t *testing.T) {
+	tests := []struct {
+		name    string
+		version string
+		want    string
+	}{
+		{name: "release", version: "1.3.0", want: "v1.3.0"},
+		{name: "pre-release", version: "1.3.0-rc.1", want: "v1.3.0-rc.1"},
+		{name: "brew HEAD stamp", version: "HEAD-f925f3f", want: "HEAD-f925f3f"},
+		{name: "bare brew HEAD stamp", version: "HEAD", want: "HEAD"},
+		{name: "brew HEAD stamp with revision", version: "HEAD-f925f3f_1", want: "HEAD-f925f3f_1"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := displayVersion(tt.version); got != tt.want {
+				t.Fatalf("displayVersion(%q) = %q, want %q", tt.version, got, tt.want)
 			}
 		})
 	}
