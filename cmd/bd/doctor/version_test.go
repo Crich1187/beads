@@ -154,6 +154,39 @@ func TestCheckCLIVersionUsesFetcher(t *testing.T) {
 	}
 }
 
+// TestCheckCLIVersionBrewHeadBuild verifies that a --HEAD build is not told to
+// run `brew upgrade beads`. CompareVersions reads the stamp as 0.0.0, so every
+// release looks newer forever, and taking the advice would move the user off
+// HEAD entirely.
+func TestCheckCLIVersionBrewHeadBuild(t *testing.T) {
+	orig := latestGitHubReleaseFetcher
+	fetched := false
+	latestGitHubReleaseFetcher = func() (string, error) {
+		fetched = true
+		return "1.3.0", nil
+	}
+	t.Cleanup(func() { latestGitHubReleaseFetcher = orig })
+
+	for _, stamp := range []string{"HEAD-f925f3f", "HEAD", "HEAD-f925f3f_1"} {
+		t.Run(stamp, func(t *testing.T) {
+			check := CheckCLIVersion(stamp)
+			if check.Status != StatusOK {
+				t.Fatalf("Status = %q, want %q (message: %q)", check.Status, StatusOK, check.Message)
+			}
+			if check.Fix != "" {
+				t.Fatalf("Fix = %q, want no upgrade advice for a --HEAD build", check.Fix)
+			}
+			if !strings.Contains(check.Message, stamp) {
+				t.Fatalf("Message = %q, want it to name the stamp", check.Message)
+			}
+		})
+	}
+
+	if fetched {
+		t.Error("CheckCLIVersion fetched the latest release for a --HEAD build; there is nothing to compare against")
+	}
+}
+
 func TestParseVersionParts(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -223,6 +256,34 @@ func TestCheckMetadataVersionTracking_EmptyFile(t *testing.T) {
 	}
 	if check.Message != ".local_version file is empty" {
 		t.Errorf("Message = %q, want %q", check.Message, ".local_version file is empty")
+	}
+}
+
+// TestCheckMetadataVersionTracking_BrewHeadStamp verifies that the version
+// stamp a Homebrew --HEAD install writes is reported as healthy rather than
+// permanently warning as an invalid format the user cannot fix: the offered
+// fix, running any bd command, writes the same stamp straight back.
+func TestCheckMetadataVersionTracking_BrewHeadStamp(t *testing.T) {
+	for _, stamp := range []string{"HEAD-f925f3f", "HEAD", "HEAD-f925f3f_1"} {
+		t.Run(stamp, func(t *testing.T) {
+			tmpDir := t.TempDir()
+			beadsDir := filepath.Join(tmpDir, ".beads")
+			if err := os.MkdirAll(beadsDir, 0755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(beadsDir, ".local_version"), []byte(stamp+"\n"), 0644); err != nil {
+				t.Fatal(err)
+			}
+
+			check := CheckMetadataVersionTracking(tmpDir, "HEAD-aaaaaaa")
+
+			if check.Status != StatusOK {
+				t.Errorf("Status = %q, want %q (message: %q)", check.Status, StatusOK, check.Message)
+			}
+			if check.Fix != "" {
+				t.Errorf("Fix = %q, want no fix advice for a --HEAD stamp", check.Fix)
+			}
+		})
 	}
 }
 

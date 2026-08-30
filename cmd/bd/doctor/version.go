@@ -16,6 +16,17 @@ var latestGitHubReleaseFetcher = fetchLatestGitHubRelease
 // CheckCLIVersion checks if the CLI version is up to date.
 // Takes cliVersion parameter since it can't access the Version variable from main package.
 func CheckCLIVersion(cliVersion string) DoctorCheck {
+	// A Homebrew --HEAD build carries no orderable version — CompareVersions
+	// would read it as 0.0.0 and warn "update available" forever, and the
+	// suggested upgrade would actually move the user off HEAD.
+	if IsBrewHeadVersion(cliVersion) {
+		return DoctorCheck{
+			Name:    "CLI Version",
+			Status:  StatusOK,
+			Message: fmt.Sprintf("%s (Homebrew --HEAD build; release comparison skipped)", cliVersion),
+		}
+	}
+
 	latestVersion, err := latestGitHubReleaseFetcher()
 	if err != nil {
 		// Network error or API issue - don't fail, just warn
@@ -151,6 +162,20 @@ func CheckMetadataVersionTracking(path string, currentVersion string) DoctorChec
 		}
 	}
 
+	trackingActive := DoctorCheck{
+		Name:    "Version Tracking",
+		Status:  StatusOK,
+		Message: fmt.Sprintf("Version tracking active (last: %s, current: %s)", lastVersion, currentVersion),
+	}
+
+	// A Homebrew --HEAD stamp carries no ordering, so the staleness heuristic
+	// below cannot apply — but it is a healthy marker, not a malformed one.
+	// Warning about it would be permanent: the offered fix rewrites the same
+	// stamp back.
+	if IsBrewHeadVersion(lastVersion) {
+		return trackingActive
+	}
+
 	// Validate that version is a valid semver-like string
 	if !IsValidSemver(lastVersion) {
 		return DoctorCheck{
@@ -171,11 +196,7 @@ func CheckMetadataVersionTracking(path string, currentVersion string) DoctorChec
 
 		// Guard against short version strings (e.g., "5" → [5] has no [1])
 		if len(currentParts) < 2 || len(lastParts) < 2 {
-			return DoctorCheck{
-				Name:    "Version Tracking",
-				Status:  StatusOK,
-				Message: fmt.Sprintf("Version tracking active (last: %s, current: %s)", lastVersion, currentVersion),
-			}
+			return trackingActive
 		}
 
 		// Simple heuristic: warn if minor version is 10+ behind or major version differs by 1+
@@ -193,11 +214,7 @@ func CheckMetadataVersionTracking(path string, currentVersion string) DoctorChec
 		}
 
 		// Version is behind but not too old - this is normal after upgrade
-		return DoctorCheck{
-			Name:    "Version Tracking",
-			Status:  StatusOK,
-			Message: fmt.Sprintf("Version tracking active (last: %s, current: %s)", lastVersion, currentVersion),
-		}
+		return trackingActive
 	}
 
 	// Version is current or ahead
