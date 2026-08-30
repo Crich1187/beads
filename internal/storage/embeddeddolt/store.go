@@ -450,6 +450,22 @@ func (s *EmbeddedDoltStore) initSchema(ctx context.Context) error {
 			}
 			return nil
 		}
+		var rekeyErr *schema.DependencyRekeyConflictError
+		if s.intent != openStrict && errors.As(err, &rekeyErr) {
+			// Same principle for the dependency re-key's refusal (#5268): it is
+			// a convergence repair, not a precondition for reading, and before
+			// that pass existed these clones opened fine. Bricking 'bd list' and
+			// 'bd show' on latent id corruption the user cannot even inspect
+			// without them would be a worse outcome than a stale primary key.
+			// Nothing is lost by continuing: the 0026 marker stays unrecorded,
+			// so the next open retries the repair.
+			fmt.Fprintf(os.Stderr,
+				"Warning: %v\n"+
+					"  Continuing without re-keying dependencies. Dependency ids stay as\n"+
+					"  they are until the conflict is resolved; run 'bd doctor' to inspect.\n",
+				rekeyErr)
+			return nil
+		}
 		return fmt.Errorf("embeddeddolt: migrate: %w", err)
 	}
 
