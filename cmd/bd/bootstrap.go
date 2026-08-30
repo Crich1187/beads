@@ -156,6 +156,19 @@ Examples:
 		// Resolve non-interactive mode: flag > env var > CI env > terminal detection.
 		nonInteractive := isNonInteractiveBootstrap(yesFlag || nonInteractiveFlag)
 
+		// dc-6jaq: "bootstrap" is in noDbCommands, so PersistentPreRunE
+		// returns at the skip-store early return before its freeze gate, and
+		// bootstrap.go calls neither CheckReadonly nor the gate itself — yet
+		// it writes, and the first of those writes (the metadata repair below)
+		// lands before its own confirmation prompt and before it takes any
+		// workspace gate. --dry-run is exempt because it genuinely does not
+		// write; every other invocation is refused while a marker is active.
+		if !dryRun {
+			if err := migrationFreezeGateFor(cmd, "bootstrap"); err != nil {
+				return err
+			}
+		}
+
 		// Find beads directory
 		beadsDir := beads.FindBeadsDir()
 		if beadsDir == "" {

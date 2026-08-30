@@ -132,6 +132,15 @@ var (
 	// This is used for tip-commit message formatting.
 	commandTipIDsShown map[string]struct{}
 
+	// commandFreeze is the migration-freeze lookup for this invocation,
+	// resolved once in PersistentPreRunE (dc-6jaq). Both hooks read it: the
+	// pre-run gate refuses writes from it, and PersistentPostRunE skips its
+	// own maintenance writes — auto-commit, tip metadata, backup, export,
+	// push — so a read command run during a freeze does not leave a new Dolt
+	// commit in the store being migrated. Zero value means "not frozen",
+	// which is the right default for the paths that never resolve it.
+	commandFreeze migration.Result
+
 	// commandSpan is the root OTel span for the current command execution.
 	// All storage and AI spans are nested as children of this span.
 	commandSpan oteltrace.Span
@@ -938,6 +947,7 @@ var rootCmd = &cobra.Command{
 		commandDidExplicitDoltCommit = false
 		commandDidWriteTipMetadata = false
 		commandTipIDsShown = make(map[string]struct{})
+		commandFreeze = migration.Result{}
 
 		// Set up signal-aware context with batch commit flush on shutdown.
 		// Unlike signal.NotifyContext, this also handles SIGHUP and flushes
@@ -1424,7 +1434,7 @@ var rootCmd = &cobra.Command{
 		policy := effectiveRootStorePolicy(cmd.Name(), readonlyMode)
 		useReadOnly := policy.readOnly || previewMode
 
-		// dc-6jaq: consult the MIGRATION-FREEZE sentinel here, before any of
+		// dc-6jaq: consult the migration freeze marker here, before any of
 		// this hook's own store-touching side effects — trackBdVersion below
 		// (writes .local_version), autoMigrateOnVersionBump (opens its own
 		// store connection and can apply a schema migration), and
@@ -1438,13 +1448,27 @@ var rootCmd = &cobra.Command{
 		// "write" commands to drift out of sync with the one useReadOnly is
 		// built from. An explicit --dry-run/--inspect preview also sets
 		// useReadOnly and so skips this early gate the same way, but is NOT
-		// exempt overall: CheckReadonly's own freeze check runs again,
-		// unconditionally, at the per-command chokepoint once RunE is
-		// reached, and that later call has no preview awareness — so a
-		// preview on a frozen town still exits 1 there, fail-closed, same as
-		// strict --readonly already blocks `create --dry-run` today.
+		// exempt overall: the per-command chokepoint checks again once RunE
+		// is reached, with no preview awareness — CheckReadonly for the ~120
+		// commands that call it, and runImport's own call for `bd import
+		// --dry-run`, which is not one of them. So a preview on a frozen
+		// workspace still exits ExitMigrationFrozen there, fail-closed, same
+		// as strict --readonly already blocks `create --dry-run` today.
+		// Returning the refusal rather than exiting is load-bearing: the
+		// gates acquired above are released by this hook's deferred cleanup,
+		// which os.Exit would skip.
+		//
+		// One lookup answers the whole invocation: the walk is a stat per
+		// ancestor of both the cwd and the resolved workspace, and resolving
+		// it twice a statement apart would not only pay for it twice but let
+		// the two readings disagree about a marker that appeared or vanished
+		// in between (write allowed but maintenance skipped, or the reverse).
+		// PostRunE reads the same answer via commandFreeze.
+		commandFreeze = migration.Find(beadsDir)
 		if !useReadOnly {
-			CheckMigrationFreeze(strings.TrimPrefix(cmd.CommandPath(), cmd.Root().Name()+" "))
+			if err := migrationFreezeGate(cmd, strings.TrimPrefix(cmd.CommandPath(), cmd.Root().Name()+" "), commandFreeze); err != nil {
+				return err
+			}
 		}
 
 		// dc-6jaq (review round 2, ask #1): a command classified read-only —
@@ -1454,14 +1478,12 @@ var rootCmd = &cobra.Command{
 		// writes against the (possibly frozen) store, run regardless of the
 		// command's own classification — so "the command is a read" must not
 		// imply "these side effects may still run". Reproduced pre-fix:
-		// freeze the town, seed .local_version with a stale version, run
+		// freeze the workspace, seed .local_version with a stale version, run
 		// `bd list` — exit 0 (correct, it's a read), but .local_version was
 		// silently rewritten mid-freeze anyway. Skip both calls under an
-		// active freeze without blocking the read itself. Short-circuits on
-		// !policy.runMaintenance (strict --readonly) so the IsFrozen/
-		// findTownRoot filesystem walk isn't paid on that path, where these
-		// calls are already skipped for an unrelated reason.
-		frozenForMaintenance := policy.runMaintenance && migration.IsFrozen(findTownRoot())
+		// active freeze without blocking the read itself. Reuses the single
+		// lookup resolved above rather than repeating the walk.
+		frozenForMaintenance := policy.runMaintenance && commandFreeze.Frozen()
 
 		// Track bd version changes unless strict readonly forbids repository mutation.
 		// Best-effort tracking - failures are silent.
@@ -1870,7 +1892,16 @@ var rootCmd = &cobra.Command{
 				uowProvider = nil
 			}
 		} else {
-			if runsPostCommandMaintenance(cmd.Name(), readonlyMode) {
+			// dc-6jaq: the freeze covers this hook's own writes too. A read is
+			// allowed through a freeze, but the maintenance that trails it is
+			// not the user's command — auto-commit, the tip_*_last_shown
+			// metadata write and its separate Dolt commit, auto-backup,
+			// auto-export and auto-push all mutate the very store being
+			// migrated, and `bd list` on a frozen workspace reaches every one
+			// of them. Guarding the outer block keeps that promise in one
+			// place instead of six. Writes never get here at all: they were
+			// refused in PersistentPreRunE.
+			if runsPostCommandMaintenance(cmd.Name(), readonlyMode) && !commandFreeze.Frozen() {
 				// Dolt auto-commit: after a successful write command (and after final flush),
 				// create a Dolt commit so changes don't remain only in the working set.
 				if commandDidWrite.Load() && !commandDidExplicitDoltCommit {

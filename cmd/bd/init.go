@@ -399,6 +399,32 @@ Non-interactive mode (--non-interactive or BD_NON_INTERACTIVE=1):
 			fmt.Fprintf(os.Stderr, "  See 'bd help init-safety' for the init flag surface.\n\n")
 			reinitLocal = true
 		}
+
+		// dc-6jaq: "init" is in noDbCommands, so PersistentPreRunE returns at
+		// the skip-store early return before its freeze gate ever runs, and
+		// init.go calls neither CheckReadonly nor the gate itself. That left
+		// the single most destructive command in the CLI free to run during a
+		// migration: `bd init --reinit-local` (or its --force alias) drops and
+		// recreates the very database the marker is protecting, permanently,
+		// and exited 0 without consulting the marker. Gate the destructive
+		// variants here — the earliest point where every one of them is
+		// resolved and nothing has been written yet, and ahead of the
+		// --proxied-server branch below, which reaches its own writes without
+		// passing through the init mutation gate at all.
+		//
+		// A plain first-time init is deliberately not gated: it creates a new
+		// database rather than touching the frozen one, and an existing
+		// workspace already refuses it via checkExistingBeadsData.
+		if reinitLocal || discardRemote {
+			op := "init --reinit-local"
+			if discardRemote {
+				op = "init --discard-remote"
+			}
+			if err := migrationFreezeGateFor(cmd, op, resolveInitBeadsDir()); err != nil {
+				return err
+			}
+		}
+
 		sharedServer, _ := cmd.Flags().GetBool("shared-server")
 		externalServer, _ := cmd.Flags().GetBool("external")
 		debugMode, _ := cmd.Flags().GetBool("debug")
