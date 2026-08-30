@@ -308,7 +308,16 @@ func migrationFreezeErrorFor(operation string, extraRoots ...string) error {
 // paths that keep running while frozen but must not apply version tracking or
 // schema auto-migration.
 func migrationFreezeActive() bool {
-	return migration.Find(freezeSearchRoots()...).Frozen()
+	return migrationFreezeActiveFor()
+}
+
+// migrationFreezeActiveFor is migrationFreezeActive against extra roots — the
+// probe half of the migrationFreezeErrorFor pair, for a diagnosis path handed a
+// workspace that is not the one bd was launched in. `bd doctor /frozen/repo`
+// skips its own maintenance writes on the strength of this, so it has to look
+// at the tree it is about to write to and not just at the caller's cwd.
+func migrationFreezeActiveFor(extraRoots ...string) bool {
+	return migration.Find(freezeRootsWith(extraRoots)...).Frozen()
 }
 
 func freezeRootsWith(extraRoots []string) []string {
