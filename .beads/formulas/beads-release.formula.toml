@@ -532,10 +532,11 @@ REL_BRANCH="release/$BASE"
 echo "$REL_BRANCH"
 ```
 
-Push the prep branch and open the PR:
+Create the prep branch, push it, and open the PR:
 
 ```bash
-git push origin "release-prep/v{{version}}"
+git checkout -b "release-prep/v{{version}}"
+git push -u origin "release-prep/v{{version}}"
 gh pr create --base "$REL_BRANCH" --label status/needs-review-auto
 ```
 

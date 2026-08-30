@@ -213,7 +213,8 @@ Commit the CHANGELOG changes and open a PR against the release branch:
 ```bash
 git add CHANGELOG.md
 git commit -m "docs: Add CHANGELOG entry for v0.22.0"
-git push origin release-prep/v0.22.0
+git checkout -b release-prep/v0.22.0
+git push -u origin release-prep/v0.22.0
 gh pr create --base release/0.22.0 --label status/needs-review-auto
 ```
 
@@ -265,7 +266,8 @@ yet**:
 ```bash
 git add -A
 git commit -m "chore: bump version to 0.22.0"
-git push origin release-prep/v0.22.0
+git checkout -b release-prep/v0.22.0
+git push -u origin release-prep/v0.22.0
 gh pr create --base release/0.22.0 --label status/needs-review-auto
 ```
 
