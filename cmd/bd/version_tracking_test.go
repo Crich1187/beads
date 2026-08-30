@@ -304,6 +304,107 @@ func TestTrackBdVersion_DowngradeIgnored(t *testing.T) {
 	}
 }
 
+// newTrackingWorkspace prepares the minimal .beads a trackBdVersion call needs
+// and pins the globals it mutates, returning the .local_version path.
+func newTrackingWorkspace(t *testing.T, lastVersion, binVersion string) string {
+	t.Helper()
+	ensureCleanGlobalState(t)
+
+	tmpDir := t.TempDir()
+	beadsDir := filepath.Join(tmpDir, ".beads")
+	if err := os.MkdirAll(beadsDir, 0755); err != nil {
+		t.Fatalf("Failed to create .beads: %v", err)
+	}
+	t.Setenv("BEADS_DIR", beadsDir)
+	t.Chdir(tmpDir)
+
+	metadataPath := filepath.Join(beadsDir, "metadata.json")
+	if err := os.WriteFile(metadataPath, []byte(`{"database":"beads.db"}`), 0600); err != nil {
+		t.Fatalf("Failed to create metadata.json: %v", err)
+	}
+
+	localVersionPath := filepath.Join(beadsDir, localVersionFile)
+	if err := writeLocalVersion(localVersionPath, lastVersion); err != nil {
+		t.Fatalf("Failed to write local version: %v", err)
+	}
+
+	origVersion, origDetected, origPrevious := Version, versionUpgradeDetected, previousVersion
+	t.Cleanup(func() {
+		Version, versionUpgradeDetected, previousVersion = origVersion, origDetected, origPrevious
+	})
+	Version = binVersion
+	versionUpgradeDetected = false
+	previousVersion = ""
+
+	return localVersionPath
+}
+
+// TestTrackBdVersion_HeadStampChangeDetectedAsUpgrade covers the stamp changes
+// CompareVersions cannot see: it reads every HEAD stamp as 0.0.0, so a HEAD
+// reinstall looked like no change and a release-to-HEAD move looked like a
+// downgrade. Both skipped the one-shot post-upgrade reconciliation entirely.
+func TestTrackBdVersion_HeadStampChangeDetectedAsUpgrade(t *testing.T) {
+	tests := []struct {
+		name         string
+		lastVersion  string
+		binVersion   string
+		wantDetected bool
+	}{
+		{name: "HEAD stamp to different HEAD stamp", lastVersion: "HEAD-423afdc", binVersion: "HEAD-f925f3f", wantDetected: true},
+		{name: "release to HEAD stamp", lastVersion: "1.1.2", binVersion: "HEAD-f925f3f", wantDetected: true},
+		{name: "HEAD stamp to release", lastVersion: "HEAD-423afdc", binVersion: "1.3.0", wantDetected: true},
+		{name: "same HEAD stamp", lastVersion: "HEAD-f925f3f", binVersion: "HEAD-f925f3f", wantDetected: false},
+		{name: "non-HEAD garbage change stays undetected", lastVersion: "not-a-version", binVersion: "also-not-one", wantDetected: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			localVersionPath := newTrackingWorkspace(t, tt.lastVersion, tt.binVersion)
+
+			trackBdVersion()
+
+			if versionUpgradeDetected != tt.wantDetected {
+				t.Errorf("versionUpgradeDetected = %v, want %v", versionUpgradeDetected, tt.wantDetected)
+			}
+			wantPrevious := ""
+			if tt.wantDetected {
+				wantPrevious = tt.lastVersion
+			}
+			if previousVersion != wantPrevious {
+				t.Errorf("previousVersion = %q, want %q", previousVersion, wantPrevious)
+			}
+			if got := readLocalVersion(localVersionPath); got != tt.binVersion {
+				t.Errorf(".local_version = %q, want %q", got, tt.binVersion)
+			}
+		})
+	}
+}
+
+// TestTrackBdVersion_HeadStampNeverReachesPreV56Recovery walks the whole
+// #5603 shape end to end: a workspace last touched by a Homebrew --HEAD build,
+// a .dolt with no .bd-dolt-ok marker, and a release install on top. Detection
+// and the recovery gate have to compose — widening detection is what puts a
+// HEAD stamp into previousVersion in the first place.
+func TestTrackBdVersion_HeadStampNeverReachesPreV56Recovery(t *testing.T) {
+	newTrackingWorkspace(t, "HEAD-f925f3f", "1.3.0")
+	doltDir, sentinel := writePreV56DoltFixture(t)
+
+	trackBdVersion()
+
+	if !versionUpgradeDetected {
+		t.Fatal("installing a release over a --HEAD build should register as an upgrade")
+	}
+	if previousVersion != "HEAD-f925f3f" {
+		t.Fatalf("previousVersion = %q, want the HEAD stamp", previousVersion)
+	}
+
+	recoverPreV56IfNeeded(previousVersion, doltDir)
+
+	if _, err := os.Stat(sentinel); err != nil {
+		t.Fatalf("a --HEAD predecessor routed a live workspace into the pre-v56 recovery: %v", err)
+	}
+}
+
 func TestTrackBdVersion_SameVersion(t *testing.T) {
 	// Create temp .beads directory
 	tmpDir := t.TempDir()
