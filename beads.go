@@ -292,6 +292,12 @@ type (
 // by every child process the embedder spawns, including git hooks and dolt
 // subprocesses.
 //
+// The parity with that env var is only in the process-local mechanism, not the
+// reach: BD_ALLOW_REMOTE_MIGRATE=1 unlocks BOTH the no-remote and the
+// remote-backed shared arms, while this authorizes ONLY the no-remote arm. A
+// remote-backed shared store still needs --force / AllowRemoteMigrateEnv,
+// because #4259 cross-clone coordination is a stronger, different contract.
+//
 // Call it before the Open* call that should perform the migration, and clear
 // it afterwards. Only grant it once the operator has confirmed that every
 // other client of the server is upgraded; it is a coordination decision the

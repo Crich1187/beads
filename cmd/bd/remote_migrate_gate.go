@@ -31,12 +31,43 @@ const (
 func handleRemoteMigrateGateJSON(e *schema.RemoteMigrateGateError) {
 	outer := buildJSONError(e.Error(), e.AgentDirective())
 	if m, ok := outer.(map[string]interface{}); ok {
+		// The shared-no-remote consent verb is the one command in this block
+		// that is target-scoped: under --global the refused open aimed at
+		// beads_global, so the project-scoped `bd migrate schema` would consent
+		// the WRONG database and leave the refusal in place. Mirror the
+		// human/text path (printGlobalDatabaseConsentHint,
+		// noticeSharedMigrateRefusal) and name the --global verb when this
+		// invocation targeted the global database. Only shared-no-remote is
+		// retargeted; the remote-backed arms coordinate through bd bootstrap /
+		// bd migrate --force, which --global does not rewrite.
+		sharedConsent := schema.SharedConsentCommand
+		if globalFlag {
+			sharedConsent = schema.SharedConsentCommandGlobal
+		}
+		retargetShared := globalFlag && e.Decision == "shared-no-remote"
+
 		opts := make([]map[string]interface{}, 0, len(e.Options()))
 		for _, o := range e.Options() {
+			commands := o.Commands
+			if retargetShared {
+				// The runnable command deliberately lives inside the option, not
+				// in the top-level hint, so an agent that extracts it
+				// programmatically must get the --global verb too — fixing only
+				// "expected" would still hand it the wrong-target command.
+				retargeted := make([]string, len(commands))
+				for i, c := range commands {
+					if c == schema.SharedConsentCommand {
+						retargeted[i] = schema.SharedConsentCommandGlobal
+					} else {
+						retargeted[i] = c
+					}
+				}
+				commands = retargeted
+			}
 			opts = append(opts, map[string]interface{}{
 				"id":       o.ID,
 				"when":     o.When,
-				"commands": o.Commands,
+				"commands": commands,
 				"risk":     o.Risk,
 			})
 		}
@@ -67,7 +98,7 @@ func handleRemoteMigrateGateJSON(e *schema.RemoteMigrateGateError) {
 			// and bd bootstrap coordination that does not exist here.
 			gate["decision"] = "shared-no-remote"
 			gate["observed"] = fmt.Sprintf("%d pending schema migration(s) on a shared server database, no consent", e.Pending)
-			gate["expected"] = "operator upgrades co-resident clients, then consents once via " + schema.SharedConsentCommand
+			gate["expected"] = "operator upgrades co-resident clients, then consents once via " + sharedConsent
 			gate["docs"] = sharedServersDocsURL
 		case "adopt-ff":
 			// A strict refinement of adopt, and on a shared store now a
