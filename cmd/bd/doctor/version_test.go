@@ -69,6 +69,41 @@ func TestIsValidSemver(t *testing.T) {
 	}
 }
 
+func TestIsBrewHeadVersion(t *testing.T) {
+	tests := []struct {
+		name    string
+		version string
+		want    bool
+	}{
+		{name: "short sha", version: "HEAD-f925f3f", want: true},
+		{name: "full sha", version: "HEAD-" + strings.Repeat("a", 40), want: true},
+		{name: "uppercase sha", version: "HEAD-F925F3F", want: true},
+		{name: "bare HEAD", version: "HEAD", want: true},
+		{name: "revision suffix", version: "HEAD-f925f3f_1", want: true},
+		{name: "bare HEAD with revision suffix", version: "HEAD_2", want: true},
+		{name: "empty sha", version: "HEAD-"},
+		{name: "non-hex sha", version: "HEAD-zzzzzzz"},
+		{name: "sha below git abbreviation floor", version: "HEAD-abc"},
+		{name: "sha beyond object id length", version: "HEAD-" + strings.Repeat("a", 41)},
+		{name: "dirty suffix", version: "HEAD-f925f3f-dirty"},
+		{name: "non-numeric revision", version: "HEAD-f925f3f_x"},
+		{name: "signed revision", version: "HEAD-f925f3f_+1"},
+		{name: "negative zero revision", version: "HEAD_-0"},
+		{name: "empty revision", version: "HEAD-f925f3f_"},
+		{name: "unrelated prefix", version: "HEADLESS-f925f3f"},
+		{name: "semver", version: "1.1.2"},
+		{name: "empty", version: ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := IsBrewHeadVersion(tt.version); got != tt.want {
+				t.Fatalf("IsBrewHeadVersion(%q) = %v, want %v", tt.version, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestUpgradeCommandForPath(t *testing.T) {
 	tests := []struct {
 		name     string

@@ -289,6 +289,49 @@ func CompareVersions(v1, v2 string) int {
 	return 0
 }
 
+// IsBrewHeadVersion recognizes the version Homebrew stamps into --HEAD
+// installs of the core beads formula: HEAD-<shortsha>, a bare HEAD when the
+// head spec resolves no commit, and either shape carrying Homebrew's
+// _<revision> suffix. Such a stamp is a healthy current-era version marker,
+// not a malformed one — the binary rewrites it identically on every run, so
+// nothing the user does can "fix" it into semver.
+//
+// This is the canonical definition; every consumer of a version stamp that
+// needs to tell a --HEAD build apart from a release delegates here so the
+// ends cannot drift.
+func IsBrewHeadVersion(version string) bool {
+	rest, ok := strings.CutPrefix(version, "HEAD")
+	if !ok {
+		return false
+	}
+	// Homebrew's pkg_version appends _<revision> once the formula carries a
+	// revision, so a revision bump must not read as malformed. The revision is
+	// an unsigned decimal; a digits-only check keeps Atoi's tolerance of
+	// signed forms ("+1", "-0") from admitting shapes brew never emits.
+	if cut := strings.IndexByte(rest, '_'); cut >= 0 {
+		revision := rest[cut+1:]
+		if revision == "" || strings.Trim(revision, "0123456789") != "" {
+			return false
+		}
+		rest = rest[:cut]
+	}
+	// Homebrew leaves the version as a bare "HEAD" whenever the head spec
+	// cannot resolve a commit.
+	if rest == "" {
+		return true
+	}
+	sha, ok := strings.CutPrefix(rest, "-")
+	if !ok {
+		return false
+	}
+	// Bound the tail to a plausible git abbreviation so that arbitrary hex
+	// cannot stand in for a commit; git never abbreviates below 7 characters.
+	if len(sha) < 7 || len(sha) > 40 {
+		return false
+	}
+	return strings.Trim(sha, "0123456789abcdefABCDEF") == ""
+}
+
 // IsValidSemver checks if a version string is valid semver-like format (X.Y.Z)
 func IsValidSemver(version string) bool {
 	if version == "" {
