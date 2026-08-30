@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -269,4 +270,77 @@ func TestFormatFailedCloneTargetErrorCleanupFailed(t *testing.T) {
 			t.Fatalf("expected %q in error, got:\n%s", want, msg)
 		}
 	}
+}
+
+// TestBootstrapFromRemoteWithDB_RetriesTransientCloneError verifies that
+// BootstrapFromRemoteWithDB retries `dolt clone` when another host's push
+// leaves the remote snapshot temporarily inconsistent. A fake dolt binary
+// fails the first two attempts with the Dolt "no chunkSource" error, then
+// succeeds and creates the expected database directory.
+func TestBootstrapFromRemoteWithDB_RetriesTransientCloneError(t *testing.T) {
+	fakeDir, stateDir := installFakeDoltForBootstrap(t, 2)
+	t.Setenv("PATH", fakeDir+":"+os.Getenv("PATH"))
+	t.Setenv("BEADS_FAKE_DOLT_STATE", stateDir)
+
+	doltDir := t.TempDir()
+	synced, err := BootstrapFromRemoteWithDB(context.Background(), doltDir, "file:///tmp/test-remote", "beads")
+	if err != nil {
+		t.Fatalf("BootstrapFromRemoteWithDB should retry and succeed: %v", err)
+	}
+	if !synced {
+		t.Fatal("expected synced=true")
+	}
+
+	if !doltExists(doltDir) {
+		t.Errorf("expected dolt database to exist in %s after retry", doltDir)
+	}
+
+	counter := fakeDoltInvocationCountBootstrap(stateDir)
+	if counter != 3 {
+		t.Errorf("expected 3 dolt clone invocations (2 failures + 1 success), got %d", counter)
+	}
+}
+
+// installFakeDoltForBootstrap creates an executable `dolt` script in a temp
+// directory and a separate state directory. The script fails the first
+// failCount calls with the "no chunkSource" error, then succeeds.
+func installFakeDoltForBootstrap(t *testing.T, failCount int) (string, string) {
+	t.Helper()
+
+	fakeDir := t.TempDir()
+	stateDir := filepath.Join(fakeDir, "state")
+	if err := os.MkdirAll(stateDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+
+	script := `#!/bin/bash
+set -e
+state="${BEADS_FAKE_DOLT_STATE}"`
+	script += `
+counter_file="$state/counter"
+n=$(cat "$counter_file" 2>/dev/null || echo 0)
+echo $((n+1)) > "$counter_file"
+if [ "$n" -lt "` + strconv.Itoa(failCount) + `" ]; then
+  echo "Error: manifest referenced table file for which there is no chunkSource." >&2
+  exit 1
+fi
+target="${@: -1}"
+mkdir -p "$target/.dolt"
+echo '{}' > "$target/.dolt/repo_state.json"
+echo '{}' > "$target/.dolt/config.json"
+`
+	fakeDoltPath := filepath.Join(fakeDir, "dolt")
+	if err := os.WriteFile(fakeDoltPath, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return fakeDir, stateDir
+}
+
+func fakeDoltInvocationCountBootstrap(stateDir string) int {
+	data, err := os.ReadFile(filepath.Join(stateDir, "counter"))
+	if err != nil {
+		return 0
+	}
+	n, _ := strconv.Atoi(strings.TrimSpace(string(data)))
+	return n
 }

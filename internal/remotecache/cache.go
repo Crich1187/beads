@@ -11,6 +11,7 @@ import (
 
 	"github.com/steveyegge/beads/internal/configfile"
 	"github.com/steveyegge/beads/internal/debug"
+	"github.com/steveyegge/beads/internal/doltretry"
 	"github.com/steveyegge/beads/internal/githooksenv"
 	"github.com/steveyegge/beads/internal/gittraceenv"
 	"github.com/steveyegge/beads/internal/lockfile"
@@ -188,13 +189,16 @@ func (c *Cache) doltExists(dbPath string) bool {
 	return err == nil && info.IsDir()
 }
 
-// doltClone clones a remote into the target directory.
+// doltClone clones a remote into the target directory, retrying if a
+// concurrent push leaves the remote snapshot temporarily inconsistent.
 func (c *Cache) doltClone(ctx context.Context, remoteURL, target string) error {
-	cmd := doltCmd(ctx, "", doltCloneArgs(remoteURL, target)...)
-	if output, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("%w\nOutput: %s", err, output)
-	}
-	return nil
+	return doltretry.CloneWithRetry(ctx, target, func() error {
+		cmd := doltCmd(ctx, "", doltCloneArgs(remoteURL, target)...)
+		if output, err := cmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("%w\nOutput: %s", err, output)
+		}
+		return nil
+	})
 }
 
 // doltCmd builds a dolt CLI invocation for cache transfers with git tracing
@@ -215,13 +219,16 @@ func doltCloneArgs(remoteURL, target string) []string {
 	return append(args, remoteURL, target)
 }
 
-// doltPull pulls from origin in the given database directory.
+// doltPull pulls from origin in the given database directory, retrying if a
+// concurrent push leaves the remote snapshot temporarily inconsistent.
 func (c *Cache) doltPull(ctx context.Context, dbDir string) error {
-	cmd := doltCmd(ctx, dbDir, "pull", "origin", "main")
-	if output, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("%w\nOutput: %s", err, output)
-	}
-	return nil
+	return doltretry.PullWithRetry(ctx, func() error {
+		cmd := doltCmd(ctx, dbDir, "pull", "origin", "main")
+		if output, err := cmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("%w\nOutput: %s", err, output)
+		}
+		return nil
+	})
 }
 
 // acquireLock acquires an exclusive file lock for a cache entry.

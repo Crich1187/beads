@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -307,4 +308,117 @@ func TestDefaultCache(t *testing.T) {
 	if filepath.Base(filepath.Dir(cache.Dir)) != "beads" || filepath.Base(cache.Dir) != "remotes" {
 		t.Errorf("unexpected cache dir: %s", cache.Dir)
 	}
+}
+
+// TestEnsureColdStart_RetriesTransientCloneError verifies that Ensure retries
+// `dolt clone` when the remote snapshot is temporarily inconsistent because
+// another host is pushing. A fake dolt binary fails the first two attempts
+// with the exact Dolt "no chunkSource" error, then succeeds.
+func TestEnsureColdStart_RetriesTransientCloneError(t *testing.T) {
+	ctx := context.Background()
+
+	fakeDir, cleanupFake := installFakeDolt(t, 2)
+	defer cleanupFake()
+
+	tmpDir := t.TempDir()
+	cache := &Cache{Dir: filepath.Join(tmpDir, "cache")}
+
+	_, err := cache.Ensure(ctx, "file:///tmp/test-remote")
+	if err != nil {
+		t.Fatalf("Ensure should retry transient clone error and succeed: %v", err)
+	}
+
+	target := cache.cloneTarget("file:///tmp/test-remote")
+	if !cache.doltExists(target) {
+		t.Errorf("expected clone target %s to exist after retry", target)
+	}
+
+	// Verify the fake was invoked the expected number of times.
+	counter := fakeDoltInvocationCount(fakeDir)
+	if counter != 3 {
+		t.Errorf("expected 3 dolt clone invocations (2 failures + 1 success), got %d", counter)
+	}
+}
+
+// TestEnsureWarmStart_RetriesTransientPullError verifies that Ensure retries
+// `dolt pull` when a concurrent push leaves the remote snapshot temporarily
+// inconsistent.
+func TestEnsureWarmStart_RetriesTransientPullError(t *testing.T) {
+	ctx := context.Background()
+
+	fakeDir, cleanupFake := installFakeDolt(t, 2)
+	defer cleanupFake()
+
+	tmpDir := t.TempDir()
+	cache := &Cache{Dir: filepath.Join(tmpDir, "cache")}
+
+	// Pre-create a cached clone so Ensure takes the warm (pull) path.
+	target := cache.cloneTarget("file:///tmp/test-remote")
+	if err := os.MkdirAll(filepath.Join(target, ".dolt"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(target, ".dolt", "repo_state.json"), []byte("{}"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := cache.Ensure(ctx, "file:///tmp/test-remote")
+	if err != nil {
+		t.Fatalf("Ensure should retry transient pull error and succeed: %v", err)
+	}
+
+	counter := fakeDoltInvocationCount(fakeDir)
+	if counter != 3 {
+		t.Errorf("expected 3 dolt pull invocations (2 failures + 1 success), got %d", counter)
+	}
+}
+
+// installFakeDolt creates an executable `dolt` script in a temporary directory,
+// prepends that directory to PATH, and returns the directory plus a cleanup
+// function. The script fails the first failCount invocations with the Dolt
+// "no chunkSource" error, then creates a minimal valid-looking dolt database.
+func installFakeDolt(t *testing.T, failCount int) (string, func()) {
+	t.Helper()
+
+	fakeDir := t.TempDir()
+	stateDir := filepath.Join(fakeDir, "state")
+	if err := os.MkdirAll(stateDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+
+	script := `#!/bin/bash
+set -e
+state="${BEADS_FAKE_DOLT_STATE}"`
+	script += `
+counter_file="$state/counter"
+n=$(cat "$counter_file" 2>/dev/null || echo 0)
+echo $((n+1)) > "$counter_file"
+if [ "$n" -lt "` + strconv.Itoa(failCount) + `" ]; then
+  echo "Error: manifest referenced table file for which there is no chunkSource." >&2
+  exit 1
+fi
+# Success path: the last argument is the clone target.
+target="${@: -1}"
+mkdir -p "$target/.dolt"
+echo '{}' > "$target/.dolt/repo_state.json"
+echo '{}' > "$target/.dolt/config.json"
+`
+	fakeDoltPath := filepath.Join(fakeDir, "dolt")
+	if err := os.WriteFile(fakeDoltPath, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Setenv("BEADS_FAKE_DOLT_STATE", stateDir)
+	origPath := os.Getenv("PATH")
+	t.Setenv("PATH", fakeDir+":"+origPath)
+
+	return fakeDir, func() {}
+}
+
+func fakeDoltInvocationCount(fakeDir string) int {
+	data, err := os.ReadFile(filepath.Join(fakeDir, "state", "counter"))
+	if err != nil {
+		return 0
+	}
+	n, _ := strconv.Atoi(strings.TrimSpace(string(data)))
+	return n
 }
