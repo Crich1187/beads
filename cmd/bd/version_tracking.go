@@ -61,9 +61,21 @@ func trackBdVersionFile(persist bool) {
 	localVersionPath := filepath.Join(beadsDir, localVersionFile)
 	lastVersion := readLocalVersion(localVersionPath)
 
-	// Check if version changed (only flag actual upgrades, not downgrades)
+	// Check if version changed (only flag actual upgrades, not downgrades).
+	//
+	// Homebrew --HEAD stamps (HEAD-<sha>) carry no ordering, so CompareVersions
+	// reads them as 0.0.0: a reinstall onto a newer HEAD registers as no change
+	// at all, and moving a release workspace onto HEAD registers as a
+	// downgrade. Treat a changed stamp with a HEAD build on either side as an
+	// upgrade, so the one-shot post-upgrade reconciliation actually runs; brew
+	// reinstalls only move forward. If that assumption is ever wrong the
+	// misfire is bounded — recoverPreV56IfNeeded refuses a non-semver
+	// predecessor, and the workspace's own version markers still refuse a
+	// genuine downgrade. (Those markers cannot arbitrate direction here: they
+	// compare with the same dotted scan and read HEAD stamps as 0.0.0 too.)
 	if lastVersion != "" && lastVersion != Version {
-		if doctor.CompareVersions(Version, lastVersion) > 0 {
+		if doctor.CompareVersions(Version, lastVersion) > 0 ||
+			doctor.IsBrewHeadVersion(Version) || doctor.IsBrewHeadVersion(lastVersion) {
 			// Version upgrade detected!
 			versionUpgradeDetected = true
 			previousVersion = lastVersion
@@ -109,6 +121,13 @@ func getVersionsSince(sinceVersion string) []VersionChange {
 		return versionChanges
 	}
 
+	// A brew --HEAD stamp names no changelog entry; without this the
+	// unknown-version fallback below would report the entire release history
+	// as new after every --HEAD reinstall.
+	if doctor.IsBrewHeadVersion(sinceVersion) {
+		return []VersionChange{}
+	}
+
 	// Find the index of sinceVersion
 	// versionChanges is ordered newest-first: [0.23.0, 0.22.1, 0.22.0, 0.21.0]
 	startIdx := -1
@@ -143,6 +162,16 @@ func getVersionsSince(sinceVersion string) []VersionChange {
 	return result
 }
 
+// displayVersion formats a version stamp for user-facing messages: semver
+// stamps get the conventional "v" prefix, while a brew --HEAD stamp is shown
+// verbatim ("vHEAD-f925f3f" reads as a typo).
+func displayVersion(version string) string {
+	if doctor.IsBrewHeadVersion(version) {
+		return version
+	}
+	return "v" + version
+}
+
 // maybeShowUpgradeNotification displays a one-time upgrade notification if version changed.
 // This is called by commands like 'bd ready' and 'bd list' to inform users of upgrades.
 func maybeShowUpgradeNotification() {
@@ -155,7 +184,7 @@ func maybeShowUpgradeNotification() {
 	upgradeAcknowledged = true
 
 	// Display notification
-	fmt.Printf("🔄 bd upgraded from v%s to v%s since last use\n", previousVersion, Version)
+	fmt.Printf("🔄 bd upgraded from %s to %s since last use\n", displayVersion(previousVersion), displayVersion(Version))
 	fmt.Println("💡 Run 'bd upgrade review' to see what changed")
 	if usesSQLServer() {
 		fmt.Println("💊 Run 'bd doctor' to verify upgrade completed cleanly")
@@ -210,17 +239,7 @@ func autoMigrateOnVersionBump(beadsDir string) {
 		return
 	}
 
-	// GH#2137: If upgrading from pre-0.56, the dolt database may have been
-	// created by the old embedded Dolt mode. Recover by reinitializing.
-	if previousVersion != "" && doctor.CompareVersions(previousVersion, "0.56.0") < 0 {
-		recovered, recErr := doltserver.RecoverPreV56DoltDir(dbPath)
-		if recErr != nil {
-			debug.Logf("auto-migrate: pre-v56 recovery failed: %v", recErr)
-		}
-		if recovered {
-			debug.Logf("auto-migrate: rebuilt pre-v56 dolt database at %s", dbPath)
-		}
-	}
+	recoverPreV56IfNeeded(previousVersion, dbPath)
 
 	// Open database using factory (respects backend config from metadata.json)
 	// Use rootCtx if available and not canceled, otherwise use Background
@@ -288,6 +307,39 @@ func autoMigrateOnVersionBump(beadsDir string) {
 	}
 }
 
+// recoverPreV56IfNeeded rebuilds a Dolt database left behind by the pre-0.56
+// embedded mode (GH#2137) — which means deleting .dolt — but only when the
+// recorded predecessor is an actual semantic version older than 0.56.0.
+//
+// The validity check is not redundant with the comparison. CompareVersions
+// scans every dot-separated part with %d and leaves whatever it cannot read at
+// 0, so any non-semver string writeLocalVersion has recorded compares as
+// pre-0.56 and routes a current workspace into this destructive path:
+// Homebrew's "HEAD-<shortsha>" from a --HEAD install (#5603), and the
+// v-prefixed Go pseudo-version a `go install`-built bd stamps (#5650). Neither
+// is a pre-0.56 workspace; both would lose their database.
+//
+// IsValidSemver rejects exactly the shapes CompareVersions misreads, so this
+// gate can only remove predecessors from the recovery set, never add one: a
+// stamp that reaches RecoverPreV56DoltDir today and still parses keeps its
+// recovery unchanged.
+func recoverPreV56IfNeeded(previousVersion, dbPath string) {
+	if !doctor.IsValidSemver(previousVersion) {
+		return
+	}
+	if doctor.CompareVersions(previousVersion, "0.56.0") >= 0 {
+		return
+	}
+
+	recovered, recErr := doltserver.RecoverPreV56DoltDir(dbPath)
+	if recErr != nil {
+		debug.Logf("auto-migrate: pre-v56 recovery failed: %v", recErr)
+	}
+	if recovered {
+		debug.Logf("auto-migrate: rebuilt pre-v56 dolt database at %s", dbPath)
+	}
+}
+
 // noticeSharedMigrateRefusal turns the one failure autoMigrateOnVersionBump
 // must not swallow into a one-line stderr notice.
 //
@@ -340,8 +392,8 @@ func noticeSharedMigrateRefusal(err error) {
 		remedy = "This database has a remote — run 'bd migrate' to see the migrate-or-adopt options before choosing; reads keep working meanwhile."
 	}
 	fmt.Fprintf(os.Stderr,
-		"bd upgraded to v%s: %d schema migration(s) pending on this database — not auto-applying (#5920).\n%s\n",
-		Version, gateErr.Pending, remedy)
+		"bd upgraded to %s: %d schema migration(s) pending on this database — not auto-applying (#5920).\n%s\n",
+		displayVersion(Version), gateErr.Pending, remedy)
 }
 
 // recordedWorkspaceVersion reads the marker through the role's accessor on a
