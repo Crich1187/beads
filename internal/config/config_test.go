@@ -2230,3 +2230,38 @@ func TestInitialize_IgnoreRepoConfigMatchesASymlinkedBeadsDir(t *testing.T) {
 		t.Errorf("ConfigFileUsed() = %q, want empty when the repo config is ignored", got)
 	}
 }
+
+// TestInitialize_HomeBeadsConfigDoesNotLeakToUnrelatedDir verifies that when
+// $HOME/.beads/config.yaml exists (e.g. root workspace), running bd in an
+// unrelated scratch directory does not load settings from $HOME/.beads/config.yaml (root-8ysaa).
+func TestInitialize_HomeBeadsConfigDoesNotLeakToUnrelatedDir(t *testing.T) {
+	restore := envSnapshot(t)
+	defer restore()
+
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+	t.Setenv("USERPROFILE", tmpHome)
+
+	homeBeadsDir := filepath.Join(tmpHome, ".beads")
+	if err := os.MkdirAll(homeBeadsDir, 0o755); err != nil {
+		t.Fatalf("failed to create home .beads: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(homeBeadsDir, "config.yaml"), []byte("sync.remote: git+http://example.com/fleet.git\nissue-prefix: root\n"), 0o600); err != nil {
+		t.Fatalf("failed to write home beads config: %v", err)
+	}
+
+	scratchDir := t.TempDir()
+	t.Chdir(scratchDir)
+
+	ResetForTesting()
+	if err := Initialize(); err != nil {
+		t.Fatalf("Initialize() returned error: %v", err)
+	}
+
+	if got := GetString("sync.remote"); got != "" {
+		t.Fatalf("GetString(sync.remote) = %q, want empty in scratch directory", got)
+	}
+	if got := GetString("issue-prefix"); got != "" {
+		t.Fatalf("GetString(issue-prefix) = %q, want empty in scratch directory", got)
+	}
+}
