@@ -199,7 +199,8 @@ func TestInitializeUserConfigPrecedence(t *testing.T) {
 	removeConfigPath(t, candidates.documented)
 	assertInitializedActor(t, "native")
 	removeConfigPath(t, candidates.native)
-	assertInitializedActor(t, "legacy")
+	// Legacy <home>/.beads/config.yaml is not loaded as user-global config (root-8ysaa)
+	assertInitializedActor(t, "")
 }
 
 func userConfigTestRoots(t *testing.T) (string, string) {

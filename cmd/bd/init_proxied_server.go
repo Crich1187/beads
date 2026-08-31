@@ -187,7 +187,7 @@ func runInitProxiedServer(cmd *cobra.Command, ctx context.Context, in initProxie
 	}
 	defer func() { _ = initUOWProvider.Close(ctx) }()
 
-	remoteURL := resolveProxiedInitRemoteURL(ctx, gitUC, in)
+	remoteURL := resolveProxiedInitRemoteURL(ctx, gitUC, in, beadsDir)
 
 	var repoID, cloneID string
 	if id, err := beads.ComputeRepoID(); err == nil {
@@ -314,8 +314,10 @@ func resolveInitPrefix(flagPrefix string) (string, error) {
 	return prefix, nil
 }
 
-func resolveProxiedInitRemoteURL(ctx context.Context, gitUC domain.GitUseCase, in initProxiedServerInput) string {
-	url, source := resolveInitConfiguredSyncRemote(in.initRemote, in.initRemoteChanged, resolveSyncRemote)
+func resolveProxiedInitRemoteURL(ctx context.Context, gitUC domain.GitUseCase, in initProxiedServerInput, beadsDir string) string {
+	url, source := resolveInitConfiguredSyncRemote(in.initRemote, in.initRemoteChanged, func() string {
+		return resolveSyncRemoteFromDir(beadsDir)
+	})
 	if url != "" {
 		return url
 	}
