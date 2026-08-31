@@ -50,6 +50,12 @@ func ResolvePartialID(ctx context.Context, store storage.Storage, input string) 
 		return issues[0].ID, nil
 	}
 
+	// SearchIssues is ID-table exact match. After bd rename the old ID lives
+	// only on events.renamed; GetIssue follows that chain (household JSONL freeze).
+	if issue, err := store.GetIssue(ctx, input); err == nil && issue != nil && issue.ID != "" {
+		return issue.ID, nil
+	}
+
 	// Get the configured prefix
 	prefix, err := store.GetConfig(ctx, "issue_prefix")
 	if err != nil || prefix == "" {
