@@ -1088,7 +1088,7 @@ func TestAutoExportSkipsEmptyExportOverPopulatedJSONL(t *testing.T) {
 	}
 }
 
-func TestAutoExportSkipsWhenExistingJSONLHasIDsMissingFromStore(t *testing.T) {
+func TestAutoExportOverwritesWhenExistingJSONLHasIDsMissingFromStore(t *testing.T) {
 	bd := buildBDForInitTests(t)
 	dir := t.TempDir()
 	env := autoExportDataLossTestEnv(dir)
@@ -1122,19 +1122,22 @@ func TestAutoExportSkipsWhenExistingJSONLHasIDsMissingFromStore(t *testing.T) {
 	run("config", "set", "export.interval", "1ms")
 	run("config", "set", "export.auto", "true")
 	out := run("create", "another local issue", "-p", "2")
-	if !strings.Contains(out, "JSONL-only issue record") || !strings.Contains(out, "dl-jsonl-only") {
-		t.Fatalf("expected JSONL-only refusal warning, got:\n%s", out)
+	if strings.Contains(out, "JSONL-only issue record") {
+		t.Fatalf("auto-export must overwrite JSONL-only ghosts, got skip warning:\n%s", out)
 	}
 
 	got, err := os.ReadFile(jsonlPath)
 	if err != nil {
-		t.Fatalf("expected JSONL to remain: %v", err)
+		t.Fatalf("expected JSONL after export: %v", err)
 	}
-	if string(got) != string(original) {
-		t.Fatalf("JSONL-only records were overwritten:\n%s", got)
+	if strings.Contains(string(got), "dl-jsonl-only") {
+		t.Fatalf("ghost JSONL-only id still present after auto-export:\n%s", got)
 	}
-	if _, err := os.Stat(filepath.Join(dir, ".beads", exportAutoStateFile)); !os.IsNotExist(err) {
-		t.Fatalf("skipped auto-export should not save export state, stat err=%v", err)
+	if !strings.Contains(string(got), `"id":"dl-2"`) && !strings.Contains(string(got), `"id": "dl-2"`) {
+		// created issues are dl-1 then dl-2
+		if !strings.Contains(string(got), "another local issue") {
+			t.Fatalf("fresh export missing new issue:\n%s", got)
+		}
 	}
 }
 

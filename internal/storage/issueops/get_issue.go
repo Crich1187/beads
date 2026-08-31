@@ -10,27 +10,73 @@ import (
 	"github.com/steveyegge/beads/internal/types"
 )
 
+const maxRenameHops = 8
+
 // GetIssueInTx retrieves a single issue by ID within an existing transaction,
 // including its labels. Automatically routes to the wisps/wisp_labels tables
-// if the ID is an active wisp. Returns storage.ErrNotFound (wrapped) if the
-// issue does not exist in either table.
+// if the ID is an active wisp. After bd rename, the old ID is gone from the
+// issues table but events.renamed (old_value → new_value) remains; follow
+// that chain so bd show <old-id> resolves instead of 404ing. Returns
+// storage.ErrNotFound (wrapped) if the issue does not exist in either table
+// and no rename event points at a live row.
 func GetIssueInTx(ctx context.Context, tx DBTX, id string) (*types.Issue, error) {
-	issue, err := getIssueFromTableInTx(ctx, tx, "issues", "labels", id)
-	if err == nil {
-		return issue, nil
-	}
-	if !errors.Is(err, storage.ErrNotFound) {
-		return nil, err
-	}
+	seen := make(map[string]struct{}, maxRenameHops)
+	cur := id
+	for hop := 0; hop < maxRenameHops; hop++ {
+		if _, ok := seen[cur]; ok {
+			break
+		}
+		seen[cur] = struct{}{}
 
-	issue, err = getIssueFromTableInTx(ctx, tx, "wisps", "wisp_labels", id)
-	if err == nil {
-		return issue, nil
+		issue, err := getIssueFromTableInTx(ctx, tx, "issues", "labels", cur)
+		if err == nil {
+			return issue, nil
+		}
+		if !errors.Is(err, storage.ErrNotFound) {
+			return nil, err
+		}
+
+		issue, err = getIssueFromTableInTx(ctx, tx, "wisps", "wisp_labels", cur)
+		if err == nil {
+			return issue, nil
+		}
+		if !errors.Is(err, storage.ErrNotFound) {
+			return nil, err
+		}
+
+		next, err := lookupRenamedIDInTx(ctx, tx, cur)
+		if err != nil {
+			if errors.Is(err, storage.ErrNotFound) {
+				break
+			}
+			return nil, err
+		}
+		cur = next
 	}
-	if errors.Is(err, storage.ErrNotFound) {
-		return nil, fmt.Errorf("%w: issue %s", storage.ErrNotFound, id)
+	return nil, fmt.Errorf("%w: issue %s", storage.ErrNotFound, id)
+}
+
+// lookupRenamedIDInTx returns the latest new_value for a renamed old ID.
+func lookupRenamedIDInTx(ctx context.Context, tx DBTX, oldID string) (string, error) {
+	for _, table := range []string{"events", "wisp_events"} {
+		//nolint:gosec // G201: table is a hardcoded literal
+		row := tx.QueryRowContext(ctx, fmt.Sprintf(
+			`SELECT new_value FROM %s WHERE event_type = 'renamed' AND old_value = ? ORDER BY created_at DESC LIMIT 1`,
+			table,
+		), oldID)
+		var newID sql.NullString
+		err := row.Scan(&newID)
+		if err == sql.ErrNoRows || isTableNotExistError(err) {
+			continue
+		}
+		if err != nil {
+			return "", fmt.Errorf("lookup renamed id: %w", err)
+		}
+		if newID.Valid && newID.String != "" && newID.String != oldID {
+			return newID.String, nil
+		}
 	}
-	return nil, err
+	return "", storage.ErrNotFound
 }
 
 func getIssueFromTableInTx(ctx context.Context, tx DBTX, issueTable, labelTable, id string) (*types.Issue, error) {

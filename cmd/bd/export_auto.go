@@ -107,15 +107,9 @@ func maybeAutoExport(ctx context.Context, allowEmptyOverwrite bool) error {
 			return nil
 		}
 	}
-	if !allowEmptyOverwrite {
-		if missingIDs, err := missingJSONLIssueIDsInStore(ctx, fullPath); err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: auto-export skipped: failed to compare existing JSONL against local store: %v\n", err)
-			return nil
-		} else if len(missingIDs) > 0 {
-			fmt.Fprintf(os.Stderr, "Warning: auto-export skipped: %s contains %d JSONL-only issue record(s) absent from the local Dolt store (%s); refusing to overwrite. Run `bd init --from-jsonl` to import the JSONL file, or move it aside and retry.\n", fullPath, len(missingIDs), strings.Join(sampleStrings(missingIDs, 5), ", "))
-			return nil
-		}
-	}
+	// JSONL-only IDs (renames, deletes) are stale projection rows, not a
+	// second ledger. Overwrite them. The empty-export guard above is the
+	// data-loss check that must remain.
 
 	// Run the export — memories are excluded from auto-export because they
 	// contain private agent context that must not reach git history (GH#3650).
@@ -213,33 +207,6 @@ func countIssueRecordsInJSONL(path string) (int, error) {
 	return len(ids), nil
 }
 
-func missingJSONLIssueIDsInStore(ctx context.Context, path string) ([]string, error) {
-	existingIDs, err := issueIDsInJSONL(path)
-	if err != nil {
-		return nil, err
-	}
-	if len(existingIDs) == 0 {
-		return nil, nil
-	}
-
-	issues, err := store.SearchIssues(ctx, "", types.IssueFilter{Limit: 0})
-	if err != nil {
-		return nil, fmt.Errorf("failed to search issues: %w", err)
-	}
-	localIDs := make(map[string]struct{}, len(issues))
-	for _, issue := range issues {
-		localIDs[issue.ID] = struct{}{}
-	}
-
-	missing := make([]string, 0)
-	for _, id := range existingIDs {
-		if _, ok := localIDs[id]; !ok {
-			missing = append(missing, id)
-		}
-	}
-	return missing, nil
-}
-
 func issueIDsInJSONL(path string) ([]string, error) {
 	f, err := os.Open(path) //nolint:gosec
 	if err != nil {
@@ -301,15 +268,6 @@ func issueIDsInJSONL(path string) ([]string, error) {
 
 	sort.Strings(ids)
 	return ids, nil
-}
-
-func sampleStrings(values []string, limit int) []string {
-	if len(values) <= limit {
-		return values
-	}
-	out := append([]string{}, values[:limit]...)
-	out = append(out, "...")
-	return out
 }
 
 func autoExportFilter(ctx context.Context) types.IssueFilter {

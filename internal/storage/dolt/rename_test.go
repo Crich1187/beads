@@ -615,13 +615,19 @@ func TestUpdateIssueIDStillWorksForRegularIssues(t *testing.T) {
 		t.Fatalf("UpdateIssueID failed: %v", err)
 	}
 
-	// Verify the old ID is gone and new ID exists
 	got, err := store.GetIssue(ctx, newID)
 	if err != nil {
 		t.Fatalf("GetIssue failed for renamed issue: %v", err)
 	}
 	if got.Title != "Regular issue to rename" {
 		t.Fatalf("expected original title, got %q", got.Title)
+	}
+	aliased, err := store.GetIssue(ctx, "test-regular-1")
+	if err != nil {
+		t.Fatalf("GetIssue(old ID) should follow events.renamed: %v", err)
+	}
+	if aliased.ID != newID {
+		t.Fatalf("GetIssue(old ID) ID = %q, want %q", aliased.ID, newID)
 	}
 
 	// Verify rename event in events table

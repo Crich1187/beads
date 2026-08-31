@@ -238,3 +238,33 @@ func TestAddLabel(t *testing.T) {
 		}
 	})
 }
+
+func TestGetIssueFollowsRenameEvent(t *testing.T) {
+	skipUnlessEmbeddedDolt(t)
+	te := newTestEnv(t, "girn")
+	ctx := t.Context()
+	issue := &types.Issue{
+		ID:        "girn-old",
+		Title:     "Rename me",
+		Status:    types.StatusOpen,
+		Priority:  2,
+		IssueType: types.TypeTask,
+	}
+	if err := te.store.CreateIssue(ctx, issue, "tester"); err != nil {
+		t.Fatalf("CreateIssue: %v", err)
+	}
+	issue.ID = "girn-new"
+	if err := te.store.UpdateIssueID(ctx, "girn-old", "girn-new", issue, "tester"); err != nil {
+		t.Fatalf("UpdateIssueID: %v", err)
+	}
+	got, err := te.store.GetIssue(ctx, "girn-old")
+	if err != nil {
+		t.Fatalf("GetIssue(old id) should follow renamed event: %v", err)
+	}
+	if got.ID != "girn-new" {
+		t.Fatalf("GetIssue(old id).ID = %q, want girn-new", got.ID)
+	}
+	if got.Title != "Rename me" {
+		t.Fatalf("title = %q", got.Title)
+	}
+}
