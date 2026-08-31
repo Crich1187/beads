@@ -199,7 +199,7 @@ func TestInitializeUserConfigPrecedence(t *testing.T) {
 	removeConfigPath(t, candidates.documented)
 	assertInitializedActor(t, "native")
 	removeConfigPath(t, candidates.native)
-	assertInitializedActor(t, "legacy")
+	assertInitializedActor(t, "")
 }
 
 func userConfigTestRoots(t *testing.T) (string, string) {
