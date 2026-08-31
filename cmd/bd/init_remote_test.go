@@ -189,3 +189,46 @@ func TestInitTimeCloneConfigExternalDefaultsAreSelfContained(t *testing.T) {
 		t.Fatalf("database = %q, want beads_proj", cfg.GetDoltDatabase())
 	}
 }
+
+// TestInitScratchDirDoesNotInheritAmbientRemoteWithoutFlag verifies that a
+// scratch directory with no local .beads/config.yaml does not inherit a
+// sync.remote from ambient/user-global config (root-8ysaa).
+func TestInitScratchDirDoesNotInheritAmbientRemoteWithoutFlag(t *testing.T) {
+	scratchDir := t.TempDir()
+	beadsDir := filepath.Join(scratchDir, ".beads")
+
+	syncURL, source := resolveInitConfiguredSyncRemote("", false, func() string {
+		return resolveSyncRemoteFromDir(beadsDir)
+	})
+	if syncURL != "" {
+		t.Fatalf("syncURL = %q, want empty for scratch directory", syncURL)
+	}
+	if source != initSyncRemoteNone {
+		t.Fatalf("source = %v, want initSyncRemoteNone", source)
+	}
+}
+
+// TestInitTargetDirWithConfigYamlInheritsTargetRemote verifies that a
+// pre-existing target workspace config.yaml (e.g. from git clone) is
+// correctly resolved as the sync.remote.
+func TestInitTargetDirWithConfigYamlInheritsTargetRemote(t *testing.T) {
+	scratchDir := t.TempDir()
+	beadsDir := filepath.Join(scratchDir, ".beads")
+	if err := os.MkdirAll(beadsDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	const targetRemote = "git+http://example.com/lymar/beads-myproject.git"
+	if err := os.WriteFile(filepath.Join(beadsDir, "config.yaml"), []byte("sync.remote: "+targetRemote+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	syncURL, source := resolveInitConfiguredSyncRemote("", false, func() string {
+		return resolveSyncRemoteFromDir(beadsDir)
+	})
+	if syncURL != targetRemote {
+		t.Fatalf("syncURL = %q, want %q", syncURL, targetRemote)
+	}
+	if source != initSyncRemoteConfigured {
+		t.Fatalf("source = %v, want initSyncRemoteConfigured", source)
+	}
+}
