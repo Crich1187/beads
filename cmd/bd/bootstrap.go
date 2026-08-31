@@ -343,7 +343,7 @@ func detectBootstrapAction(beadsDir string, cfg *configfile.Config) BootstrapPla
 	}
 
 	// Check sync.remote (primary) or sync.git-remote (deprecated fallback)
-	syncRemote := resolveSyncRemote()
+	syncRemote := resolveSyncRemoteFromDir(beadsDir)
 	if syncRemote != "" {
 		if isGitCodeRepoURL(syncRemote) {
 			// Cloning from a git code-repo URL via DOLT_CLONE spins dolt to
