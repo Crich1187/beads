@@ -17,6 +17,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -865,7 +866,7 @@ func TestAutoMigrateSkippedDuringMigrationFreeze(t *testing.T) {
 // hang here is the failure).
 func TestDoctorMutationBlockedDuringMigrationFreeze(t *testing.T) {
 	bd, dir := setupMigrationFreezeWorkspace(t)
-	marker := writeFreezeMarker(t, dir, "migrator", "dolt v2 migration")
+	writeFreezeMarker(t, dir, "migrator", "dolt v2 migration")
 	before := doctorWorkspaceFingerprint(t, dir)
 
 	for _, tt := range doctorMutationSurfaces() {
@@ -877,7 +878,17 @@ func TestDoctorMutationBlockedDuringMigrationFreeze(t *testing.T) {
 			}
 			for _, want := range []string{
 				"workspace is frozen for migration",
-				"bd " + tt.op + " is blocked by the freeze marker at " + marker,
+				// The operation label and the marker path are asserted
+				// separately: the path is matched from the workspace
+				// directory's own name down, the same way
+				// TestCreateBlockedDuringMigrationFreeze does it, because the
+				// refusal reports the marker as the subprocess's cwd walk
+				// found it. On macOS that walk starts from an os.Getwd() the
+				// kernel has already resolved, so a /var/folders temp root
+				// arrives as /private/var/folders and a full-path expectation
+				// never matches.
+				"bd " + tt.op + " is blocked by the freeze marker at ",
+				filepath.Join(filepath.Base(dir), migration.FileName),
 				"To resume writes, remove that file.",
 			} {
 				if !strings.Contains(stderr, want) {
@@ -891,6 +902,52 @@ func TestDoctorMutationBlockedDuringMigrationFreeze(t *testing.T) {
 	}
 }
 
+// TestFreezeRefusalPathMatchesUnderSymlinkedTempRoot builds, deliberately, the
+// filesystem shape that made #6038 a macOS-only red lane: a temp root reached
+// through a symlink. A subprocess's os.Getwd() is already symlink-resolved, so
+// a marker found by the cwd walk is reported under its real path while the test
+// still holds the unresolved one — on macOS every t.TempDir() is /var/folders,
+// and /var is a symlink to /private/var, so full-path expectations never match
+// there and always match on Linux, where temp roots are real directories.
+//
+// Constructing the symlink here is what makes that class reproducible on the
+// Linux lane every contributor actually runs.
+func TestFreezeRefusalPathMatchesUnderSymlinkedTempRoot(t *testing.T) {
+	if runtime.GOOS == windowsOS {
+		t.Skip("creating symlinks needs elevated privileges on Windows")
+	}
+	root := t.TempDir()
+	real := filepath.Join(root, "real")
+	if err := os.MkdirAll(real, 0755); err != nil {
+		t.Fatalf("creating %s: %v", real, err)
+	}
+	link := filepath.Join(root, "link")
+	if err := os.Symlink(real, link); err != nil {
+		t.Skipf("symlinks unavailable on this filesystem: %v", err)
+	}
+
+	bd := setupMigrationFreezeWorkspaceIn(t, real)
+	writeFreezeMarker(t, real, "migrator", "dolt v2 migration")
+
+	// cwd expressed through the symlink — the shape macOS hands every
+	// subprocess without anyone asking for it.
+	stdout, stderr, code := runBDFrozen(t, bd, link, "create", "should not be created", "-p", "2")
+	if code != ExitMigrationFrozen {
+		t.Fatalf("exit code = %d, want %d\nstdout:\n%s\nstderr:\n%s", code, ExitMigrationFrozen, stdout, stderr)
+	}
+	if want := filepath.Join(filepath.Base(real), migration.FileName); !strings.Contains(stderr, want) {
+		t.Errorf("refusal should name the marker by its resolved path, matched from %q down:\n%s", want, stderr)
+	}
+	// The other half, and the one that keeps this honest: the unresolved path
+	// must NOT appear. Without it, someone could satisfy the check above while
+	// reintroducing a full-path expectation elsewhere.
+	if unresolved := filepath.Join(link, migration.FileName); strings.Contains(stderr, unresolved) {
+		t.Errorf("refusal named the unresolved symlink path %q; assertions that pin it break on macOS:\n%s",
+			unresolved, stderr)
+	}
+	assertVendorNeutral(t, stderr)
+}
+
 // TestDoctorPathArgBlockedByTargetFreeze covers the reason doctor's gate takes
 // the resolved target path: doctor is the only write-capable command that
 // operates on a directory named on the command line, so keying the lookup on
@@ -899,7 +956,7 @@ func TestDoctorMutationBlockedDuringMigrationFreeze(t *testing.T) {
 func TestDoctorPathArgBlockedByTargetFreeze(t *testing.T) {
 	target := t.TempDir()
 	bd := setupMigrationFreezeWorkspaceIn(t, target)
-	marker := writeFreezeMarker(t, target, "migrator", "dolt v2 migration")
+	writeFreezeMarker(t, target, "migrator", "dolt v2 migration")
 	before := doctorWorkspaceFingerprint(t, target)
 
 	// cwd is an unrelated, unfrozen workspace; only the target is frozen.
@@ -911,8 +968,14 @@ func TestDoctorPathArgBlockedByTargetFreeze(t *testing.T) {
 	if code != ExitMigrationFrozen {
 		t.Fatalf("exit code = %d, want %d\nstdout:\n%s\nstderr:\n%s", code, ExitMigrationFrozen, stdout, stderr)
 	}
-	if !strings.Contains(stderr, marker) {
-		t.Errorf("refusal should name the target's own marker %q:\n%s", marker, stderr)
+	// Same path-tail convention as the table test above. This assertion happens
+	// to survive the macOS symlink split today — the target arrives from argv,
+	// which nothing resolves — but it would break the moment discovery
+	// canonicalizes its roots, and target/outside are distinct temp
+	// subdirectories, so the tail still proves it named the target and not cwd.
+	wantMarker := filepath.Join(filepath.Base(target), migration.FileName)
+	if !strings.Contains(stderr, wantMarker) {
+		t.Errorf("refusal should name the target's own marker %q:\n%s", wantMarker, stderr)
 	}
 	assertVendorNeutral(t, stderr)
 	assertDoctorRefusalIsClean(t, stdout)
