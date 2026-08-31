@@ -476,10 +476,29 @@ Non-interactive mode (--non-interactive or BD_NON_INTERACTIVE=1):
 			}
 		}
 
-		// Determine prefix with precedence: flag > config > auto-detect from git > auto-detect from directory name
+		// Determine beadsDir first (used for prefix, storage path, and remote resolution).
+		// BEADS_DIR takes precedence, otherwise use CWD/.beads (with redirect support).
+		// This must be computed BEFORE initDBPath to ensure consistent path resolution
+		// (avoiding macOS /var -> /private/var symlink issues when directory creation
+		// happens between path computations).
+		var beadsDirForInit string
+		if envBeadsDir := os.Getenv("BEADS_DIR"); envBeadsDir != "" {
+			beadsDirForInit = utils.CanonicalizePath(envBeadsDir)
+		} else {
+			beadsDirForInit = beads.GetWorktreeFallbackBeadsDir()
+			if beadsDirForInit == "" {
+				localBeadsDir := filepath.Join(".", ".beads")
+				beadsDirForInit = beads.FollowRedirect(localBeadsDir)
+			}
+		}
+
+		// Determine prefix with precedence: flag > target dir config > auto-detect from directory name
 		if prefix == "" {
-			// Try to get from config file
-			prefix = config.GetString("issue-prefix")
+			if v := config.GetStringFromDir(beadsDirForInit, "issue-prefix"); v != "" {
+				prefix = v
+			} else if v := config.GetStringFromDir(beadsDirForInit, "issue_prefix"); v != "" {
+				prefix = v
+			}
 		}
 
 		// auto-detect prefix from directory name
@@ -510,7 +529,9 @@ Non-interactive mode (--non-interactive or BD_NON_INTERACTIVE=1):
 			var earlySyncURL string
 			earlyRemoteSource := initSyncRemoteNone
 			earlyRemoteHasDoltData := false
-			earlySyncURL, earlyRemoteSource = resolveInitConfiguredSyncRemote(initRemote, initRemoteChanged, resolveSyncRemote)
+			earlySyncURL, earlyRemoteSource = resolveInitConfiguredSyncRemote(initRemote, initRemoteChanged, func() string {
+				return resolveSyncRemoteFromDir(beadsDirForInit)
+			})
 			if earlyRemoteSource == initSyncRemoteExplicit {
 				// An explicit --remote is intent to bootstrap or wire that URL,
 				// but it is not proof that the remote already contains Dolt
@@ -553,22 +574,6 @@ Non-interactive mode (--non-interactive or BD_NON_INTERACTIVE=1):
 					// selection happens later after beadsDir/dbName are known.
 					return err
 				}
-			}
-		}
-
-		// Determine beadsDir first (used for all storage path calculations).
-		// BEADS_DIR takes precedence, otherwise use CWD/.beads (with redirect support).
-		// This must be computed BEFORE initDBPath to ensure consistent path resolution
-		// (avoiding macOS /var -> /private/var symlink issues when directory creation
-		// happens between path computations).
-		var beadsDirForInit string
-		if envBeadsDir := os.Getenv("BEADS_DIR"); envBeadsDir != "" {
-			beadsDirForInit = utils.CanonicalizePath(envBeadsDir)
-		} else {
-			beadsDirForInit = beads.GetWorktreeFallbackBeadsDir()
-			if beadsDirForInit == "" {
-				localBeadsDir := filepath.Join(".", ".beads")
-				beadsDirForInit = beads.FollowRedirect(localBeadsDir)
 			}
 		}
 
@@ -811,7 +816,9 @@ Non-interactive mode (--non-interactive or BD_NON_INTERACTIVE=1):
 		// CheckRemoteSafety chokepoint encodes this invariant; any future
 		// flag that can interact with remote history must route through
 		// it rather than adding another `&& !someFlag` here.
-		syncResolutionURL, syncRemoteSource := resolveInitConfiguredSyncRemote(initRemote, initRemoteChanged, resolveSyncRemote)
+		syncResolutionURL, syncRemoteSource := resolveInitConfiguredSyncRemote(initRemote, initRemoteChanged, func() string {
+			return resolveSyncRemoteFromDir(beadsDirForInit)
+		})
 		syncURL := syncResolutionURL
 		syncURLFromConfig := syncURL != "" && syncRemoteSource != initSyncRemoteNone // true when URL came from explicit user config
 		bootstrappedFromRemote := false

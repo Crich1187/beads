@@ -32,23 +32,16 @@ func Initialize() error {
 	// subsequent file so higher-priority values overwrite lower-priority ones.
 	//
 	// Precedence (highest to lowest):
-	//   BEADS_DIR/config.yaml > project .beads/config.yaml > ~/.config/bd/config.yaml > ~/.beads/config.yaml
+	//   BEADS_DIR/config.yaml > project .beads/config.yaml > ~/.config/bd/config.yaml
 	//
-	// Previously, only ONE config file was loaded (the highest-priority match),
-	// which meant user-level config was silently ignored when project-level
-	// config existed — e.g., the idle-monitor daemon with BEADS_DIR set (GH#2375).
+	// Previously, ~/.beads/config.yaml was loaded as a legacy user-global config,
+	// but on hosts where $HOME is a beads workspace (e.g. /root/.beads), that
+	// file is project config for $HOME and must NOT leak into unrelated scratch
+	// directories (root-8ysaa). User-level settings live in ~/.config/bd/config.yaml.
 	var configPaths []string     // ordered lowest priority first
 	var primaryConfigPath string // project-level config (for config.local.yaml and SaveConfigValue)
 
-	// 3. Legacy: ~/.beads/config.yaml (lowest priority)
-	if homeDir, err := os.UserHomeDir(); err == nil {
-		p := filepath.Join(homeDir, ".beads", "config.yaml")
-		if _, err := os.Stat(p); err == nil {
-			configPaths = append(configPaths, p)
-		}
-	}
-
-	// 2. User: ~/.config/bd/config.yaml
+	// User: ~/.config/bd/config.yaml
 	if configDir, err := os.UserConfigDir(); err == nil {
 		p := filepath.Join(configDir, "bd", "config.yaml")
 		if _, err := os.Stat(p); err == nil {
@@ -615,6 +608,35 @@ func GetStringFromDir(beadsDir, key string) string {
 	if err := yaml.Unmarshal(data, &root); err != nil {
 		return ""
 	}
+
+	formatVal := func(val interface{}) string {
+		if val == nil {
+			return ""
+		}
+		switch s := val.(type) {
+		case string:
+			return s
+		default:
+			return fmt.Sprintf("%v", s)
+		}
+	}
+
+	// 1. Direct top-level match (e.g. "sync.remote: url" or "issue-prefix: root")
+	if val, ok := root[key]; ok {
+		return formatVal(val)
+	}
+
+	// 2. Direct top-level alias / hyphen match (e.g. "sync-remote: url" or "issue_prefix: root")
+	normalized := normalizeYamlKey(key)
+	if val, ok := root[normalized]; ok {
+		return formatVal(val)
+	}
+	underscoreKey := strings.ReplaceAll(key, "-", "_")
+	if val, ok := root[underscoreKey]; ok {
+		return formatVal(val)
+	}
+
+	// 3. Nested path traversal (e.g. sync: remote: url)
 	parts := strings.SplitN(key, ".", 2)
 	node := root
 	for len(parts) == 2 {
@@ -633,12 +655,7 @@ func GetStringFromDir(beadsDir, key string) string {
 	if !ok {
 		return ""
 	}
-	switch s := val.(type) {
-	case string:
-		return s
-	default:
-		return fmt.Sprintf("%v", s)
-	}
+	return formatVal(val)
 }
 
 // GetBool retrieves a boolean configuration value

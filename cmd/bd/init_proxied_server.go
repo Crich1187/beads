@@ -168,7 +168,7 @@ func runInitProxiedServer(cmd *cobra.Command, ctx context.Context, in initProxie
 	} else if !in.quiet {
 		fmt.Fprintf(os.Stderr, "Warning: could not compute clone ID: %v\n", err)
 	}
-	if remoteURL := resolveProxiedInitRemoteURL(ctx, gitUC, in); remoteURL != "" {
+	if remoteURL := resolveProxiedInitRemoteURL(ctx, gitUC, in, beadsDir); remoteURL != "" {
 		bootstrapParams.RemoteName = "origin"
 		bootstrapParams.RemoteURL = remoteURL
 	}
@@ -212,8 +212,10 @@ func resolveInitPrefix(flagPrefix string) (string, error) {
 	return prefix, nil
 }
 
-func resolveProxiedInitRemoteURL(ctx context.Context, gitUC domain.GitUseCase, in initProxiedServerInput) string {
-	url, source := resolveInitConfiguredSyncRemote(in.initRemote, in.initRemoteChanged, resolveSyncRemote)
+func resolveProxiedInitRemoteURL(ctx context.Context, gitUC domain.GitUseCase, in initProxiedServerInput, beadsDir string) string {
+	url, source := resolveInitConfiguredSyncRemote(in.initRemote, in.initRemoteChanged, func() string {
+		return resolveSyncRemoteFromDir(beadsDir)
+	})
 	if url != "" {
 		return url
 	}

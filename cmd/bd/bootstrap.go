@@ -294,7 +294,7 @@ func detectBootstrapAction(beadsDir string, cfg *configfile.Config) BootstrapPla
 	isServer := cfg.IsDoltServerMode() || isSharedServer
 
 	// Check sync.remote (primary) or sync.git-remote (deprecated fallback)
-	syncRemote := resolveSyncRemote()
+	syncRemote := resolveSyncRemoteFromDir(beadsDir)
 	if syncRemote != "" {
 		// User-provided sync.remote — trust the URL format as-is.
 		// normalizeRemoteURL would convert http:// to git+http://,
