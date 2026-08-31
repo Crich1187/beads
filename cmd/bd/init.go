@@ -858,9 +858,7 @@ Non-interactive mode (--non-interactive or BD_NON_INTERACTIVE=1):
 			earlyRemoteSource := initSyncRemoteNone
 			earlyRemoteHasDoltData := false
 			var earlyProbeNote string
-			earlySyncURL, earlyRemoteSource = resolveInitConfiguredSyncRemote(initRemote, initRemoteChanged, func() string {
-				return resolveSyncRemoteFromDir(beadsDirForInit)
-			})
+			earlySyncURL, earlyRemoteSource = resolveInitConfiguredSyncRemote(initRemote, initRemoteChanged, resolveSyncRemote)
 			if earlyRemoteSource == initSyncRemoteExplicit {
 				// An explicit --remote is intent to bootstrap or wire that URL,
 				// but it is not proof that the remote already contains Dolt
@@ -1196,9 +1194,7 @@ Non-interactive mode (--non-interactive or BD_NON_INTERACTIVE=1):
 		// CheckRemoteSafety chokepoint encodes this invariant; any future
 		// flag that can interact with remote history must route through
 		// it rather than adding another `&& !someFlag` here.
-		syncResolutionURL, syncRemoteSource := resolveInitConfiguredSyncRemote(initRemote, initRemoteChanged, func() string {
-			return resolveSyncRemoteFromDir(beadsDirForInit)
-		})
+		syncResolutionURL, syncRemoteSource := resolveInitConfiguredSyncRemote(initRemote, initRemoteChanged, resolveSyncRemote)
 		syncURL := syncResolutionURL
 		syncURLFromConfig := syncURL != "" && syncRemoteSource != initSyncRemoteNone // true when URL came from explicit user config
 		bootstrappedFromRemote := false
