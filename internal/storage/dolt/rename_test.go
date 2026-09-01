@@ -3,8 +3,10 @@ package dolt
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"testing"
 
+	"github.com/google/uuid"
 	"github.com/steveyegge/beads/internal/storage/issueops"
 	"github.com/steveyegge/beads/internal/types"
 )
@@ -632,5 +634,167 @@ func TestUpdateIssueIDStillWorksForRegularIssues(t *testing.T) {
 	}
 	if eventCount != 1 {
 		t.Fatalf("expected 1 rename event for new ID, got %d", eventCount)
+	}
+
+	// Verify GetIssue follows the rename event and resolves the old ID.
+	got, err = store.GetIssue(ctx, "test-regular-1")
+	if err != nil {
+		t.Fatalf("GetIssue(oldID) failed: %v", err)
+	}
+	if got.ID != newID {
+		t.Fatalf("GetIssue(oldID) returned %q, want %q", got.ID, newID)
+	}
+	if got.Title != "Regular issue to rename" {
+		t.Fatalf("GetIssue(oldID) title %q, want original title", got.Title)
+	}
+}
+
+// TestGetIssueFollowsRenameEventChain verifies that GetIssue follows multiple
+// rename events in order, up to the hop limit.
+func TestGetIssueFollowsRenameEventChain(t *testing.T) {
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	issue := &types.Issue{
+		ID:        "chain-a",
+		Title:     "Chain start",
+		Status:    types.StatusOpen,
+		Priority:  2,
+		IssueType: types.TypeTask,
+	}
+	if err := store.CreateIssue(ctx, issue, "test"); err != nil {
+		t.Fatalf("CreateIssue failed: %v", err)
+	}
+
+	// a -> b -> c -> d
+	for _, pair := range []struct{ oldID, newID string }{
+		{"chain-a", "chain-b"},
+		{"chain-b", "chain-c"},
+		{"chain-c", "chain-d"},
+	} {
+		issue.ID = pair.newID
+		if err := store.UpdateIssueID(ctx, pair.oldID, pair.newID, issue, "test"); err != nil {
+			t.Fatalf("UpdateIssueID %s -> %s failed: %v", pair.oldID, pair.newID, err)
+		}
+	}
+
+	got, err := store.GetIssue(ctx, "chain-a")
+	if err != nil {
+		t.Fatalf("GetIssue(chain-a) failed: %v", err)
+	}
+	if got.ID != "chain-d" {
+		t.Fatalf("GetIssue(chain-a) returned %q, want chain-d", got.ID)
+	}
+}
+
+// TestGetIssueFollowsRenameEventCycle verifies that GetIssue detects a rename
+// cycle among IDs that do not exist as issues and returns an error instead of
+// looping forever.
+func TestGetIssueFollowsRenameEventCycle(t *testing.T) {
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	// Create an anchor issue solely to satisfy the events FK. The rename cycle
+	// uses IDs A -> B -> C -> A that are not present in issues/wisps.
+	anchor := &types.Issue{
+		ID:        "cycle-anchor",
+		Title:     "Anchor",
+		Status:    types.StatusOpen,
+		Priority:  2,
+		IssueType: types.TypeTask,
+	}
+	if err := store.CreateIssue(ctx, anchor, "test"); err != nil {
+		t.Fatalf("CreateIssue failed: %v", err)
+	}
+
+	for _, pair := range []struct{ oldID, newID string }{
+		{"cycle-a", "cycle-b"},
+		{"cycle-b", "cycle-c"},
+		{"cycle-c", "cycle-a"},
+	} {
+		if _, err := store.db.ExecContext(ctx, `
+			INSERT INTO events (id, issue_id, event_type, actor, old_value, new_value)
+			VALUES (?, ?, 'renamed', ?, ?, ?)
+		`, uuid.Must(uuid.NewV7()).String(), anchor.ID, "test", pair.oldID, pair.newID); err != nil {
+			t.Fatalf("failed to inject cycle edge %s -> %s: %v", pair.oldID, pair.newID, err)
+		}
+	}
+
+	_, err := store.GetIssue(ctx, "cycle-a")
+	if err == nil {
+		t.Fatal("GetIssue(cycle-a) succeeded, expected error for cycle")
+	}
+}
+
+// TestGetIssueFollowsWispRenameEvent verifies that GetIssue follows rename
+// events stored in wisp_events for wisps.
+func TestGetIssueFollowsWispRenameEvent(t *testing.T) {
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	wisp := &types.Issue{
+		ID:        "wisp-old",
+		Title:     "Wisp to rename",
+		Status:    types.StatusOpen,
+		Priority:  2,
+		IssueType: types.TypeTask,
+		Ephemeral: true,
+	}
+	if err := store.CreateIssue(ctx, wisp, "test"); err != nil {
+		t.Fatalf("CreateIssue failed: %v", err)
+	}
+
+	newID := "wisp-new"
+	wisp.ID = newID
+	if err := store.UpdateIssueID(ctx, "wisp-old", newID, wisp, "test"); err != nil {
+		t.Fatalf("UpdateIssueID failed: %v", err)
+	}
+
+	got, err := store.GetIssue(ctx, "wisp-old")
+	if err != nil {
+		t.Fatalf("GetIssue(wisp-old) failed: %v", err)
+	}
+	if got.ID != newID {
+		t.Fatalf("GetIssue(wisp-old) returned %q, want %q", got.ID, newID)
+	}
+}
+
+// TestGetIssueRenameHopLimit verifies that GetIssue stops following rename
+// events after the configured hop limit.
+func TestGetIssueRenameHopLimit(t *testing.T) {
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	issue := &types.Issue{
+		ID:        "hop-0",
+		Title:     "Hop start",
+		Status:    types.StatusOpen,
+		Priority:  2,
+		IssueType: types.TypeTask,
+	}
+	if err := store.CreateIssue(ctx, issue, "test"); err != nil {
+		t.Fatalf("CreateIssue failed: %v", err)
+	}
+
+	// Build a chain longer than maxRenameHops (8).
+	for i := 0; i < 10; i++ {
+		next := fmt.Sprintf("hop-%d", i+1)
+		issue.ID = next
+		if err := store.UpdateIssueID(ctx, fmt.Sprintf("hop-%d", i), next, issue, "test"); err != nil {
+			t.Fatalf("UpdateIssueID hop %d failed: %v", i, err)
+		}
+	}
+
+	_, err := store.GetIssue(ctx, "hop-0")
+	if err == nil {
+		t.Fatal("GetIssue(hop-0) succeeded, expected error for exceeded hop limit")
 	}
 }

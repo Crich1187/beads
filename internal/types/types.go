@@ -1620,6 +1620,9 @@ const (
 	EventLabelAdded        EventType = "label_added"
 	EventLabelRemoved      EventType = "label_removed"
 	EventCompacted         EventType = "compacted"
+	// EventRenamed records that an issue ID was changed. old_value is the
+	// previous ID; new_value is the current ID.
+	EventRenamed EventType = "renamed"
 	// EventLeaseReclaimed records that a stale lease was reverted to ready by
 	// bd reclaim (dead-worker recovery). old_value is the previous owner.
 	EventLeaseReclaimed EventType = "lease_reclaimed"

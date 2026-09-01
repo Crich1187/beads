@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"regexp"
 	"strings"
 	"testing"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/storage/sqlbuild"
+	"github.com/steveyegge/beads/internal/types"
 )
 
 // missingTableError builds the driver error a Dolt query returns when its FROM
@@ -33,6 +35,17 @@ func missingTableErrorMySQLText(schema, table string) error {
 func expectHydrationQuery(mock sqlmock.Sqlmock, table, id string, err error) {
 	mock.ExpectQuery(regexp.QuoteMeta("SELECT " + IssueSelectColumns + " FROM " + table + " " + sqlbuild.LeaseJoin(table) + " WHERE id = ?")).
 		WithArgs(id).
+		WillReturnError(err)
+}
+
+func expectRenameQuery(mock sqlmock.Sqlmock, table, id string, err error) {
+	mock.ExpectQuery(regexp.QuoteMeta(fmt.Sprintf(`
+			SELECT new_value, created_at FROM %s
+			WHERE old_value = ? AND event_type = ?
+			ORDER BY created_at DESC, id DESC
+			LIMIT 1
+		`, table))).
+		WithArgs(id, string(types.EventRenamed)).
 		WillReturnError(err)
 }
 
@@ -84,6 +97,8 @@ func TestGetIssueInTxMissingWispsTableIsNotFound(t *testing.T) {
 
 	expectHydrationQuery(mock, "issues", "bd-1", sql.ErrNoRows)
 	expectHydrationQuery(mock, "wisps", "bd-1", missingTableError("wisps"))
+	expectRenameQuery(mock, "events", "bd-1", sql.ErrNoRows)
+	expectRenameQuery(mock, "wisp_events", "bd-1", missingTableError("wisp_events"))
 
 	_, err := GetIssueInTx(context.Background(), tx, "bd-1")
 	if !errors.Is(err, storage.ErrNotFound) {
@@ -101,6 +116,8 @@ func TestGetIssueInTxAbsentRowIsNotFound(t *testing.T) {
 
 	expectHydrationQuery(mock, "issues", "bd-1", sql.ErrNoRows)
 	expectHydrationQuery(mock, "wisps", "bd-1", sql.ErrNoRows)
+	expectRenameQuery(mock, "events", "bd-1", sql.ErrNoRows)
+	expectRenameQuery(mock, "wisp_events", "bd-1", sql.ErrNoRows)
 
 	_, err := GetIssueInTx(context.Background(), tx, "bd-1")
 	if !errors.Is(err, storage.ErrNotFound) {
