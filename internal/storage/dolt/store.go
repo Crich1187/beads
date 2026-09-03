@@ -1850,12 +1850,12 @@ func (s *DoltStore) Commit(ctx context.Context, message string) error {
 // configConflictsAreMemoryConvergent) — so widening the commit screen to the
 // whole kv. namespace cannot auto-resolve a genuine kv.* conflict; it only stops
 // generic `bd kv set` writes from wedging the pull. Config is staged explicitly
-// (via DOLT_ADD in commitWorkingSet) rather than through CommitWithConfig's
-// DOLT_COMMIT('-Am'), which was observed not to stage config reliably under the
-// server-mode stored-procedure path. Committing this clone's own kv.* rows as the
-// merge basis is the same explicit, user-initiated action CommitPending ('bd dolt
-// commit') already performs, so it does not widen the concurrent-writer race
-// GH#2455 guards against.
+// via DOLT_ADD in commitWorkingSet (same path CommitWithConfig uses). A bare
+// DOLT_COMMIT('-Am') was observed not to stage config reliably under the
+// server-mode stored-procedure path (root-c1q3p). Committing this clone's own
+// kv.* rows as the merge basis is the same explicit, user-initiated action
+// CommitPending / `bd dolt commit` already performs, so it does not widen the
+// concurrent-writer race GH#2455 guards against.
 func (s *DoltStore) commitBeforePull(ctx context.Context, message string) error {
 	return s.commitWorkingSet(ctx, message, configIncludeUserKVOnly)
 }
@@ -1936,7 +1936,10 @@ func (s *DoltStore) commitWorkingSet(ctx context.Context, message string, mode c
 	}
 
 	if len(tables) == 0 {
-		return nil // Nothing to commit (all changes were config-only or dolt_ignore'd)
+		// Distinguish "nothing staged" from a real commit so callers (especially
+		// `bd dolt commit` / `bd vc commit`) do not print a false "Committed."
+		// when configExclude skipped the only dirty table (root-c1q3p).
+		return fmt.Errorf("nothing to commit")
 	}
 
 	for _, table := range tables {
@@ -2009,22 +2012,16 @@ func (s *DoltStore) assertDirtyConfigUserKVOnly(ctx context.Context, conn *sql.C
 
 // CommitWithConfig creates a Dolt commit that includes the config table.
 // Use this instead of Commit when the caller intentionally modified config
-// (e.g., CommitPending after 'bd config set', 'bd init', or 'bd rename-prefix').
+// (e.g., CommitPending after 'bd config set', 'bd init', or 'bd rename-prefix'),
+// and for explicit user commits (`bd dolt commit` / `bd vc commit`).
 // GH#2455: Commit() excludes config to prevent sweeping up stale changes.
+//
+// IMPORTANT: do not use DOLT_COMMIT('-Am') here. Under dolt sql-server, '-Am'
+// has been observed to leave the config table unstaged while still returning
+// success, silently stranding `bd config set` in the working set (root-c1q3p).
+// Stage via commitWorkingSet + explicit DOLT_ADD instead.
 func (s *DoltStore) CommitWithConfig(ctx context.Context, message string) error {
-	conn, err := s.db.Conn(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to acquire connection: %w", err)
-	}
-	defer conn.Close()
-
-	if _, err := conn.ExecContext(ctx, "CALL DOLT_COMMIT('-Am', ?, '--author', ?)", message, s.commitAuthorString()); err != nil {
-		if isDoltNothingToCommit(err) {
-			return nil
-		}
-		return fmt.Errorf("failed to commit: %w", err)
-	}
-	return nil
+	return s.commitWorkingSet(ctx, message, configIncludeAll)
 }
 
 // doltAddAndCommit stages the specified tables and commits on a pinned

@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 
 	"github.com/steveyegge/beads/internal/storage/domain/db"
 )
@@ -25,7 +26,45 @@ func (t *doltServerTx) Commit(ctx context.Context, message string) error {
 	}
 	t.done = true
 	defer t.releaseConn()
-	_, err := t.conn.ExecContext(ctx, "CALL DOLT_COMMIT('-Am', ?);", message)
+
+	// Explicitly stage config first. Under dolt sql-server, DOLT_COMMIT('-Am')
+	// can return success while leaving config unstaged, silently stranding
+	// `bd config set` in the working set (root-c1q3p). Staging via DOLT_ADD
+	// before commit is the proven durable path.
+	if _, err := t.conn.ExecContext(ctx, "CALL DOLT_ADD('config')"); err != nil {
+		// Config may already be clean / not dirty — continue and stage others.
+		_ = err
+	}
+
+	rows, err := t.conn.QueryContext(ctx, "SELECT table_name FROM dolt_status")
+	if err != nil {
+		return fmt.Errorf("uow: query dolt_status: %w", err)
+	}
+	var tables []string
+	for rows.Next() {
+		var table string
+		if err := rows.Scan(&table); err != nil {
+			_ = rows.Close()
+			return fmt.Errorf("uow: scan dolt_status: %w", err)
+		}
+		if table == "config" {
+			continue // already staged above
+		}
+		tables = append(tables, table)
+	}
+	_ = rows.Close()
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("uow: iterate dolt_status: %w", err)
+	}
+
+	for _, table := range tables {
+		if _, err := t.conn.ExecContext(ctx, "CALL DOLT_ADD(?)", table); err != nil {
+			// Best effort: some tables may be dolt_ignore'd (e.g., wisps).
+			continue
+		}
+	}
+
+	_, err = t.conn.ExecContext(ctx, "CALL DOLT_COMMIT('-m', ?);", message)
 	return err
 }
 

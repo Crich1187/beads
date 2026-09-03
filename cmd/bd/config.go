@@ -210,7 +210,13 @@ var configSetCmd = &cobra.Command{
 		if err := store.SetConfig(ctx, key, value); err != nil {
 			return HandleError("setting config: %v", err)
 		}
+		// Config lives in the config table; plain auto-Commit() excludes it
+		// (GH#2455) and would silently strand this write (root-c1q3p).
+		if err := store.CommitWithConfig(ctx, fmt.Sprintf("bd: config set %s", key)); err != nil && !isDoltNothingToCommit(err) {
+			return HandleError("committing config: %v", err)
+		}
 		commandDidWrite.Store(true)
+		commandDidExplicitDoltCommit = true
 
 		if jsonOutput {
 			if err := outputJSON(map[string]string{
@@ -542,7 +548,13 @@ var configUnsetCmd = &cobra.Command{
 		if err := store.DeleteConfig(ctx, key); err != nil {
 			return HandleError("deleting config: %v", err)
 		}
+		// Config lives in the config table; plain auto-Commit() excludes it
+		// (GH#2455) and would silently strand this write (root-c1q3p).
+		if err := store.CommitWithConfig(ctx, fmt.Sprintf("bd: config unset %s", key)); err != nil && !isDoltNothingToCommit(err) {
+			return HandleError("committing config: %v", err)
+		}
 		commandDidWrite.Store(true)
+		commandDidExplicitDoltCommit = true
 
 		if jsonOutput {
 			if err := outputJSON(map[string]string{
@@ -821,7 +833,13 @@ Examples:
 						return HandleError("setting config %s: %v", p.key, err)
 					}
 				}
+				// Config lives in the config table; plain auto-Commit() excludes it
+				// (GH#2455) and would silently strand these writes (root-c1q3p).
+				if err := store.CommitWithConfig(ctx, fmt.Sprintf("bd: config set-many (%d keys)", len(dbPairs))); err != nil && !isDoltNothingToCommit(err) {
+					return HandleError("committing config: %v", err)
+				}
 				commandDidWrite.Store(true)
+				commandDidExplicitDoltCommit = true
 			}
 		}
 

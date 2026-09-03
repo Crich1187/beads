@@ -171,7 +171,9 @@ Examples:
 		}
 
 		commandDidExplicitDoltCommit = true
-		if err := store.Commit(ctx, vcCommitMessage); err != nil {
+		// Explicit user commit must include config (root-c1q3p). Plain Commit()
+		// excludes config (GH#2455) and would silently strand `bd config set`.
+		if err := store.CommitWithConfig(ctx, vcCommitMessage); err != nil {
 			if isDoltNothingToCommit(err) {
 				if jsonOutput {
 					return outputJSON(map[string]interface{}{"committed": false, "message": "nothing to commit"})

@@ -513,7 +513,9 @@ For more options (--stdin, custom messages), see: bd vc commit`,
 		if msg == "" {
 			msg = fmt.Sprintf("bd: dolt commit (auto-commit) by %s", getActor())
 		}
-		if err := st.Commit(ctx, msg); err != nil {
+		// Explicit user commit must include config (root-c1q3p). Plain Commit()
+		// excludes config (GH#2455) and would silently strand `bd config set`.
+		if err := st.CommitWithConfig(ctx, msg); err != nil {
 			if isDoltNothingToCommit(err) {
 				fmt.Println("Nothing to commit.")
 				return
