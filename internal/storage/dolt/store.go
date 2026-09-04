@@ -3209,23 +3209,21 @@ func (s *DoltStore) assertDirtyConfigUserKVOnly(ctx context.Context, conn *sql.C
 
 // CommitWithConfig creates a Dolt commit that includes the config table.
 // Use this instead of Commit when the caller intentionally modified config
-// (e.g., CommitPending after 'bd config set', 'bd init', or 'bd rename-prefix').
+// (e.g., after 'bd config set', 'bd init', or 'bd rename-prefix'), and for
+// explicit user commits that must not strand config (root-c1q3p).
 // GH#2455: Commit() excludes config to prevent sweeping up stale changes.
+//
+// IMPORTANT: do not use DOLT_COMMIT('-Am') here. Under dolt sql-server, '-Am'
+// has been observed to leave the config table unstaged while still returning
+// success, silently stranding `bd config set` in the working set (root-c1q3p).
+// Stage via commitWorkingSet + explicit DOLT_ADD instead.
 func (s *DoltStore) CommitWithConfig(ctx context.Context, message string) error {
 	return s.withCircuitWrite(ctx, func(ctx context.Context) error {
-		conn, err := s.db.Conn(ctx)
-		if err != nil {
-			return fmt.Errorf("failed to acquire connection: %w", err)
+		err := s.commitWorkingSet(ctx, message, configIncludeAll)
+		if isDoltNothingToCommit(err) {
+			return nil
 		}
-		defer conn.Close()
-
-		if err := schema.DrainCall(ctx, conn, "CALL DOLT_COMMIT('-Am', ?, '--author', ?)", message, s.commitAuthorString()); err != nil {
-			if isDoltNothingToCommit(err) {
-				return nil
-			}
-			return s.wrapDoltPublicationFailure(ctx, "failed to commit", err)
-		}
-		return nil
+		return err
 	})
 }
 
@@ -3252,19 +3250,28 @@ func (s *DoltStore) CommitWithConfig(ctx context.Context, message string) error 
 //     or only dolt_ignore'd tables such as wisps dirty ('-A' skips those) —
 //     without the concurrent-writer misattribution race of comparing HEADs.
 func (s *DoltStore) CommitAll(ctx context.Context, message string) (bool, error) {
-	committed := false
-	err := s.withCircuitWrite(ctx, func(ctx context.Context) error {
-		conn, err := s.db.Conn(ctx)
-		if err != nil {
-			return fmt.Errorf("failed to acquire connection: %w", err)
-		}
-		defer conn.Close()
+	// Pre-check so we can return an honest (false, nil) when nothing is
+	// committable, including when the only dirt is config (which Commit
+	// excludes per GH#2455 but this method must include — root-c1q3p).
+	dirty, err := s.HasCommittablePending(ctx)
+	if err != nil {
+		return false, err
+	}
+	if !dirty {
+		return false, nil
+	}
 
-		if err := schema.DrainCall(ctx, conn, "CALL DOLT_COMMIT('-Am', ?, '--author', ?)", message, s.commitAuthorString()); err != nil {
+	committed := false
+	err = s.withCircuitWrite(ctx, func(ctx context.Context) error {
+		// Explicit DOLT_ADD via commitWorkingSet — not DOLT_COMMIT('-Am'),
+		// which can return success while leaving config unstaged under
+		// sql-server (root-c1q3p).
+		err := s.commitWorkingSet(ctx, message, configIncludeAll)
+		if err != nil {
 			if isDoltNothingToCommit(err) {
 				return nil
 			}
-			return s.wrapDoltPublicationFailure(ctx, "failed to commit", err)
+			return err
 		}
 		committed = true
 		return nil

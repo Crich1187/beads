@@ -44,10 +44,19 @@ func expectPendingChanges(mock sqlmock.Sqlmock, count int) {
 		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(count))
 }
 
+// expectConfigInclusiveStaging arms the root-c1q3p path: DOLT_ADD('config'),
+// dolt_status scan, then DOLT_COMMIT('-m', ...).
+func expectConfigInclusiveStaging(mock sqlmock.Sqlmock) {
+	mock.ExpectExec("DOLT_ADD").WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectQuery("SELECT table_name FROM dolt_status").
+		WillReturnRows(sqlmock.NewRows([]string{"table_name"}).AddRow("config"))
+}
+
 func TestDoltServerTxCommitFailureRollsBackBeforeRelease(t *testing.T) {
 	p, mock := newMockTxProvider(t)
 	mock.ExpectExec("START TRANSACTION").WillReturnResult(sqlmock.NewResult(0, 0))
 	expectPendingChanges(mock, 1)
+	expectConfigInclusiveStaging(mock)
 	mock.ExpectExec("DOLT_COMMIT").WillReturnError(errors.New("commit exploded"))
 	mock.ExpectExec("ROLLBACK").WillReturnResult(sqlmock.NewResult(0, 0))
 
@@ -64,6 +73,7 @@ func TestDoltServerTxCommitAndRollbackFailurePoisonsConn(t *testing.T) {
 	p, mock := newMockTxProvider(t)
 	mock.ExpectExec("START TRANSACTION").WillReturnResult(sqlmock.NewResult(0, 0))
 	expectPendingChanges(mock, 1)
+	expectConfigInclusiveStaging(mock)
 	mock.ExpectExec("DOLT_COMMIT").WillReturnError(errors.New("commit exploded"))
 	mock.ExpectExec("ROLLBACK").WillReturnError(errors.New("rollback exploded too"))
 
@@ -138,6 +148,11 @@ func TestDoltServerTxCommitIssuesDoltCommitWhenPending(t *testing.T) {
 	p, mock := newMockTxProvider(t)
 	mock.ExpectExec("START TRANSACTION").WillReturnResult(sqlmock.NewResult(0, 0))
 	expectPendingChanges(mock, 3)
+	// root-c1q3p: stage config explicitly, then other dirty tables, then '-m'.
+	mock.ExpectExec("DOLT_ADD").WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectQuery("SELECT table_name FROM dolt_status").
+		WillReturnRows(sqlmock.NewRows([]string{"table_name"}).AddRow("config").AddRow("issues"))
+	mock.ExpectExec("DOLT_ADD").WithArgs("issues").WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectExec("DOLT_COMMIT").WithArgs("bd: real write").WillReturnResult(sqlmock.NewResult(0, 1))
 
 	tx, err := p.BeginTx(context.Background())
@@ -145,8 +160,10 @@ func TestDoltServerTxCommitIssuesDoltCommitWhenPending(t *testing.T) {
 
 	err = tx.Commit(context.Background(), "bd: real write")
 	require.NoError(t, err)
-	require.NoError(t, mock.ExpectationsWereMet(), "a dirty working set must be committed via DOLT_COMMIT")
+	require.NoError(t, mock.ExpectationsWereMet(), "a dirty working set must be committed via DOLT_ADD + DOLT_COMMIT('-m')")
 }
+
+// keep expectConfigInclusiveStaging used by failure tests above
 
 func TestDoltServerTxCommitPendingCheckFailureRollsBackBeforeRelease(t *testing.T) {
 	p, mock := newMockTxProvider(t)
@@ -173,6 +190,9 @@ func TestDoltServerTxCommitPropagatesNothingToCommit(t *testing.T) {
 	p, mock := newMockTxProvider(t)
 	mock.ExpectExec("START TRANSACTION").WillReturnResult(sqlmock.NewResult(0, 0))
 	expectPendingChanges(mock, 1)
+	mock.ExpectExec("DOLT_ADD").WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectQuery("SELECT table_name FROM dolt_status").
+		WillReturnRows(sqlmock.NewRows([]string{"table_name"}).AddRow("config"))
 	mock.ExpectExec("DOLT_COMMIT").WillReturnError(errors.New("nothing to commit"))
 	mock.ExpectExec("ROLLBACK").WillReturnResult(sqlmock.NewResult(0, 0))
 

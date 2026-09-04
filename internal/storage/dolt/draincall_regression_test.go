@@ -229,7 +229,14 @@ func TestCommitWithConfigCommitResponseLossIsIndeterminate(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = db.Close() })
 
-	mock.ExpectQuery(regexp.QuoteMeta("CALL DOLT_COMMIT('-Am', ?, '--author', ?)")).
+	// CommitWithConfig now routes through commitWorkingSet + explicit DOLT_ADD
+	// (root-c1q3p); connection loss on DOLT_COMMIT('-m') remains indeterminate.
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT s.table_name FROM dolt_status")).
+		WillReturnRows(sqlmock.NewRows([]string{"table_name"}).AddRow("config"))
+	mock.ExpectQuery(regexp.QuoteMeta("CALL DOLT_ADD(?)")).
+		WithArgs("config").
+		WillReturnRows(sqlmock.NewRows([]string{"status"}))
+	mock.ExpectQuery(regexp.QuoteMeta("CALL DOLT_COMMIT('-m', ?, '--author', ?)")).
 		WithArgs("bd: test config commit", " <>").
 		WillReturnError(testConnectionLoss)
 
@@ -344,7 +351,12 @@ func TestPublicCommitAmbiguousConnectionFailuresTripCircuit(t *testing.T) {
 		{
 			name: "CommitWithConfig",
 			expect: func(mock sqlmock.Sqlmock) {
-				mock.ExpectQuery(regexp.QuoteMeta("CALL DOLT_COMMIT('-Am', ?, '--author', ?)")).
+				mock.ExpectQuery(regexp.QuoteMeta("SELECT s.table_name FROM dolt_status")).
+					WillReturnRows(sqlmock.NewRows([]string{"table_name"}).AddRow("config"))
+				mock.ExpectQuery(regexp.QuoteMeta("CALL DOLT_ADD(?)")).
+					WithArgs("config").
+					WillReturnRows(sqlmock.NewRows([]string{"status"}))
+				mock.ExpectQuery(regexp.QuoteMeta("CALL DOLT_COMMIT('-m', ?, '--author', ?)")).
 					WithArgs("bd: test config commit", " <>").
 					WillReturnError(testConnectionLoss)
 			},

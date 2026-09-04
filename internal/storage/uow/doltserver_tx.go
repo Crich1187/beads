@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"database/sql/driver"
 	"errors"
+	"fmt"
 
 	"github.com/steveyegge/beads/internal/storage/domain/db"
 	"github.com/steveyegge/beads/internal/storage/issueops"
@@ -86,6 +87,42 @@ func (t *doltServerTx) Commit(ctx context.Context, message string) error {
 		}
 		if !pending {
 			stmt, args = "COMMIT;", nil
+		} else {
+			// Explicitly stage config first. Under dolt sql-server,
+			// DOLT_COMMIT('-Am') can return success while leaving config
+			// unstaged, silently stranding `bd config set` (root-c1q3p).
+			// Stage via DOLT_ADD then commit with '-m' only.
+			if _, err := t.conn.ExecContext(ctx, "CALL DOLT_ADD('config')"); err != nil {
+				// Config may already be clean — continue and stage others.
+				_ = err
+			}
+			rows, qerr := t.conn.QueryContext(ctx, "SELECT table_name FROM dolt_status")
+			if qerr != nil {
+				return t.closeOpenTxAfterFailure(ctx, fmt.Errorf("uow: query dolt_status: %w", qerr))
+			}
+			var tables []string
+			for rows.Next() {
+				var table string
+				if err := rows.Scan(&table); err != nil {
+					_ = rows.Close()
+					return t.closeOpenTxAfterFailure(ctx, fmt.Errorf("uow: scan dolt_status: %w", err))
+				}
+				if table == "config" {
+					continue // already staged above
+				}
+				tables = append(tables, table)
+			}
+			_ = rows.Close()
+			if err := rows.Err(); err != nil {
+				return t.closeOpenTxAfterFailure(ctx, fmt.Errorf("uow: iterate dolt_status: %w", err))
+			}
+			for _, table := range tables {
+				if _, err := t.conn.ExecContext(ctx, "CALL DOLT_ADD(?)", table); err != nil {
+					// Best effort: some tables may be dolt_ignore'd (e.g., wisps).
+					continue
+				}
+			}
+			stmt, args = "CALL DOLT_COMMIT('-m', ?);", []interface{}{message}
 		}
 	}
 	_, err := t.conn.ExecContext(ctx, stmt, args...)

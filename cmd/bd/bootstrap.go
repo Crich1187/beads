@@ -639,7 +639,9 @@ func executeInitAction(ctx context.Context, plan BootstrapPlan, cfg *configfile.
 	if err := s.SetConfig(ctx, "issue_prefix", prefix); err != nil {
 		return fmt.Errorf("set issue prefix: %w", err)
 	}
-	if err := s.CommitWithConfig(ctx, "bd bootstrap"); err != nil {
+	// CommitWithConfig may report nothing-to-commit if the working set is
+	// already clean (root-c1q3p commitWorkingSet zero-dirty behavior).
+	if err := s.CommitWithConfig(ctx, "bd bootstrap"); err != nil && !isDoltNothingToCommit(err) {
 		return fmt.Errorf("commit: %w", err)
 	}
 
@@ -666,7 +668,7 @@ func executeRestoreAction(ctx context.Context, plan BootstrapPlan, cfg *configfi
 	if err := s.SetConfig(ctx, "issue_prefix", prefix); err != nil {
 		return fmt.Errorf("set issue prefix: %w", err)
 	}
-	if err := s.CommitWithConfig(ctx, "bd bootstrap: init"); err != nil {
+	if err := s.CommitWithConfig(ctx, "bd bootstrap: init"); err != nil && !isDoltNothingToCommit(err) {
 		return fmt.Errorf("commit init: %w", err)
 	}
 
@@ -697,7 +699,7 @@ func executeJSONLImportAction(ctx context.Context, plan BootstrapPlan, cfg *conf
 	if err := s.SetConfig(ctx, "issue_prefix", prefix); err != nil {
 		return fmt.Errorf("set issue prefix: %w", err)
 	}
-	if err := s.CommitWithConfig(ctx, "bd bootstrap: init"); err != nil {
+	if err := s.CommitWithConfig(ctx, "bd bootstrap: init"); err != nil && !isDoltNothingToCommit(err) {
 		return fmt.Errorf("commit init: %w", err)
 	}
 
@@ -706,7 +708,10 @@ func executeJSONLImportAction(ctx context.Context, plan BootstrapPlan, cfg *conf
 		return fmt.Errorf("import from JSONL: %w", err)
 	}
 
-	if err := s.Commit(ctx, "bd bootstrap: import from issues.jsonl"); err != nil {
+	// Zero-issue / already-imported JSONL leaves a clean working set.
+	// Treat "nothing to commit" as success so bootstrap does not hard-fail
+	// (root-c1q3p).
+	if err := s.Commit(ctx, "bd bootstrap: import from issues.jsonl"); err != nil && !isDoltNothingToCommit(err) {
 		return fmt.Errorf("commit import: %w", err)
 	}
 
