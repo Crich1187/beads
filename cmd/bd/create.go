@@ -27,10 +27,21 @@ import (
 )
 
 var createCmd = &cobra.Command{
-	Use:           "create [title]",
-	GroupID:       "issues",
-	Aliases:       []string{"new"},
-	Short:         "Create a new issue (or batch from markdown/graph JSON)",
+	Use:     "create [title]",
+	GroupID: "issues",
+	Aliases: []string{"new"},
+	Short:   "Create a new issue (or batch from markdown/graph JSON)",
+	Long: `Create a new issue (or batch from markdown/graph JSON).
+
+` + validation.FormatRequiredSectionsHelp() + `
+
+Example (decision with --validate):
+  bd create --type decision --validate --title "Use Forgejo for beads backups" --description "## Decision
+Use Forgejo remotes for beads Dolt backups.
+## Rationale
+Self-hosted and already fleet-standard.
+## Alternatives Considered
+GitHub private remotes — rejected due to self-host bias."`,
 	Args:          cobra.MinimumNArgs(0),
 	SilenceUsage:  true,
 	SilenceErrors: true,
@@ -876,7 +887,7 @@ func init() {
 	createCmd.Flags().Bool("no-history", false, "Skip Dolt commit history without making GC-eligible (for permanent agent beads)")
 	createCmd.Flags().String("mol-type", "", "Molecule type: swarm (multi-agent), patrol (recurring ops), work (default)")
 	createCmd.Flags().String("wisp-type", "", "Wisp type for TTL-based compaction: heartbeat, ping, patrol, gc_report, recovery, error, escalation")
-	createCmd.Flags().Bool("validate", false, "Validate description contains required sections for issue type")
+	createCmd.Flags().Bool("validate", false, validation.ValidateFlagHelp())
 	// Event-specific flags (only valid when --type=event)
 	createCmd.Flags().String("event-category", "", "Event category (e.g., patrol.muted, agent.started) (requires --type=event)")
 	createCmd.Flags().String("event-actor", "", "Entity URI who caused this event (requires --type=event)")

@@ -195,6 +195,58 @@ func TestTemplateErrorMessage(t *testing.T) {
 	if !strings.Contains(msg, "Describe how to reproduce") {
 		t.Errorf("Error message should contain hint, got: %s", msg)
 	}
+	if !strings.Contains(msg, "bd create --help") {
+		t.Errorf("Error message should point at create --help, got: %s", msg)
+	}
+}
+
+func TestValidateTemplateDecisionMissingSectionsDiagnostics(t *testing.T) {
+	err := ValidateTemplate(types.TypeDecision, "design planning notes without sections")
+	if err == nil {
+		t.Fatal("expected validation error for decision without sections")
+	}
+	templateErr, ok := err.(*TemplateError)
+	if !ok {
+		t.Fatalf("error type = %T, want *TemplateError", err)
+	}
+	if len(templateErr.Missing) != 3 {
+		t.Fatalf("missing sections = %d, want 3: %+v", len(templateErr.Missing), templateErr.Missing)
+	}
+	msg := err.Error()
+	for _, want := range []string{
+		"## Decision",
+		"## Rationale",
+		"## Alternatives Considered",
+		"bd create --help",
+	} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("diagnostics missing %q\n%s", want, msg)
+		}
+	}
+}
+
+func TestFormatRequiredSectionsHelpIncludesDecision(t *testing.T) {
+	help := FormatRequiredSectionsHelp()
+	for _, want := range []string{
+		"decision:",
+		"## Decision",
+		"## Rationale",
+		"## Alternatives Considered",
+		"--validate",
+	} {
+		if !strings.Contains(help, want) {
+			t.Errorf("FormatRequiredSectionsHelp missing %q:\n%s", want, help)
+		}
+	}
+}
+
+func TestValidateFlagHelpDiscoverable(t *testing.T) {
+	help := ValidateFlagHelp()
+	for _, want := range []string{"## Decision", "## Rationale", "## Alternatives Considered"} {
+		if !strings.Contains(help, want) {
+			t.Errorf("ValidateFlagHelp missing %q: %s", want, help)
+		}
+	}
 }
 
 func TestTemplateErrorEmpty(t *testing.T) {

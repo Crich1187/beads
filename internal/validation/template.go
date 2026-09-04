@@ -29,7 +29,48 @@ func (e *TemplateError) Error() string {
 	for _, m := range e.Missing {
 		fmt.Fprintf(&b, "\n  - %s (%s)", m.Heading, m.Hint)
 	}
+	b.WriteString("\nSee 'bd create --help' for required sections by type.")
 	return b.String()
+}
+
+// requiredSectionsHelpTypes is the stable display order for create --help.
+// Only types with RequiredSections() entries are rendered.
+var requiredSectionsHelpTypes = []types.IssueType{
+	types.TypeBug,
+	types.TypeFeature,
+	types.TypeTask,
+	types.TypeStory,
+	types.TypeEpic,
+	types.TypeDecision,
+	types.TypeSpike,
+}
+
+// FormatRequiredSectionsHelp returns the discoverable required-section list for
+// bd create --help. Content is derived from IssueType.RequiredSections so help
+// cannot drift from --validate enforcement.
+func FormatRequiredSectionsHelp() string {
+	var b strings.Builder
+	b.WriteString("Required description sections by --type (enforced with --validate):\n")
+	for _, issueType := range requiredSectionsHelpTypes {
+		sections := issueType.RequiredSections()
+		if len(sections) == 0 {
+			continue
+		}
+		headings := make([]string, len(sections))
+		for i, section := range sections {
+			headings[i] = section.Heading
+		}
+		fmt.Fprintf(&b, "  %-10s %s\n", string(issueType)+":", strings.Join(headings, ", "))
+	}
+	b.WriteString("Matching is case-insensitive; heading text may appear without markdown ## prefixes.")
+	return b.String()
+}
+
+// ValidateFlagHelp is the --validate flag description shown by bd create --help.
+// It names the decision sections that historically were undiscoverable from help alone.
+func ValidateFlagHelp() string {
+	return "Validate description contains required sections for issue type " +
+		"(decision: ## Decision, ## Rationale, ## Alternatives Considered; see full list above)"
 }
 
 // ValidateTemplate checks if the description contains all required sections
