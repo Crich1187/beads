@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"strings"
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/beads/internal/beads"
@@ -104,10 +103,8 @@ func runBackupRestore(ctx context.Context, s storage.DoltStorage, dir string, fo
 	// `bd backup sync` works immediately without a separate `bd backup add`.
 	registerBackupRemote(ctx, bs, dir)
 
-	if err := s.Commit(ctx, "bd backup restore"); err != nil {
-		if !strings.Contains(err.Error(), "nothing to commit") {
-			return fmt.Errorf("failed to commit restore: %w", err)
-		}
+	if err := s.Commit(ctx, "bd backup restore"); err != nil && !isDoltNothingToCommit(err) {
+		return fmt.Errorf("failed to commit restore: %w", err)
 	}
 
 	return nil

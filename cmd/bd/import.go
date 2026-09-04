@@ -301,13 +301,14 @@ func runImportFromReader(ctx context.Context, r io.Reader, source string) error 
 			commitMsg += fmt.Sprintf(", %d memories", result.Memories)
 		}
 		commitMsg += fmt.Sprintf(" from %s", filepath.Base(source))
-		if err := store.Commit(ctx, commitMsg); err != nil {
+		if err := store.Commit(ctx, commitMsg); err != nil && !isDoltNothingToCommit(err) {
 			// An import can be a working-set no-op: re-importing an
 			// identical snapshot, or equal-timestamp rows whose guarded
-			// upsert kept every local column (bd-hj85c).
-			if !strings.Contains(err.Error(), "nothing to commit") {
-				return fmt.Errorf("commit: %w", err)
-			}
+			// upsert kept every local column (bd-hj85c). Use the shared
+			// isDoltNothingToCommit helper (case-insensitive; also
+			// matches "No changes to commit") rather than a literal
+			// substring — same assumption change as root-c1q3p.
+			return fmt.Errorf("commit: %w", err)
 		}
 	}
 

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -26,6 +27,9 @@ type fakeFallbackStore struct {
 	statsTotalIssues    int
 	statsNil            bool
 	getStatistics       func(context.Context) (*types.Statistics, error)
+	commitErr           error
+	commitCalls         atomic.Int32
+	lastCommitMsg       string
 }
 
 func (f *fakeFallbackStore) GetStatistics(ctx context.Context) (*types.Statistics, error) {
@@ -38,7 +42,11 @@ func (f *fakeFallbackStore) GetStatistics(ctx context.Context) (*types.Statistic
 	return &types.Statistics{TotalIssues: f.statsTotalIssues}, nil
 }
 
-func (f *fakeFallbackStore) Commit(_ context.Context, _ string) error { return nil }
+func (f *fakeFallbackStore) Commit(_ context.Context, msg string) error {
+	f.commitCalls.Add(1)
+	f.lastCommitMsg = msg
+	return f.commitErr
+}
 
 func writeAutoImportFixtureJSONL(t *testing.T, dir string) {
 	t.Helper()
@@ -400,4 +408,62 @@ func TestAutoImportFallbackSeamUsesConflictSkip(t *testing.T) {
 			t.Fatalf("bd bootstrap / init --from-jsonl must keep UPSERT (ConflictSkip=false); got true")
 		}
 	})
+}
+
+// TestMaybeAutoImportJSONL_FallbackCommitNothingToCommitIsSilent is the
+// Gate3 Minor regression for root-c1q3p: commitWorkingSet now returns
+// "nothing to commit" on a clean working set. The auto-import fallback
+// Commit must treat that as success and must not emit
+// "dolt commit failed".
+func TestMaybeAutoImportJSONL_FallbackCommitNothingToCommitIsSilent(t *testing.T) {
+	dir := t.TempDir()
+	writeAutoImportFixtureJSONL(t, dir)
+	orig := fallbackImporter
+	fallbackImporter = func(_ context.Context, _ storage.DoltStorage, _ string) (*importLocalResult, error) {
+		return &importLocalResult{Issues: 1}, nil
+	}
+	t.Cleanup(func() { fallbackImporter = orig })
+
+	store := &fakeFallbackStore{
+		statsTotalIssues: 0,
+		commitErr:        errors.New("nothing to commit"),
+	}
+	out := captureStderr(t, func() {
+		maybeAutoImportJSONL(context.Background(), store, dir)
+	})
+	if store.commitCalls.Load() != 1 {
+		t.Fatalf("Commit called %d times, want 1", store.commitCalls.Load())
+	}
+	if strings.Contains(out, "dolt commit failed") {
+		t.Fatalf("nothing-to-commit must not warn; stderr:\n%s", out)
+	}
+	if !strings.Contains(out, "auto-imported") {
+		t.Fatalf("expected success message after nothing-to-commit; stderr:\n%s", out)
+	}
+}
+
+// TestMaybeAutoImportJSONL_FallbackCommitRealErrorStillWarns ensures the
+// nothing-to-commit guard does not swallow genuine Commit failures.
+func TestMaybeAutoImportJSONL_FallbackCommitRealErrorStillWarns(t *testing.T) {
+	dir := t.TempDir()
+	writeAutoImportFixtureJSONL(t, dir)
+	orig := fallbackImporter
+	fallbackImporter = func(_ context.Context, _ storage.DoltStorage, _ string) (*importLocalResult, error) {
+		return &importLocalResult{Issues: 1}, nil
+	}
+	t.Cleanup(func() { fallbackImporter = orig })
+
+	store := &fakeFallbackStore{
+		statsTotalIssues: 0,
+		commitErr:        errors.New("connection reset"),
+	}
+	out := captureStderr(t, func() {
+		maybeAutoImportJSONL(context.Background(), store, dir)
+	})
+	if !strings.Contains(out, "dolt commit failed") {
+		t.Fatalf("real Commit error must warn; stderr:\n%s", out)
+	}
+	if strings.Contains(out, "auto-imported") {
+		t.Fatalf("must not claim auto-imported after Commit failure; stderr:\n%s", out)
+	}
 }

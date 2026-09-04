@@ -162,7 +162,10 @@ func maybeAutoImportJSONL(ctx context.Context, s storage.DoltStorage, beadsDir s
 	if result.Memories > 0 {
 		commitMsg = fmt.Sprintf("auto-import: %d issues, %d memories from %s (upgrade recovery, GH#2994)", result.Issues, result.Memories, filepath.Base(jsonlPath))
 	}
-	if err := s.Commit(ctx, commitMsg); err != nil {
+	// commitWorkingSet returns "nothing to commit" on a clean working set
+	// (root-c1q3p). That is a routine no-op after conflict-skip / already-
+	// committed imports — do not warn (Gate3 Minor on unguarded Commit).
+	if err := s.Commit(ctx, commitMsg); err != nil && !isDoltNothingToCommit(err) {
 		writeAutoImportStamp(beadsDir, info)
 		fmt.Fprintf(os.Stderr, "warning: auto-import: dolt commit failed: %v\n", err)
 		return

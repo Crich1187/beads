@@ -1414,11 +1414,10 @@ Non-interactive mode (--non-interactive or BD_NON_INTERACTIVE=1):
 
 		// Auto-commit Dolt state so bd doctor doesn't warn about uncommitted
 		// changes and users don't need a separate "bd vc commit" step.
-		if err := store.Commit(ctx, "bd init"); err != nil {
-			// Non-fatal: some setups (e.g. no tables yet) may have nothing to commit
-			if !strings.Contains(err.Error(), "nothing to commit") {
-				fmt.Fprintf(os.Stderr, "Warning: failed to commit initial state: %v\n", err)
-			}
+		if err := store.Commit(ctx, "bd init"); err != nil && !isDoltNothingToCommit(err) {
+			// Non-fatal: some setups (e.g. no tables yet) may have nothing to commit.
+			// Prefer isDoltNothingToCommit over a literal substring (root-c1q3p).
+			fmt.Fprintf(os.Stderr, "Warning: failed to commit initial state: %v\n", err)
 		}
 
 		if err := store.Close(); err != nil {
