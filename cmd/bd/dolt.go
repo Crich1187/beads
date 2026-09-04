@@ -1147,13 +1147,7 @@ var doltRemoteListCmd = &cobra.Command{
 	Short: "List configured Dolt remotes",
 	Run: func(cmd *cobra.Command, args []string) {
 		ctx := context.Background()
-		st := getStore()
-		if st == nil {
-			fmt.Fprintf(os.Stderr, "Error: no store available\n")
-			os.Exit(1)
-		}
-
-		remotes, err := st.ListRemotes(ctx)
+		remotes, err := loadDoltRemotes(ctx, getStore())
 		if err != nil {
 			if jsonOutput {
 				_ = outputJSONError(err, "remote_list_failed")
@@ -1200,6 +1194,24 @@ func formatDoltRemoteListJSON(remotes []storage.RemoteInfo) []doltRemoteListJSON
 		})
 	}
 	return out
+}
+
+// loadDoltRemotes is the shared remote-list path for `bd dolt remote list` and
+// `bd dolt show` (root-w1hht). Callers must treat a non-nil error as a real
+// failure — never as an empty remote set. A nil error with len==0 is the only
+// true-empty answer.
+func loadDoltRemotes(ctx context.Context, st remoteLister) ([]storage.RemoteInfo, error) {
+	if st == nil {
+		return nil, fmt.Errorf("no store available")
+	}
+	remotes, err := st.ListRemotes(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if remotes == nil {
+		return []storage.RemoteInfo{}, nil
+	}
+	return remotes, nil
 }
 
 var doltRemoteRemoveCmd = &cobra.Command{
@@ -1391,10 +1403,11 @@ func showDoltConfig(testConnection bool) {
 
 	fmt.Println("\nRemotes:")
 	ctx := context.Background()
-	st := getStore()
-	var remotes []storage.RemoteInfo
-	if st != nil {
-		remotes, _ = st.ListRemotes(ctx)
+	remotes, err := loadDoltRemotes(ctx, getStore())
+	if err != nil {
+		// Fail closed: do not print "(none)" when listing failed (root-w1hht).
+		fmt.Fprintf(os.Stderr, "Error listing remotes: %v\n", err)
+		os.Exit(1)
 	}
 	if len(remotes) == 0 {
 		fmt.Println("  (none)")

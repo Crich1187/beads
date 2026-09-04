@@ -801,8 +801,8 @@ func TestDoltPushPullCommitNeedStore(t *testing.T) {
 	}
 
 	// The key verification: needsStoreDoltSubcommands in PersistentPreRun
-	// lists push, pull, and commit. When these commands run, PersistentPreRun
-	// will NOT return early (unlike show/set/test which skip via the "dolt"
+	// lists push, pull, commit, and show. When these commands run, PersistentPreRun
+	// will NOT return early (unlike set/test which skip via the "dolt"
 	// parent entry in noDbCommands). This means the store will be initialized.
 	//
 	// We can't easily invoke PersistentPreRun in a unit test without a real
@@ -810,13 +810,13 @@ func TestDoltPushPullCommitNeedStore(t *testing.T) {
 	// for nil store and report "no store available" when it's missing.
 }
 
-// TestDoltConfigSubcommandsSkipStore verifies that dolt config/diagnostic
-// subcommands (show, set, test, start, stop, status) don't require the store.
-// These commands manage their own config loading and should work without
-// PersistentPreRun's store initialization.
+// TestDoltConfigSubcommandsSkipStore verifies that dolt config/process
+// subcommands (set, test, start, stop, status) don't require the store.
+// show is intentionally NOT in this set (root-w1hht): it must open the store
+// so Remotes agrees with `bd dolt remote list`.
 func TestDoltConfigSubcommandsSkipStore(t *testing.T) {
 	// Verify these are registered as children of doltCmd
-	configSubcommands := []string{"show", "set", "test", "start", "stop", "status"}
+	configSubcommands := []string{"set", "test", "start", "stop", "status"}
 	for _, name := range configSubcommands {
 		found := false
 		for _, cmd := range doltCmd.Commands() {
@@ -830,8 +830,8 @@ func TestDoltConfigSubcommandsSkipStore(t *testing.T) {
 		}
 	}
 
-	// Verify that push, pull, commit are also registered (they need the store)
-	storeSubcommands := []string{"push", "pull", "commit"}
+	// Verify that push, pull, commit, show are also registered (they need the store)
+	storeSubcommands := []string{"push", "pull", "commit", "show"}
 	for _, name := range storeSubcommands {
 		found := false
 		for _, cmd := range doltCmd.Commands() {
@@ -1102,6 +1102,78 @@ type fakeRemoteLister struct {
 
 func (f fakeRemoteLister) ListRemotes(context.Context) ([]storage.RemoteInfo, error) {
 	return f.remotes, f.err
+}
+
+// TestLoadDoltRemotesSQLErrorVsEmpty (root-w1hht): SQL/list failures must not
+// collapse to a true-empty remote set; only nil error + len==0 is empty.
+func TestLoadDoltRemotesSQLErrorVsEmpty(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("nil store", func(t *testing.T) {
+		remotes, err := loadDoltRemotes(ctx, nil)
+		if err == nil {
+			t.Fatal("expected error for nil store")
+		}
+		if remotes != nil {
+			t.Fatalf("remotes=%v, want nil on error", remotes)
+		}
+		if !strings.Contains(err.Error(), "no store available") {
+			t.Fatalf("err=%v, want no store available", err)
+		}
+	})
+
+	t.Run("sql error is not empty", func(t *testing.T) {
+		sqlErr := fmt.Errorf("dial tcp 127.0.0.1:35597: i/o timeout")
+		remotes, err := loadDoltRemotes(ctx, fakeRemoteLister{err: sqlErr})
+		if err == nil {
+			t.Fatal("expected SQL error to propagate")
+		}
+		if !errors.Is(err, sqlErr) && err.Error() != sqlErr.Error() {
+			t.Fatalf("err=%v, want %v", err, sqlErr)
+		}
+		if remotes != nil {
+			t.Fatalf("remotes=%v on error; must not report empty set", remotes)
+		}
+	})
+
+	t.Run("true empty", func(t *testing.T) {
+		remotes, err := loadDoltRemotes(ctx, fakeRemoteLister{remotes: nil, err: nil})
+		if err != nil {
+			t.Fatalf("unexpected err: %v", err)
+		}
+		if len(remotes) != 0 {
+			t.Fatalf("len=%d, want 0", len(remotes))
+		}
+	})
+
+	t.Run("populated", func(t *testing.T) {
+		want := []storage.RemoteInfo{{Name: "origin", URL: "git+http://example.test/beads.git"}}
+		remotes, err := loadDoltRemotes(ctx, fakeRemoteLister{remotes: want})
+		if err != nil {
+			t.Fatalf("unexpected err: %v", err)
+		}
+		if len(remotes) != 1 || remotes[0].Name != "origin" {
+			t.Fatalf("remotes=%v, want origin", remotes)
+		}
+	})
+}
+
+// TestDoltShowNeedsStore (root-w1hht): show must be a store-needed dolt child
+// so PersistentPreRun opens the DB before Remotes is rendered.
+func TestDoltShowNeedsStore(t *testing.T) {
+	found := false
+	for _, cmd := range doltCmd.Commands() {
+		if cmd.Name() == "show" {
+			found = true
+			if cmd.Parent() == nil || cmd.Parent().Name() != "dolt" {
+				t.Fatalf("show parent=%v, want dolt", cmd.Parent())
+			}
+			break
+		}
+	}
+	if !found {
+		t.Fatal("dolt show not registered")
+	}
 }
 
 // fakeProbingRemoteLister also implements persistedRemoteProber, like the

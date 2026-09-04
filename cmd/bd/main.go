@@ -816,10 +816,12 @@ var rootCmd = &cobra.Command{
 			"zsh",
 		}
 
-		// GH#2042: Dolt subcommands that need the store for version-control operations.
-		// All other dolt subcommands (show, set, test, start, stop, status) are
-		// config/diagnostic commands that skip DB init via the "dolt" parent entry above.
-		needsStoreDoltSubcommands := []string{"push", "pull", "commit"}
+		// GH#2042 / root-w1hht: Dolt subcommands that need the store for
+		// version-control or remote inspection. Config/process subcommands
+		// (set, test, start, stop, status) still skip DB init via the "dolt"
+		// parent entry above. "show" must open the store so Remotes matches
+		// `bd dolt remote list` instead of printing a false "(none)".
+		needsStoreDoltSubcommands := []string{"push", "pull", "commit", "show"}
 
 		// GH#2224: Dolt grandchild subcommands (e.g. "bd dolt remote add") whose
 		// Cobra parent is "remote", not "dolt". These need the store but would be
