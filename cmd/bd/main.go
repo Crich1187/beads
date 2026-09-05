@@ -1105,7 +1105,9 @@ var rootCmd = &cobra.Command{
 		cmdName := cmd.Name()
 		isSubcommand := cmd.Parent() != nil && cmd.Parent().Name() != "bd"
 		skipsStoreInit := false
-		if cmd.Parent() != nil {
+		if isScopedMigrateCommand(cmd) {
+			skipsStoreInit = true
+		} else if cmd.Parent() != nil {
 			parentName := cmd.Parent().Name()
 			if parentName == "dolt" && slices.Contains(needsStoreDoltSubcommands, cmdName) {
 				// GH#2042: dolt push/pull/commit need the store — fall through to init
