@@ -54,3 +54,27 @@ func TestDecodeScopedMappingRejectsUnknownFields(t *testing.T) {
 		t.Fatalf("unknown mapping field error = %v", err)
 	}
 }
+
+func TestMigrateScopedApplyBlockedDuringMigrationFreeze(t *testing.T) {
+	bd, dir := setupMigrationFreezeWorkspace(t)
+	bundlePath := filepath.Join(dir, "invalid-bundle.json")
+	if err := os.WriteFile(bundlePath, []byte("{}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	freezeTown(t, dir, "scoped-test-operator", "scoped apply freeze test")
+
+	stdout, stderr, code := runBDMigrationFreeze(t, bd, dir,
+		"migrate", "scoped", "apply",
+		"--bundle", bundlePath,
+		"--expect-current", strings.Repeat("0", 64),
+		"--actor", "scoped-test-actor")
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1\nstdout:\n%s\nstderr:\n%s", code, stdout, stderr)
+	}
+	if !strings.Contains(stderr, "frozen for migration") {
+		t.Fatalf("stderr missing migration-freeze refusal:\n%s", stderr)
+	}
+	if strings.Contains(stderr, "unsupported bundle") {
+		t.Fatalf("bundle was read before migration-freeze refusal:\n%s", stderr)
+	}
+}

@@ -112,6 +112,26 @@ func TestBundleRejectsTablesOutsideTheFiveTableContract(t *testing.T) {
 	}
 }
 
+func TestBundleRejectsEveryMissingRequiredTable(t *testing.T) {
+	for _, missing := range transferredTables {
+		t.Run(missing, func(t *testing.T) {
+			bundle := minimalBundle(t)
+			kept := make([]Table, 0, len(bundle.Tables)-1)
+			for _, table := range bundle.Tables {
+				if table.Name != missing {
+					kept = append(kept, table)
+				}
+			}
+			bundle.Tables = kept
+
+			err := bundle.Seal()
+			if err == nil || !strings.Contains(err.Error(), "bundle has no "+missing+" table") {
+				t.Fatalf("missing %s error = %v", missing, err)
+			}
+		})
+	}
+}
+
 func TestBundleMappedTablesRewriteOnlyReferenceColumns(t *testing.T) {
 	t.Parallel()
 

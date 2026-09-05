@@ -28,6 +28,29 @@ func TestApplyRequiresExactCurrentDigestBeforeOpeningTransaction(t *testing.T) {
 	}
 }
 
+func TestApplyRejectsTamperedBundleBeforeOpeningTransaction(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	bundle := minimalBundle(t)
+	if err := bundle.Seal(); err != nil {
+		t.Fatal(err)
+	}
+	bundle.Tables[0].Rows[0].Cells[1].Text = "tampered after seal"
+
+	_, err = Apply(context.Background(), db, bundle, ApplyOptions{
+		ExpectedCurrentSHA256: strings.Repeat("0", 64),
+	})
+	if err == nil || !strings.Contains(err.Error(), "verify bundle: bundle digest mismatch") {
+		t.Fatalf("tampered bundle error = %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("Apply touched the database before verifying the bundle seal: %v", err)
+	}
+}
+
 func TestMaterializeDesiredUsesCompatibleTargetShape(t *testing.T) {
 	bundle := minimalBundle(t)
 	if err := bundle.Seal(); err != nil {

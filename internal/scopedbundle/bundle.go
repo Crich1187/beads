@@ -162,10 +162,10 @@ func (b Bundle) validateShape() error {
 			return fmt.Errorf("bundle has no %s table", name)
 		}
 	}
-	issues, ok := findTable(b.Tables, "issues")
-	if !ok {
-		return fmt.Errorf("bundle has no issues table")
-	}
+	// The required-table loop above is the single fail-closed presence guard
+	// for all five tables, including issues. Avoid a second unreachable issues
+	// guard whose removal is an equivalent mutation rather than a bypass.
+	issues, _ := findTable(b.Tables, "issues")
 	if len(issues.Rows) != b.Mapping.ExpectedCount {
 		return fmt.Errorf("issues row count %d does not match reviewed mapping count %d", len(issues.Rows), b.Mapping.ExpectedCount)
 	}
