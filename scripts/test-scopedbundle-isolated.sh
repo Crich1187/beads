@@ -64,11 +64,11 @@ rtk docker run --rm --name "$container_name" \
      exit 1
    fi
    cd /tmp/src
-   go test -count=1 -cover ./internal/scopedbundle
-   go test -count=1 -run "Test(MigrateScoped|DecodeScoped)" ./cmd/bd
-   go test -count=1 ./internal/storage/issueops ./internal/eventsjournal
+   go test -tags=gms_pure_go,scopedbundle_integration -count=1 -cover ./internal/scopedbundle
+   go test -tags=gms_pure_go -count=1 -run "Test(MigrateScoped|DecodeScoped)" ./cmd/bd
+   go test -tags=gms_pure_go -count=1 ./internal/storage/issueops ./internal/eventsjournal
    go vet ./internal/scopedbundle ./cmd/bd
-   go build -o /tmp/bd-scoped ./cmd/bd
+   go build -tags=gms_pure_go -o /tmp/bd-scoped ./cmd/bd
    /tmp/bd-scoped migrate scoped --help >/tmp/scoped-help.out
    /tmp/bd-scoped migrate scoped inspect --help >/tmp/scoped-inspect-help.out
    /tmp/bd-scoped migrate scoped export --help >/tmp/scoped-export-help.out

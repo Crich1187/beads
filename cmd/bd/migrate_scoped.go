@@ -154,6 +154,7 @@ func isScopedMigrateCommand(command *cobra.Command) bool {
 }
 
 func readScopedMapping(path string) (scopedbundle.Mapping, error) {
+	// #nosec G304 -- opening the operator-selected --map path is the command contract; strict JSON decoding and Mapping.Validate reject malformed content.
 	file, err := os.Open(path)
 	if err != nil {
 		return scopedbundle.Mapping{}, fmt.Errorf("open mapping: %w", err)
@@ -183,6 +184,7 @@ func decodeScopedMapping(reader io.Reader) (scopedbundle.Mapping, error) {
 }
 
 func readScopedBundle(path string) (scopedbundle.Bundle, error) {
+	// #nosec G304 -- opening the operator-selected --bundle path is the command contract; strict JSON decoding and Bundle.Verify enforce its seal.
 	file, err := os.Open(path)
 	if err != nil {
 		return scopedbundle.Bundle{}, fmt.Errorf("open bundle: %w", err)
@@ -215,6 +217,7 @@ func requireJSONEOF(decoder *json.Decoder) error {
 }
 
 func writeScopedBundle(path string, bundle *scopedbundle.Bundle) error {
+	// #nosec G304 -- creating the operator-selected --output path is the command contract; O_EXCL refuses overwrite/symlink targets and mode 0600 limits access.
 	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
 		return fmt.Errorf("create bundle: %w", err)

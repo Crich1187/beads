@@ -209,6 +209,7 @@ func reconcileTables(ctx context.Context, tx *sql.Tx, mapping Mapping, current, 
 	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(ids)), ",")
 	args := stringsToAny(ids)
 
+	//nolint:gosec // G202: the table/column SQL is constant; only the count of bound placeholders is constructed from the validated reviewed mapping.
 	if _, err := tx.ExecContext(ctx, "DELETE FROM `labels` WHERE `issue_id` IN ("+placeholders+")", args...); err != nil {
 		return fmt.Errorf("replace labels: %w", err)
 	}
@@ -218,6 +219,7 @@ func reconcileTables(ctx context.Context, tx *sql.Tx, mapping Mapping, current, 
 	}
 
 	depArgs := append(append([]any{}, args...), args...)
+	//nolint:gosec // G202: the table/column SQL is constant; only the count of bound placeholders is constructed from the validated reviewed mapping.
 	if _, err := tx.ExecContext(ctx, "DELETE FROM `dependencies` WHERE `issue_id` IN ("+placeholders+") OR `depends_on_issue_id` IN ("+placeholders+")", depArgs...); err != nil {
 		return fmt.Errorf("replace dependencies: %w", err)
 	}
@@ -248,6 +250,7 @@ func upsertRows(ctx context.Context, tx *sql.Tx, table Table) error {
 			updates = append(updates, quoted+"=VALUES("+quoted+")")
 		}
 	}
+	//nolint:gosec // G202: materializeDesired supplies a fixed allowlisted table and target-schema columns; identifiers are quoted and row values remain bound parameters.
 	query := "INSERT INTO " + quoteIdentifier(table.Name) + " (" + strings.Join(columns, ",") + ") VALUES (" + placeholders(len(table.Columns)) + ") ON DUPLICATE KEY UPDATE " + strings.Join(updates, ",")
 	for _, row := range table.Rows {
 		if _, err := tx.ExecContext(ctx, query, cellsToAny(row.Cells)...); err != nil {
@@ -261,6 +264,7 @@ func insertRows(ctx context.Context, tx *sql.Tx, table Table, existing map[strin
 	if len(table.Rows) == 0 {
 		return nil
 	}
+	//nolint:gosec // G202: materializeDesired supplies a fixed allowlisted table and target-schema columns; identifiers are quoted and row values remain bound parameters.
 	query := "INSERT INTO " + quoteIdentifier(table.Name) + " (" + strings.Join(quotedColumnList(table.Columns), ",") + ") VALUES (" + placeholders(len(table.Columns)) + ")"
 	for _, row := range table.Rows {
 		if existing != nil {
