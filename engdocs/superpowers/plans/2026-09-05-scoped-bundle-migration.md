@@ -2,7 +2,7 @@
 
 > Bead: `root-55fr9.13.21`
 > Base: `ce448cb395dbf9b2784dd37c52f1c126a52670cd`
-> Design: `docs/superpowers/specs/2026-09-05-scoped-bundle-migration-design.md`
+> Design: `engdocs/superpowers/specs/2026-09-05-scoped-bundle-migration-design.md`
 
 ## Constraints
 
