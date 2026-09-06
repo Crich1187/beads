@@ -436,9 +436,23 @@ func finishNoRemote(op string) {
 	if !noRemoteIsFatal() {
 		return
 	}
-	fmt.Fprintf(os.Stderr, "\nError: %s transferred nothing — no Dolt remote is configured.\n", op)
+	printNoRemoteFailure(os.Stderr, op)
 	fmt.Fprintf(os.Stderr, "Configure a remote, or set %s=1 (or no-push: true) if this rig is intentionally local-only.\n", noRemoteAllowedEnv)
 	os.Exit(1)
+}
+
+// printNoRemoteFailure prints only fixed operation names. Callers currently
+// pass "push" or "pull"; the default keeps future or unexpected inputs from
+// being reflected into terminal output.
+func printNoRemoteFailure(w io.Writer, op string) {
+	switch op {
+	case "push":
+		fmt.Fprintln(w, "\nError: push transferred nothing — no Dolt remote is configured.")
+	case "pull":
+		fmt.Fprintln(w, "\nError: pull transferred nothing — no Dolt remote is configured.")
+	default:
+		fmt.Fprintln(w, "\nError: sync transferred nothing — no Dolt remote is configured.")
+	}
 }
 
 // noRemoteIsFatal reports whether a confirmed no-remote push/pull should exit

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -1404,6 +1405,59 @@ func TestNoRemoteIsFatal(t *testing.T) {
 			if got := noRemoteIsFatal(); got != tt.want {
 				t.Errorf("noRemoteIsFatal() with %s=%q = %v, want %v",
 					noRemoteAllowedEnv, tt.value, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestFinishNoRemoteFailureMessages(t *testing.T) {
+	const childOpEnv = "BD_TEST_FINISH_NO_REMOTE_OP"
+	if op, ok := os.LookupEnv(childOpEnv); ok {
+		_ = os.Unsetenv(noRemoteAllowedEnv)
+		finishNoRemote(op)
+		return
+	}
+
+	tests := []struct {
+		name      string
+		op        string
+		want      string
+		forbidden string
+	}{
+		{
+			name: "push uses constant output",
+			op:   "push",
+			want: "Error: push transferred nothing — no Dolt remote is configured.",
+		},
+		{
+			name: "pull uses constant output",
+			op:   "pull",
+			want: "Error: pull transferred nothing — no Dolt remote is configured.",
+		},
+		{
+			name:      "unknown operation is not echoed",
+			op:        "unexpected-operation-marker",
+			want:      "Error: sync transferred nothing — no Dolt remote is configured.",
+			forbidden: "unexpected-operation-marker",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cmd := exec.Command(os.Args[0], "-test.run=^TestFinishNoRemoteFailureMessages$")
+			cmd.Env = append(os.Environ(), childOpEnv+"="+tt.op, noRemoteAllowedEnv+"=")
+			output, err := cmd.CombinedOutput()
+
+			var exitErr *exec.ExitError
+			if !errors.As(err, &exitErr) || exitErr.ExitCode() != 1 {
+				t.Fatalf("finishNoRemote(%q) exit = %v, want code 1", tt.op, err)
+			}
+			got := string(output)
+			if !strings.Contains(got, tt.want) {
+				t.Errorf("finishNoRemote(%q) output missing %q", tt.op, tt.want)
+			}
+			if tt.forbidden != "" && strings.Contains(got, tt.forbidden) {
+				t.Errorf("finishNoRemote(%q) echoed untrusted operation", tt.op)
 			}
 		})
 	}
