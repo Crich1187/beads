@@ -464,7 +464,7 @@ func (s *testSuite) configListAllStatusNamesBuiltinsOnly() {
 
 	got, err := s.configRepo().ListAllStatusNames(s.Ctx())
 	s.Require().NoError(err)
-	s.Equal([]string{"open", "in_progress", "blocked", "deferred", "closed", "pinned", "hooked"}, got)
+	s.Equal([]string{"open", "in_progress", "in_review", "blocked", "deferred", "closed", "pinned", "hooked"}, got)
 }
 
 func (s *testSuite) configListAllStatusNamesAppendsCustom() {
@@ -480,7 +480,7 @@ func (s *testSuite) configListAllStatusNamesAppendsCustom() {
 	got, err := s.configRepo().ListAllStatusNames(s.Ctx())
 	s.Require().NoError(err)
 	s.Equal([]string{
-		"open", "in_progress", "blocked", "deferred", "closed", "pinned", "hooked",
+		"open", "in_progress", "in_review", "blocked", "deferred", "closed", "pinned", "hooked",
 		"archived", "review",
 	}, got)
 }
@@ -498,7 +498,7 @@ func (s *testSuite) configUseCaseListAllStatusNames() {
 	got, err := uc.ListAllStatusNames(s.Ctx())
 	s.Require().NoError(err)
 	s.Equal([]string{
-		"open", "in_progress", "blocked", "deferred", "closed", "pinned", "hooked",
+		"open", "in_progress", "in_review", "blocked", "deferred", "closed", "pinned", "hooked",
 		"audit",
 	}, got)
 }
