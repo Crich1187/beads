@@ -283,12 +283,17 @@ func scopedStateOutput(state scopedbundle.State, mapping scopedbundle.Mapping, s
 		counts[table.Name] = len(table.Rows)
 	}
 	return map[string]any{
-		"status":           "inspected",
-		"id_side":          side,
-		"schema_version":   state.Schema.Version,
-		"state_sha256":     state.SHA256,
-		"mapping_sha256":   mapping.SHA256,
-		"expected_count":   mapping.ExpectedCount,
-		"table_row_counts": counts,
+		"status":  "inspected",
+		"id_side": side,
+		// Deliberately NOT "schema_version": the generic JSON wrapper
+		// (wrapWithSchemaVersion) injects its own output-format version under
+		// that key and overwrites any payload value, which silently replaced a
+		// real database schema version with the constant 1 on the legacy JSON
+		// path (root-55fr9.13.21 preflight "schema_version=1").
+		"db_schema_version": state.Schema.Version,
+		"state_sha256":      state.SHA256,
+		"mapping_sha256":    mapping.SHA256,
+		"expected_count":    mapping.ExpectedCount,
+		"table_row_counts":  counts,
 	}
 }
