@@ -313,7 +313,27 @@ possible data loss detected in journal file at offset ...: corrupted journal
 is not the same as a stale PID, stale port, or stale lock file. `bd` will not
 run Dolt's data-loss repair mode automatically.
 
-**Safe recovery when your remote is current:**
+**Before assuming corruption — rule out saturation first.** A single-writer
+Dolt server under heavy host load presents exactly like a dead one: query
+timeouts, `broken pipe` in `dolt-server.log`, and bd's circuit breaker opening.
+None of those are corruption evidence. Check, in order:
+
+```bash
+uptime                          # load vs CPU count
+sar -u -s <window>              # %iowait climbing = disk saturation
+systemctl --user status dolt-sql-server   # is the server process alive?
+ss -ltn | grep 35597            # is the port actually bound?
+```
+
+If the process is alive and the port is bound, the server is slow, not corrupt:
+reduce load, let the circuit breaker cool down, and retry. Do **not** move the
+data directory aside on timeout/lock evidence alone — on a busy multi-agent
+host that recipe has renamed gigabytes of healthy data (see incident
+2026-09-06: load ~90, 43% iowait, healthy 8.9 GB tree moved aside by an agent
+following the earlier version of this section).
+
+**Safe recovery when corruption is actually confirmed** (journal error above
+present, saturation ruled out) **and your remote is current:**
 
 ```bash
 mv .beads/dolt .beads/dolt.corrupt.$(date +%Y%m%dT%H%M%S)
