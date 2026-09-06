@@ -91,6 +91,7 @@ func TestTxEndReleasesJournalScope(t *testing.T) {
 			name: "commit",
 			end: func(t *testing.T, mock sqlmock.Sqlmock, tx Tx) {
 				expectPendingChanges(mock, 1)
+				expectConfigInclusiveStaging(mock)
 				mock.ExpectExec("DOLT_COMMIT").WillReturnResult(sqlmock.NewResult(0, 1))
 				require.NoError(t, tx.Commit(context.Background(), "msg"))
 			},
