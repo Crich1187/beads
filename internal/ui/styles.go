@@ -394,7 +394,7 @@ func GetStatusIconWithCategory(status string, category types.StatusCategory) str
 // Example: ui.GetStatusStyle("in_progress").Render(myCustomText)
 func GetStatusStyle(status string) lipgloss.Style {
 	switch status {
-	case "in_progress":
+	case "in_progress", "in_review":
 		return StatusInProgressStyle
 	case "blocked":
 		return StatusBlockedStyle

@@ -18,6 +18,7 @@ var builtInStatuses = []struct {
 }{
 	{types.StatusOpen, types.CategoryActive, "Available to work (default)"},
 	{types.StatusInProgress, types.CategoryWIP, "Actively being worked on"},
+	{types.StatusInReview, types.CategoryWIP, "Under review (tracker syncs write this)"},
 	{types.StatusBlocked, types.CategoryWIP, "Blocked by a dependency"},
 	{types.StatusDeferred, types.CategoryFrozen, "Deliberately put on ice for later"},
 	{types.StatusClosed, types.CategoryDone, "Completed"},
