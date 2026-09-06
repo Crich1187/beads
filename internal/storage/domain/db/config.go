@@ -261,7 +261,7 @@ func (r *configSQLRepositoryImpl) GetCustomStatuses(ctx context.Context) ([]type
 
 func (r *configSQLRepositoryImpl) ListAllStatusNames(ctx context.Context) ([]string, error) {
 	builtins := []types.Status{
-		types.StatusOpen, types.StatusInProgress, types.StatusBlocked,
+		types.StatusOpen, types.StatusInProgress, types.StatusInReview, types.StatusBlocked,
 		types.StatusDeferred, types.StatusClosed, types.StatusPinned, types.StatusHooked,
 	}
 	custom, err := r.GetCustomStatuses(ctx)

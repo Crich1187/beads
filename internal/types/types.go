@@ -326,6 +326,7 @@ type Status string
 const (
 	StatusOpen       Status = "open"
 	StatusInProgress Status = "in_progress"
+	StatusInReview   Status = "in_review" // Under review (tracker syncs write this)
 	StatusBlocked    Status = "blocked"
 	StatusDeferred   Status = "deferred" // Deliberately put on ice for later
 	StatusClosed     Status = "closed"
@@ -336,7 +337,7 @@ const (
 // IsValid checks if the status value is valid (built-in statuses only)
 func (s Status) IsValid() bool {
 	switch s {
-	case StatusOpen, StatusInProgress, StatusBlocked, StatusDeferred, StatusClosed, StatusPinned, StatusHooked:
+	case StatusOpen, StatusInProgress, StatusInReview, StatusBlocked, StatusDeferred, StatusClosed, StatusPinned, StatusHooked:
 		return true
 	}
 	return false
@@ -410,7 +411,7 @@ const maxCustomStatuses = 50
 
 // builtInStatusNames contains all built-in status names in lowercase for collision detection.
 var builtInStatusNames = map[string]bool{
-	"open": true, "in_progress": true, "blocked": true,
+	"open": true, "in_progress": true, "in_review": true, "blocked": true,
 	"deferred": true, "closed": true, "pinned": true, "hooked": true,
 }
 
@@ -504,7 +505,7 @@ func BuiltInStatusCategory(status Status) StatusCategory {
 	switch status {
 	case StatusOpen:
 		return CategoryActive
-	case StatusInProgress, StatusBlocked, StatusHooked:
+	case StatusInProgress, StatusInReview, StatusBlocked, StatusHooked:
 		return CategoryWIP
 	case StatusClosed:
 		return CategoryDone
