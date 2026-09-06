@@ -132,6 +132,86 @@ var migrateScopedApplyCmd = &cobra.Command{
 	},
 }
 
+// migrateScopedReconcileCmd performs the sealed union that `apply` refuses.
+// `apply` is unchanged and still rejects unenumerated destination history; this
+// command requires a sealed, reviewed manifest that names every destination row
+// which is to survive, and refuses anything the manifest did not describe.
+var migrateScopedReconcileCmd = &cobra.Command{
+	Use:          "reconcile",
+	Short:        "Apply a sealed reviewed union that preserves enumerated destination history",
+	SilenceUsage: true,
+	RunE: func(cmd *cobra.Command, _ []string) error {
+		bundlePath, _ := cmd.Flags().GetString("bundle")
+		manifestPath, _ := cmd.Flags().GetString("manifest")
+		expected, _ := cmd.Flags().GetString("expect-current")
+		actor, _ := cmd.Flags().GetString("actor")
+		if bundlePath == "" || manifestPath == "" || expected == "" || actor == "" {
+			return fmt.Errorf("--bundle, --manifest, --expect-current, and --actor are required")
+		}
+		CheckReadonly("migrate scoped reconcile")
+		bundle, err := readScopedBundle(bundlePath)
+		if err != nil {
+			return err
+		}
+		manifest, err := readReconcileManifest(manifestPath)
+		if err != nil {
+			return err
+		}
+		db, cleanup, err := openScopedBundleConnection(rootCtx)
+		if err != nil {
+			return err
+		}
+		defer cleanup()
+		beadsDir := selectedDoltBeadsDir()
+		result, err := scopedbundle.Reconcile(rootCtx, db, bundle, manifest, scopedbundle.ReconcileOptions{
+			ExpectedCurrentSHA256: expected,
+			Actor:                 actor,
+			JournalEnabled:        eventsjournal.EnabledFor(beadsDir),
+		})
+		if err != nil {
+			return err
+		}
+		return outputJSON(map[string]any{
+			"status":                        "reconciled",
+			"changed":                       result.Changed,
+			"before_sha256":                 result.BeforeSHA256,
+			"after_sha256":                  result.AfterSHA256,
+			"bundle_sha256":                 bundle.SHA256,
+			"manifest_sha256":               manifest.SHA256,
+			"schema_statements":             len(result.SchemaStatements),
+			"source_comments":               result.SourceComments,
+			"retained_destination_comments": result.RetainedDestinationComments,
+			"removed_linked_comments":       result.RemovedLinkedComments,
+			"source_events":                 result.SourceEvents,
+			"retained_destination_events":   result.RetainedDestinationEvents,
+		})
+	},
+}
+
+// readReconcileManifest decodes a sealed manifest with strict JSON, refusing
+// unknown fields so a typo cannot silently disable a guard.
+func readReconcileManifest(path string) (scopedbundle.ReconcileManifest, error) {
+	// #nosec G304 -- opening the operator-selected --manifest path is the command contract; strict JSON decoding and Verify enforce its seal.
+	file, err := os.Open(path)
+	if err != nil {
+		return scopedbundle.ReconcileManifest{}, fmt.Errorf("open reconcile manifest: %w", err)
+	}
+	defer func() { _ = file.Close() }()
+	decoder := json.NewDecoder(file)
+	decoder.DisallowUnknownFields()
+	var manifest scopedbundle.ReconcileManifest
+	if err := decoder.Decode(&manifest); err != nil {
+		return scopedbundle.ReconcileManifest{}, fmt.Errorf("decode reconcile manifest: %w", err)
+	}
+	if err := requireJSONEOF(decoder); err != nil {
+		return scopedbundle.ReconcileManifest{}, err
+	}
+	if err := manifest.Verify(); err != nil {
+		return scopedbundle.ReconcileManifest{}, err
+	}
+	return manifest, nil
+}
+
 func init() {
 	migrateScopedInspectCmd.Flags().String("map", "", "Path to the reviewed mapping JSON")
 	migrateScopedInspectCmd.Flags().String("id-side", "", "Mapping side to inspect: source or target")
@@ -140,7 +220,11 @@ func init() {
 	migrateScopedApplyCmd.Flags().String("bundle", "", "Path to a verified scoped bundle JSON")
 	migrateScopedApplyCmd.Flags().String("expect-current", "", "Exact current target state SHA-256")
 	migrateScopedApplyCmd.Flags().String("actor", "", "Auditable applying identity")
-	migrateScopedCmd.AddCommand(migrateScopedInspectCmd, migrateScopedExportCmd, migrateScopedApplyCmd)
+	migrateScopedReconcileCmd.Flags().String("bundle", "", "Path to a verified scoped bundle JSON")
+	migrateScopedReconcileCmd.Flags().String("manifest", "", "Path to the sealed reviewed reconcile manifest JSON")
+	migrateScopedReconcileCmd.Flags().String("expect-current", "", "Exact current target state SHA-256")
+	migrateScopedReconcileCmd.Flags().String("actor", "", "Auditable applying identity")
+	migrateScopedCmd.AddCommand(migrateScopedInspectCmd, migrateScopedExportCmd, migrateScopedApplyCmd, migrateScopedReconcileCmd)
 	migrateCmd.AddCommand(migrateScopedCmd)
 }
 
