@@ -207,11 +207,25 @@ func verifyUnion(current State, desired []Table, post State, manifest ReconcileM
 
 	counts.sourceComments = len(desiredComments.Rows)
 	counts.sourceEvents = len(desiredEvents.Rows)
-	counts.retainedComments = len(manifest.RetainTargetCommentIDs)
-	counts.retainedEvents = len(manifest.RetainTargetEventIDs)
 
 	postCommentIDs := idSet(postComments)
 	postEventIDs := idSet(postEvents)
+
+	// Report retained counts as observed destination-only survivors: a retained
+	// identity the source also supplies (landed by an earlier apply) is a source
+	// row in the union, and counting it twice would overstate what was kept.
+	desiredCommentIDs := idSet(desiredComments)
+	desiredEventIDs := idSet(desiredEvents)
+	for _, id := range manifest.RetainTargetCommentIDs {
+		if _, fromSource := desiredCommentIDs[id]; !fromSource {
+			counts.retainedComments++
+		}
+	}
+	for _, id := range manifest.RetainTargetEventIDs {
+		if _, fromSource := desiredEventIDs[id]; !fromSource {
+			counts.retainedEvents++
+		}
+	}
 
 	for _, row := range desiredComments.Rows {
 		id, err := rowID(desiredComments, row)
@@ -244,6 +258,13 @@ func verifyUnion(current State, desired []Table, post State, manifest ReconcileM
 	for _, link := range manifest.CommentLinks {
 		if _, ok := postCommentIDs[link.TargetID]; ok {
 			return counts, fmt.Errorf("postcondition: linked destination comment %q survived and would duplicate source %q", link.TargetID, link.SourceID)
+		}
+		// Belt and braces behind validateLinkIntegrity: the surviving side of
+		// every link must actually exist after the union. A phantom SourceID
+		// that somehow reached execution deleted its target and wrote nothing —
+		// that is data loss, so the transaction must roll back.
+		if _, ok := postCommentIDs[link.SourceID]; !ok {
+			return counts, fmt.Errorf("postcondition: linked source comment %q is missing after reconcile; destination %q would be silently lost", link.SourceID, link.TargetID)
 		}
 	}
 

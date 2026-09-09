@@ -166,6 +166,17 @@ func (m ReconcileManifest) validateShape() error {
 		seenTarget[link.TargetID] = struct{}{}
 		seenSource[link.SourceID] = struct{}{}
 	}
+	// A comment identity may appear on only one side of the link set. An
+	// identity that is simultaneously "a destination duplicate to delete" and
+	// "the surviving source identity" (including a self-link) would make the
+	// executor's delete-then-insert order semantically ambiguous and its
+	// postconditions self-contradictory; a destination row that already carries
+	// the source identity belongs in RetainTargetCommentIDs instead.
+	for id := range seenSource {
+		if _, both := seenTarget[id]; both {
+			return fmt.Errorf("comment %q appears as both a link source and a link target", id)
+		}
+	}
 
 	for name, ids := range map[string][]string{
 		"retain_target_comment_ids": m.RetainTargetCommentIDs,
@@ -371,6 +382,10 @@ func PlanReconcile(bundle Bundle, target State, targetSchema Schema, manifest Re
 		return ReconcilePlan{}, err
 	}
 
+	if err := validateLinkIntegrity(bundle, target, manifest); err != nil {
+		return ReconcilePlan{}, err
+	}
+
 	canonical := manifest.Canonical()
 	return ReconcilePlan{
 		SchemaStatements:    statements,
@@ -379,6 +394,113 @@ func PlanReconcile(bundle Bundle, target State, targetSchema Schema, manifest Re
 		RetainedTargetEvent: canonical.RetainTargetEventIDs,
 		RetainedSourceEvent: canonical.RetainSourceEventIDs,
 	}, nil
+}
+
+// validateLinkIntegrity refuses every comment-link (and source-event) shape the
+// enumeration guarantee alone cannot catch. requireEveryRowListed already proves
+// each link's TargetID names a real destination row; the checks here close the
+// remaining integrity classes:
+//
+//   - a SourceID that names no bundle comment. The executor would delete the
+//     linked destination comment and never write a replacement — silent loss of
+//     exactly the history this tool exists to preserve, reported as success.
+//   - a TargetID that the bundle itself also supplies as a comment identity.
+//     The delete-then-insert union would resurrect the identity the link just
+//     removed, guaranteeing a postcondition contradiction after writes; refuse
+//     before any write instead.
+//   - a link whose two comments belong to non-corresponding issues. The content
+//     would survive, silently reattached to a different issue's history.
+//   - a RetainSourceEventIDs list that is not exactly the bundle's event
+//     identity set. The executor retains every mapped source event regardless,
+//     so a partial list would let a reviewer believe an omission excludes an
+//     event when it does not; a non-empty list must therefore be a complete,
+//     verified enumeration (an empty list makes no assertion).
+func validateLinkIntegrity(bundle Bundle, target State, manifest ReconcileManifest) error {
+	sourceComments, ok := findTable(bundle.Tables, "comments")
+	if !ok {
+		return fmt.Errorf("bundle has no comments table")
+	}
+	sourceIssueByComment := make(map[string]string, len(sourceComments.Rows))
+	issueIndex, hasIssue := tableColumnIndex(sourceComments, "issue_id")
+	if !hasIssue {
+		return fmt.Errorf("bundle comments table is missing issue_id column")
+	}
+	for _, row := range sourceComments.Rows {
+		id, err := rowID(sourceComments, row)
+		if err != nil {
+			return err
+		}
+		cell := row.Cells[issueIndex]
+		if cell.Null || cell.Text == "" {
+			return fmt.Errorf("bundle comment %q has an empty issue_id", id)
+		}
+		sourceIssueByComment[id] = cell.Text
+	}
+
+	targetComments, _ := findTable(target.Tables, "comments")
+	targetIssueByComment := make(map[string]string, len(targetComments.Rows))
+	if len(manifest.CommentLinks) > 0 {
+		targetIssueIndex, ok := tableColumnIndex(targetComments, "issue_id")
+		if !ok {
+			return fmt.Errorf("target comments table is missing issue_id column")
+		}
+		for _, row := range targetComments.Rows {
+			id, err := rowID(targetComments, row)
+			if err != nil {
+				return err
+			}
+			targetIssueByComment[id] = row.Cells[targetIssueIndex].Text
+		}
+	}
+
+	for _, link := range manifest.CommentLinks {
+		sourceIssue, exists := sourceIssueByComment[link.SourceID]
+		if !exists {
+			return fmt.Errorf("comment link source %q does not exist in the bundle", link.SourceID)
+		}
+		if _, collides := sourceIssueByComment[link.TargetID]; collides {
+			return fmt.Errorf("comment link target %q is also a bundle comment identity; the union would resurrect the row the link deletes", link.TargetID)
+		}
+		mappedIssue, err := bundle.Mapping.TargetFor(sourceIssue)
+		if err != nil {
+			return fmt.Errorf("comment link source %q: %w", link.SourceID, err)
+		}
+		targetIssue, exists := targetIssueByComment[link.TargetID]
+		if !exists {
+			// requireEveryRowListed reports absent targets with its own message;
+			// reaching here means the caller skipped enumeration, so fail closed.
+			return fmt.Errorf("comment link target %q does not exist in the destination", link.TargetID)
+		}
+		if targetIssue != mappedIssue {
+			return fmt.Errorf("comment link %q -> %q crosses issues: destination comment belongs to %q but the source comment maps to %q",
+				link.SourceID, link.TargetID, targetIssue, mappedIssue)
+		}
+	}
+
+	if len(manifest.RetainSourceEventIDs) > 0 {
+		sourceEvents, ok := findTable(bundle.Tables, "events")
+		if !ok {
+			return fmt.Errorf("bundle has no events table")
+		}
+		bundleEventIDs := make(map[string]struct{}, len(sourceEvents.Rows))
+		for _, row := range sourceEvents.Rows {
+			id, err := rowID(sourceEvents, row)
+			if err != nil {
+				return err
+			}
+			bundleEventIDs[id] = struct{}{}
+		}
+		for _, id := range manifest.RetainSourceEventIDs {
+			if _, ok := bundleEventIDs[id]; !ok {
+				return fmt.Errorf("retain_source_event_ids names %q which is not a bundle event", id)
+			}
+		}
+		if len(manifest.RetainSourceEventIDs) != len(bundleEventIDs) {
+			return fmt.Errorf("retain_source_event_ids lists %d of %d bundle events; a non-empty list must enumerate every source event because the executor retains all of them",
+				len(manifest.RetainSourceEventIDs), len(bundleEventIDs))
+		}
+	}
+	return nil
 }
 
 // requireEveryRowListed rejects any destination row the manifest did not
