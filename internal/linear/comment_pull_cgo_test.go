@@ -59,8 +59,11 @@ func TestCommentPull_EmbeddedDoltRoundTrip(t *testing.T) {
 	if s := run(); s.Imported != 0 || s.Deduplicated != 0 || s.WatermarksWritten != 0 {
 		t.Fatalf("second run = %+v", s)
 	}
-	// A pull that replaces the whole metadata column wipes the watermark.
-	if err := store.UpdateIssue(ctx, "cpull-1", map[string]interface{}{"metadata": `{"linear":{"x":1}}`}, "tester"); err != nil {
+	// A pull that replaces the whole metadata column wipes the watermark
+	// (base bug tracked as .31). Sibling pass keys written alongside must
+	// survive the watermark rewrite, which merges rather than replaces.
+	wiped := `{"linear":{"x":1},"linear.relations":{"r":1},"linear.milestone_assigned":"m1"}`
+	if err := store.UpdateIssue(ctx, "cpull-1", map[string]interface{}{"metadata": wiped}, "tester"); err != nil {
 		t.Fatalf("replace metadata: %v", err)
 	}
 	if s := run(); s.Imported != 0 || s.Deduplicated != 2 || s.WatermarksWritten != 1 {
@@ -89,7 +92,8 @@ func TestCommentPull_EmbeddedDoltRoundTrip(t *testing.T) {
 		t.Fatalf("GetIssue: %v", err)
 	}
 	md := string(issue.Metadata)
-	if !strings.Contains(md, `"linear.comment_watermark"`) || !strings.Contains(md, `"linear"`) {
+	if !strings.Contains(md, `"linear.comment_watermark"`) || !strings.Contains(md, `"linear"`) ||
+		!strings.Contains(md, `"linear.relations"`) || !strings.Contains(md, `"linear.milestone_assigned"`) {
 		t.Fatalf("metadata = %s", md)
 	}
 	if fake.mutationCount() != 0 {
