@@ -333,6 +333,12 @@ func (e *Engine) doPull(ctx context.Context, opts SyncOptions, allowOverwriteIDs
 	)
 	defer span.End()
 
+	protected, err := compileProtectedAssignees(opts.ProtectedAssigneePatterns)
+	if err != nil {
+		span.RecordError(err)
+		return nil, err
+	}
+
 	stats := &PullStats{}
 
 	// Determine if incremental sync is possible
@@ -509,7 +515,7 @@ func (e *Engine) doPull(ctx context.Context, opts SyncOptions, allowOverwriteIDs
 			dryRunIssues = append(dryRunIssues, &dryRunIssue)
 		}
 
-		if existing != nil && pullIssueEqual(existing, conv.Issue, ref) {
+		if existing != nil && pullIssueEqual(existing, conv.Issue, ref, protected) {
 			stats.Skipped++
 			continue
 		}
@@ -526,7 +532,7 @@ func (e *Engine) doPull(ctx context.Context, opts SyncOptions, allowOverwriteIDs
 		}
 
 		if existing != nil {
-			updates := buildPullIssueUpdates(existing, conv.Issue, ref)
+			updates := buildPullIssueUpdates(existing, conv.Issue, ref, protected)
 			if raw, ok := marshalTrackerMetadata(extIssue.Metadata); ok {
 				updates["metadata"] = raw
 			}
@@ -595,7 +601,7 @@ func markPullIssueFields(updates map[string]interface{}) {
 	updates[issueops.OpForceClosePolicy] = true
 }
 
-func pullIssueEqual(local *types.Issue, remote *types.Issue, ref string) bool {
+func pullIssueEqual(local *types.Issue, remote *types.Issue, ref string, protected protectedAssignees) bool {
 	if local == nil || remote == nil {
 		return false
 	}
@@ -604,7 +610,7 @@ func pullIssueEqual(local *types.Issue, remote *types.Issue, ref string) bool {
 		local.Priority != remote.Priority ||
 		local.Status != remote.Status ||
 		local.IssueType != remote.IssueType ||
-		strings.TrimSpace(local.Assignee) != strings.TrimSpace(remote.Assignee) ||
+		pullAssigneeChanges(local, remote, protected) ||
 		!equalNormalizedStrings(local.Labels, remote.Labels) {
 		return false
 	}
@@ -615,14 +621,16 @@ func pullIssueEqual(local *types.Issue, remote *types.Issue, ref string) bool {
 	return localRef == strings.TrimSpace(ref)
 }
 
-func buildPullIssueUpdates(existing *types.Issue, remote *types.Issue, ref string) map[string]interface{} {
+func buildPullIssueUpdates(existing *types.Issue, remote *types.Issue, ref string, protected protectedAssignees) map[string]interface{} {
 	updates := map[string]interface{}{
 		"title":       remote.Title,
 		"description": remote.Description,
 		"priority":    remote.Priority,
 		"status":      string(remote.Status),
 		"issue_type":  string(remote.IssueType),
-		"assignee":    remote.Assignee,
+	}
+	if assignee, ok := pullAssignee(existing, remote, protected); ok {
+		updates["assignee"] = assignee
 	}
 	trimmedRef := strings.TrimSpace(ref)
 	if trimmedRef == "" {
