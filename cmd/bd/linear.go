@@ -419,6 +419,7 @@ func runLinearSync(cmd *cobra.Command, args []string) error {
 	effectivePush := push || (!push && !pull)
 	if effectivePush && result.Success && !syncIsScoped(&opts) {
 		reconcileLinearParentsForStore(ctx, trackerStore, lt, dryRun, jsonOutput, &result.Warnings)
+		reconcileLinearMilestonesForStore(ctx, trackerStore, lt, &opts, dryRun, jsonOutput, &result.Warnings)
 	}
 
 	// Record successful pull timestamp
