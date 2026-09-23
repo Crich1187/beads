@@ -623,10 +623,10 @@ The remote must already exist (see 'bd dolt remote add').`,
 		}
 		if pushErr != nil {
 			if isConfirmedNoRemote(ctx, st, pushErr) {
-			if isConfirmedNoRemote(ctx, st, pushErr) {
-				finishNoRemote("push")
-				return nil
-			}
+				if isConfirmedNoRemote(ctx, st, pushErr) {
+					finishNoRemote("push")
+					return nil
+				}
 			}
 			fmt.Fprintf(os.Stderr, "Error: %v\n", pushErr)
 			if isAncestorPKMismatchErr(pushErr) {
@@ -730,10 +730,10 @@ reports conflicts.`,
 		}
 		if err != nil {
 			if isConfirmedNoRemote(ctx, st, err) {
-			if isConfirmedNoRemote(ctx, st, err) {
-				finishNoRemote("pull")
-				return nil
-			}
+				if isConfirmedNoRemote(ctx, st, err) {
+					finishNoRemote("pull")
+					return nil
+				}
 			}
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			if isAncestorPKMismatchErr(err) {
