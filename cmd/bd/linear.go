@@ -433,6 +433,7 @@ func runLinearSync(cmd *cobra.Command, args []string) error {
 		if err := reconcileLinearRelationsForStore(ctx, trackerStore, lt, dryRun, jsonOutput, &result.Warnings); err != nil {
 			return HandleErrorRespectJSON("relation reconcile: %v", err)
 		}
+		reconcileLinearMilestonesForStore(ctx, trackerStore, lt, &opts, dryRun, jsonOutput, &result.Warnings)
 	}
 
 	// Record successful pull timestamp
