@@ -325,24 +325,42 @@ func PriorityToLinear(beadsPriority int, config *MappingConfig) int {
 	return 3 // Default to Medium
 }
 
-// StateToBeadsStatus maps Linear state type to Beads status.
-// Checks both state type (backlog, unstarted, etc.) and state name for custom workflows.
-// Uses configurable mapping from linear.state_map.* config.
+// StateToBeadsStatus maps a Linear workflow state to a Beads status.
+//
+// Precedence:
+//  1. An explicit linear.state_map.<state name> entry, when its value is a
+//     built-in status or a configured custom status (status.custom). This lets
+//     e.g. a "Blocked" state of type started pull as blocked instead of the
+//     started-type default in_progress.
+//  2. The state type (built-in defaults, or an explicit type-key override).
+//  3. The state name in the full state map (for custom workflow types).
+//  4. open.
+//
+// An explicit name entry whose value is not a known status is ignored so the
+// state falls back to its type default rather than silently becoming open.
 func StateToBeadsStatus(state *State, config *MappingConfig) types.Status {
 	if state == nil {
 		return types.StatusOpen
 	}
 
-	// First, try to match by state type (preferred)
+	stateName := strings.ToLower(strings.TrimSpace(state.Name))
+
+	// Explicit per-name entries beat type defaults.
+	if statusStr, ok := config.ExplicitStateMap[stateName]; ok {
+		if status, known := parseKnownBeadsStatus(statusStr, config.CustomStatuses); known {
+			return status
+		}
+	}
+
+	// Then match by state type
 	stateType := strings.ToLower(state.Type)
 	if statusStr, ok := config.StateMap[stateType]; ok {
-		return ParseBeadsStatus(statusStr)
+		return ParseBeadsStatus(statusStr, config.CustomStatuses...)
 	}
 
 	// Then try to match by state name (for custom workflow states)
-	stateName := strings.ToLower(state.Name)
 	if statusStr, ok := config.StateMap[stateName]; ok {
-		return ParseBeadsStatus(statusStr)
+		return ParseBeadsStatus(statusStr, config.CustomStatuses...)
 	}
 
 	// Default fallback
@@ -435,25 +453,42 @@ func ResolveStateIDForBeadsStatus(cache *StateCache, status types.Status, config
 }
 
 // ParseBeadsStatus converts a status string to types.Status.
-func ParseBeadsStatus(s string) types.Status {
-	switch strings.ToLower(s) {
+// Built-in statuses (including in_review) are always recognized; custom
+// statuses are recognized only when present in the supplied status.custom
+// entries. Unrecognized strings return StatusOpen.
+func ParseBeadsStatus(s string, custom ...types.CustomStatus) types.Status {
+	status, _ := parseKnownBeadsStatus(s, custom)
+	return status
+}
+
+// parseKnownBeadsStatus is ParseBeadsStatus with an explicit "recognized"
+// result, so callers can distinguish a real open from an unknown value.
+func parseKnownBeadsStatus(s string, custom []types.CustomStatus) (types.Status, bool) {
+	normalized := strings.ToLower(strings.TrimSpace(s))
+	switch normalized {
 	case "open":
-		return types.StatusOpen
+		return types.StatusOpen, true
 	case "in_progress", "in-progress", "inprogress":
-		return types.StatusInProgress
+		return types.StatusInProgress, true
+	case "in_review", "in-review", "inreview":
+		return types.StatusInReview, true
 	case "blocked":
-		return types.StatusBlocked
+		return types.StatusBlocked, true
 	case "closed", "done":
-		return types.StatusClosed
+		return types.StatusClosed, true
 	case "deferred":
-		return types.StatusDeferred
+		return types.StatusDeferred, true
 	case "pinned":
-		return types.StatusPinned
+		return types.StatusPinned, true
 	case "hooked":
-		return types.StatusHooked
-	default:
-		return types.StatusOpen
+		return types.StatusHooked, true
 	}
+	for _, cs := range custom {
+		if normalized != "" && normalized == cs.Name {
+			return types.Status(cs.Name), true
+		}
+	}
+	return types.StatusOpen, false
 }
 
 // StatusToLinearStateType converts Beads status to Linear state type for filtering.
