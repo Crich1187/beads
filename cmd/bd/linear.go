@@ -420,6 +420,11 @@ func runLinearSync(cmd *cobra.Command, args []string) error {
 	if effectivePush && result.Success && !syncIsScoped(&opts) {
 		reconcileLinearParentsForStore(ctx, trackerStore, lt, dryRun, jsonOutput, &result.Warnings)
 	}
+	// Post-sync: pull new Linear comments into bead comments (read-only
+	// toward Linear). Pull direction only; skipped on scoped syncs.
+	if (pull || !push) && result.Success && !syncIsScoped(&opts) {
+		pullLinearCommentsForStore(ctx, trackerStore, store, lt, dryRun, jsonOutput, &result.Warnings)
+	}
 
 	// Record successful pull timestamp
 	if (pull || !push) && !dryRun {
