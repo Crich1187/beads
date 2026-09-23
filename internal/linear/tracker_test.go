@@ -409,9 +409,11 @@ func TestBatchPush_PerTeamStateCache(t *testing.T) {
 			json.NewEncoder(w).Encode(teamLabelsEmptyResp("team-2"))
 		case strings.Contains(req.Query, "IssueByIdentifier"):
 			// Return the issue with DIFFERENT title so PushFieldsEqual = false and we proceed.
+			// The remote sits in a completed state so the open bead is a real
+			// transition and the update carries a stateId (patch 3 omits it otherwise).
 			json.NewEncoder(w).Encode(issueByIdentifierResp(
 				"t2-uuid", "T2-1", "Old Title", "", 0,
-				"t2-state-open", "Ready", "backlog",
+				"t2-state-done", "Done", "completed",
 			))
 		case strings.Contains(req.Query, "issueUpdate"):
 			// Capture the stateId sent in the update so we can verify it came from team-2's cache.

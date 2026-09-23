@@ -253,13 +253,22 @@ func (t *Tracker) UpdateIssue(ctx context.Context, externalID string, issue *typ
 	mapper := &linearFieldMapper{config: t.config, labelCache: labelCache}
 	updates := mapper.IssueToTracker(issue)
 
-	// Resolve and include state so status changes are pushed to Linear.
-	stateID, err := t.findStateID(ctx, client, issue.Status)
-	if err != nil {
-		return nil, fmt.Errorf("finding state for status %s: %w", issue.Status, err)
+	// Include state only when the bead status is a real transition relative
+	// to the current remote state (see shouldPushStateID). A fetch failure or
+	// missing issue leaves the remote state unknown, which pushes state as
+	// before rather than failing the update.
+	var remoteState *State
+	if remote, fetchErr := client.FetchIssueByIdentifier(ctx, externalID); fetchErr == nil && remote != nil {
+		remoteState = remote.State
 	}
-	if stateID != "" {
-		updates["stateId"] = stateID
+	if shouldPushStateID(remoteState, issue.Status, t.config) {
+		stateID, err := t.findStateID(ctx, client, issue.Status)
+		if err != nil {
+			return nil, fmt.Errorf("finding state for status %s: %w", issue.Status, err)
+		}
+		if stateID != "" {
+			updates["stateId"] = stateID
+		}
 	}
 
 	updated, err := client.UpdateIssue(ctx, externalID, updates)
@@ -519,25 +528,37 @@ func (t *Tracker) BatchPush(ctx context.Context, issues []*types.Issue, forceIDs
 		mapper := &linearFieldMapper{config: t.config, labelCache: teamLabelCache}
 		updates := mapper.IssueToTracker(issue)
 
-		stateID, stateErr := ResolveStateIDForBeadsStatus(teamCache, issue.Status, t.config)
-		if stateErr != nil {
-			result.Errors = append(result.Errors, tracker.BatchPushError{
-				LocalID: issue.ID,
-				Message: fmt.Sprintf("resolving state for status %s: %v", issue.Status, stateErr),
-			})
-			continue
+		// Prefer the issue obtained during the skip-check fetch; fall back to a
+		// fresh lookup only when the skip check was bypassed (forceIDs) or the
+		// skip-check fetch failed. The fetched issue supplies both the UUID and
+		// the current remote state used by the stateId decision below.
+		if remoteIssue == nil {
+			if li, lookupErr := routeClient.FetchIssueByIdentifier(ctx, externalID); lookupErr == nil && li != nil {
+				remoteIssue = li
+			}
 		}
-		if stateID != "" {
-			updates["stateId"] = stateID
-		}
-
-		// Prefer the UUID obtained during the skip-check fetch; fall back to a
-		// fresh lookup only when the skip check was bypassed (forceIDs).
 		issueUUID := externalID
+		var remoteState *State
 		if remoteIssue != nil {
 			issueUUID = remoteIssue.ID
-		} else if li, lookupErr := routeClient.FetchIssueByIdentifier(ctx, externalID); lookupErr == nil && li != nil {
-			issueUUID = li.ID
+			remoteState = remoteIssue.State
+		}
+
+		// Force bypasses the content skip, not the transition rule: stateId is
+		// sent only when the bead status differs from the remote state's
+		// pull mapping, or when the remote state is unknown.
+		if shouldPushStateID(remoteState, issue.Status, t.config) {
+			stateID, stateErr := ResolveStateIDForBeadsStatus(teamCache, issue.Status, t.config)
+			if stateErr != nil {
+				result.Errors = append(result.Errors, tracker.BatchPushError{
+					LocalID: issue.ID,
+					Message: fmt.Sprintf("resolving state for status %s: %v", issue.Status, stateErr),
+				})
+				continue
+			}
+			if stateID != "" {
+				updates["stateId"] = stateID
+			}
 		}
 
 		updated, updateErr := routeClient.UpdateIssue(ctx, issueUUID, updates)
@@ -644,6 +665,27 @@ func (t *Tracker) ValidatePushStateMappings(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+// shouldPushStateID reports whether an update for a bead with the given
+// status should carry a stateId.
+//
+// The comparison uses the pull mapping (StateToBeadsStatus) of the CURRENT
+// remote workflow state. When that mapping already equals the bead status,
+// the update is not a status transition, so stateId is omitted: re-asserting
+// the outbound state would otherwise clobber Linear-only distinctions on an
+// unrelated edit (Canceled or Duplicate becoming Done, Backlog becoming Todo).
+//
+// Conservative cases: when the remote state is unknown (issue not fetched,
+// fetch failed, or the issue has no state) or no mapping config is loaded,
+// it returns true so the bead status is pushed exactly as before. A remote
+// state with no pull mapping resolves through StateToBeadsStatus's own
+// fallback (open), matching what a pull would write to the bead.
+func shouldPushStateID(remote *State, status types.Status, config *MappingConfig) bool {
+	if remote == nil || config == nil {
+		return true
+	}
+	return StateToBeadsStatus(remote, config) != status
 }
 
 // findStateID looks up the Linear workflow state ID for a beads status
