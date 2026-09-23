@@ -324,7 +324,11 @@ Examples:
 			return rememberBareKeyPath(derived, insight, recalled.Value)
 		}
 
-		result, err := memories.Remember(rootCtx, memoryops.RememberRequest{Key: memoryKeyFlag, Content: insight})
+		writeCtx, err := directConfigWriteContext(rootCtx)
+		if err != nil {
+			return HandleErrorRespectJSON("%v", err)
+		}
+		result, err := memories.Remember(writeCtx, memoryops.RememberRequest{Key: memoryKeyFlag, Content: insight})
 		if err != nil {
 			// The role's two refusals ARE this command's shipped sentences —
 			// "memory content cannot be empty" and "could not generate key from
@@ -429,7 +433,11 @@ Examples:
 		// No pre-read here, deliberately: the value printed below is the one
 		// the role's transaction actually deleted, not the one an earlier read
 		// happened to see.
-		result, err := memories.Forget(rootCtx, memoryops.ForgetRequest{Key: args[0]})
+		writeCtx, err := directConfigWriteContext(rootCtx)
+		if err != nil {
+			return HandleErrorRespectJSON("%v", err)
+		}
+		result, err := memories.Forget(writeCtx, memoryops.ForgetRequest{Key: args[0]})
 		if err != nil {
 			return HandleErrorRespectJSON("forgetting memory: %v", err)
 		}

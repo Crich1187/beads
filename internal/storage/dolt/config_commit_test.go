@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/steveyegge/beads/internal/storage/issueops"
+	"github.com/steveyegge/beads/memoryops"
 )
 
 // TestRootC1Q3P_ConfigSetSurvivesCommitWithConfig pins the explicit-commit
@@ -219,4 +220,19 @@ func TestConfigLinearSync30_SetConfigPublishesToHead(t *testing.T) {
 	if dirty, _, _ := configTableState(t, ctx, store, "metadata"); !dirty {
 		t.Fatal("SetConfig swept an unrelated dirty table (metadata) into its commit (GH#2455)")
 	}
+
+	// 6. Memories are kv.memory.* config rows: bd remember / bd forget share
+	// the contract.
+	mem, err := store.Memories()
+	if err != nil {
+		t.Fatalf("Memories: %v", err)
+	}
+	if _, err := mem.Remember(ctx, memoryops.RememberRequest{Key: "ls30-mem", Content: "durable memory"}); err != nil {
+		t.Fatalf("Remember: %v", err)
+	}
+	assertTablePublished(t, ctx, store, "Remember", "config")
+	if _, err := mem.Forget(ctx, memoryops.ForgetRequest{Key: "ls30-mem"}); err != nil {
+		t.Fatalf("Forget: %v", err)
+	}
+	assertTablePublished(t, ctx, store, "Forget", "config")
 }
