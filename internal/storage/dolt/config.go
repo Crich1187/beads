@@ -3,7 +3,9 @@ package dolt
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"log"
+	"slices"
 
 	"github.com/steveyegge/beads/internal/config"
 	"github.com/steveyegge/beads/internal/storage/domain"
@@ -11,14 +13,43 @@ import (
 	"github.com/steveyegge/beads/internal/types"
 )
 
-// SetConfig sets a configuration value
+// SetConfig sets a configuration value and publishes it as a Dolt version
+// commit (config-LinearSync-001.30, recurrence of root-c1q3p).
+//
+// Durability contract: on a nil return the row is in HEAD, not merely in the
+// branch working set -- unless ctx defers version commits
+// (issueops.WithDeferredVersionCommit: --dolt-auto-commit batch/off), in which
+// case the write is left in the working set for the caller's explicit commit
+// point, exactly like the issue-operation write paths.
+//
+// Why the store must do this itself: DoltStore is the direct SQL-server
+// route, and on that route the CLI's post-run auto-commit epilogue
+// (cmd/bd maybeAutoCommit) deliberately does nothing -- it relies on the
+// storage layer versioning its own writes in server mode. Every other
+// DoltStore write verb honours that (runIssueOperationTxWithMessage ->
+// doltAddAndCommitPostTx), but SetConfig/DeleteConfig only committed the SQL
+// transaction, so `bd config set`, `bd kv set` and tracker last_sync writes
+// stranded config (and the custom_statuses / custom_types projections) in the
+// shared working set until some unrelated sweep committed them.
+//
+// Ordering follows upstream #6040: the SQL transaction commits first, then the
+// Dolt commit stages ONLY the tables this write touched (config plus its
+// projection table, never a concurrent writer's dirty tables -- GH#2455) from
+// the post-merge working set.
+//
+// Unlike the issue-operation path, a failed version commit is returned, not
+// swallowed: a config write is idempotent (re-running it cannot double-apply),
+// and reporting success for a value that is not in HEAD is the exact failure
+// this contract exists to prevent.
 func (s *DoltStore) SetConfig(ctx context.Context, key, value string) error {
+	var projection string
 	if err := s.withRetryTx(ctx, func(tx *sql.Tx) error {
 		if err := issueops.SetConfigInTx(ctx, tx, key, value); err != nil {
 			return err
 		}
 		// Sync normalized tables when config keys change
-		_, err := issueops.SyncConfigTables(ctx, tx, key, value)
+		var err error
+		projection, err = issueops.SyncConfigTables(ctx, tx, key, value)
 		return err
 	}); err != nil {
 		return err
@@ -27,6 +58,48 @@ func (s *DoltStore) SetConfig(ctx context.Context, key, value string) error {
 	// Invalidate caches for keys that affect cached data
 	s.invalidateConfigCaches(key)
 
+	return s.publishConfigWrite(ctx, configWriteTables(projection), "bd: config set "+key)
+}
+
+// CommitConfigWrites publishes config writes that were made under a deferred
+// version-commit context as ONE Dolt commit, staging only config and the
+// projection tables the given keys feed. It is the commit point for a
+// multi-key write (bd config set-many on the direct SQL-server route), so the
+// batch stays one commit instead of one per key. It honours
+// issueops.WithDeferredVersionCommit on its own ctx, and nothing staged means
+// no commit.
+func (s *DoltStore) CommitConfigWrites(ctx context.Context, keys []string, message string) error {
+	var projections []string
+	for _, key := range keys {
+		if t := issueops.ConfigProjectionTable(key); t != "" {
+			projections = append(projections, t)
+		}
+	}
+	return s.publishConfigWrite(ctx, configWriteTables(projections...), message)
+}
+
+// configWriteTables is the staged set for a config write: config plus any
+// non-empty, de-duplicated projection tables.
+func configWriteTables(projections ...string) []string {
+	tables := []string{"config"}
+	for _, t := range projections {
+		if t != "" && !slices.Contains(tables, t) {
+			tables = append(tables, t)
+		}
+	}
+	return tables
+}
+
+// publishConfigWrite creates the post-transaction Dolt commit for a config
+// write. See SetConfig for the contract.
+func (s *DoltStore) publishConfigWrite(ctx context.Context, tables []string, message string) error {
+	if issueops.VersionCommitDeferred(ctx) {
+		return nil
+	}
+	if err := s.doltAddAndCommitPostTx(ctx, tables, message); err != nil {
+		return fmt.Errorf("config written to the working set but its Dolt commit failed "+
+			"(readable now, missing from HEAD and from clones until committed; retry the write or run `bd dolt commit`): %w", err)
+	}
 	return nil
 }
 
@@ -77,10 +150,16 @@ func (s *DoltStore) GetAllConfig(ctx context.Context) (map[string]string, error)
 }
 
 // DeleteConfig removes a configuration value
+//
+// Like SetConfig, a nil return means the deletion is in HEAD (or deferred to
+// the caller's commit point under issueops.WithDeferredVersionCommit).
 func (s *DoltStore) DeleteConfig(ctx context.Context, key string) error {
-	return s.withRetryTx(ctx, func(tx *sql.Tx) error {
+	if err := s.withRetryTx(ctx, func(tx *sql.Tx) error {
 		return issueops.DeleteConfigInTx(ctx, tx, key)
-	})
+	}); err != nil {
+		return err
+	}
+	return s.publishConfigWrite(ctx, configWriteTables(), "bd: config unset "+key)
 }
 
 // SetMetadata sets a metadata value
