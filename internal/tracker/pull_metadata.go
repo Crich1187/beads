@@ -160,15 +160,17 @@ func metadataObjectsDiffer(a, b map[string]json.RawMessage) (bool, error) {
 	return !reflect.DeepEqual(av, bv), nil
 }
 
+// decodeJSONValue decodes m into plain Go values for a semantic comparison.
+// Numbers decode to float64 on purpose: the store may re-render a number
+// (60.61 vs 6.061e1, 60 vs 60.0), and comparing number text would make every
+// pull rewrite the metadata of every milestone child.
 func decodeJSONValue(m map[string]json.RawMessage) (interface{}, error) {
 	raw, err := json.Marshal(m)
 	if err != nil {
 		return nil, fmt.Errorf("marshal metadata for comparison: %w", err)
 	}
-	dec := json.NewDecoder(bytes.NewReader(raw))
-	dec.UseNumber()
 	var v interface{}
-	if err := dec.Decode(&v); err != nil {
+	if err := json.Unmarshal(raw, &v); err != nil {
 		return nil, fmt.Errorf("decode metadata for comparison: %w", err)
 	}
 	return v, nil

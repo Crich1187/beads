@@ -195,6 +195,20 @@ func TestMergePulledMetadataSemanticEqualityIsUnchanged(t *testing.T) {
 	}
 }
 
+func TestMergePulledMetadataNumberFormattingIsUnchanged(t *testing.T) {
+	// The store may render numbers differently from json.Marshal; equal
+	// values must not count as a change.
+	existing := json.RawMessage(`{"linear":{"project_milestone":{"id":"m1","progress":6.061e1,"n":60.0}}}`)
+	incoming := milestoneMeta(map[string]interface{}{"id": "m1", "progress": 60.61, "n": 60})
+	_, changed, err := mergePulledMetadata(existing, incoming)
+	if err != nil {
+		t.Fatalf("merge: %v", err)
+	}
+	if changed {
+		t.Fatal("changed = true for equal numbers in different notation; pull would rewrite every sync")
+	}
+}
+
 func TestMergePulledMetadataFlatTopLevelKeys(t *testing.T) {
 	// Flat trackers (ADO/Jira style) replace only their own keys; top-level
 	// null deletes; an object replacing a scalar is taken as-is.
