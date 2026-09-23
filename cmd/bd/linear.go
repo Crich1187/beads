@@ -136,6 +136,14 @@ Persistent push-direction ID filters (workflow artifacts, sandbox beads, etc.):
   future syncs; the Linear-side issue persists — archive/delete it manually
   if desired.
 
+Assignee protection on pull:
+  bd config set linear.protected_assignee_patterns '["[a-z0-9][a-z0-9_.-]*/[a-z]+:.+"]'
+
+  Pull never clears a local assignee when the Linear issue is unassigned.
+  protected_assignee_patterns is a JSON array of regexes (whole-string,
+  case-insensitive); a local assignee matching one is never overwritten
+  by pull, so agent claims survive a Linear assignment.
+
 Conflict Resolution:
   By default, newer timestamp wins. Override with:
   --prefer-local    Always prefer local beads version
@@ -364,6 +372,9 @@ func runLinearSync(cmd *cobra.Command, args []string) error {
 		opts.ExcludeTypes = append(opts.ExcludeTypes, types.IssueType(strings.ToLower(t)))
 	}
 	applyLinearExcludeIDConfig(ctx, trackerStore, &opts)
+	if err := applyLinearProtectedAssigneeConfig(ctx, trackerStore, &opts); err != nil {
+		return HandleErrorRespectJSON("%v", err)
+	}
 	if !includeEphemeral {
 		opts.ExcludeEphemeral = true
 	}
@@ -1294,6 +1305,32 @@ func applyLinearExcludeIDConfig(ctx context.Context, reader configReader, opts *
 			}
 		}
 	}
+}
+
+// applyLinearProtectedAssigneeConfig reads linear.protected_assignee_patterns,
+// a JSON array of regular expressions, into opts. Pull leaves a local assignee
+// that fully matches one of them (case-insensitive) untouched, so a Linear
+// assignment cannot overwrite an agent claim. Unset or empty means no
+// patterns. A read error or malformed value is returned so sync fails closed
+// instead of running without claim protection.
+func applyLinearProtectedAssigneeConfig(ctx context.Context, reader configReader, opts *tracker.SyncOptions) error {
+	if reader == nil || opts == nil {
+		return nil
+	}
+	raw, err := reader.GetConfig(ctx, "linear.protected_assignee_patterns")
+	if err != nil {
+		return fmt.Errorf("reading linear.protected_assignee_patterns: %w", err)
+	}
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	var patterns []string
+	if err := json.Unmarshal([]byte(raw), &patterns); err != nil {
+		return fmt.Errorf("linear.protected_assignee_patterns must be a JSON array of regex strings: %w", err)
+	}
+	opts.ProtectedAssigneePatterns = patterns
+	return nil
 }
 
 // getLinearHashLength returns the configured hash length for Linear imports.

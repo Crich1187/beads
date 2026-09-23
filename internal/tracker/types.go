@@ -97,6 +97,12 @@ type SyncOptions struct {
 	// pattern filter. Combined with ExcludeIDPrefix as a union (matches
 	// either rule → excluded).
 	ExcludeIDPatterns []string
+	// ProtectedAssigneePatterns are regular expressions (Go RE2 syntax, each
+	// matched against the whole trimmed assignee, case-insensitively) that mark
+	// a local assignee as a claim pull must not overwrite. Independently of
+	// these patterns, pull never writes an empty remote assignee over a local
+	// one. An invalid pattern fails the pull before anything is written.
+	ProtectedAssigneePatterns []string
 	// ExcludeEphemeral skips ephemeral/wisp issues from push (default behavior in CLI).
 	ExcludeEphemeral bool
 	// ParentID limits push to this beads issue and all its descendants via
