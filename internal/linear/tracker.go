@@ -803,12 +803,21 @@ func linearToTrackerIssue(li *Issue) tracker.TrackerIssue {
 		ti.ParentInternalID = li.Parent.ID
 	}
 
+	// Always report linear.project_milestone so pull can clear it: an explicit
+	// JSON null tells the engine's metadata merge to delete only that key when
+	// the milestone was removed in Linear (sibling metadata is preserved).
+	// This is safe because every pull feeder (issuesQuery for FetchIssues /
+	// FetchIssuesSince, and FetchIssueByIdentifier) selects projectMilestone,
+	// so nil here means "no milestone", not "not queried". Mutation responses
+	// do not select it, but the push path never writes tracker metadata locally.
+	var milestone interface{}
 	if li.ProjectMilestone != nil {
-		ti.Metadata = map[string]interface{}{
-			"linear": map[string]interface{}{
-				"project_milestone": li.ProjectMilestone,
-			},
-		}
+		milestone = li.ProjectMilestone
+	}
+	ti.Metadata = map[string]interface{}{
+		"linear": map[string]interface{}{
+			"project_milestone": milestone,
+		},
 	}
 
 	if t, err := time.Parse(time.RFC3339, li.CreatedAt); err == nil {

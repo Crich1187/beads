@@ -933,6 +933,30 @@ func TestLinearToTrackerIssue(t *testing.T) {
 	}
 }
 
+// TestLinearToTrackerIssueNoMilestoneEmitsNull pins the removal signal the
+// pull metadata merge relies on: an issue with no milestone reports
+// linear.project_milestone as an explicit JSON null (delete that key), not
+// nil metadata (which would mean "no change" and never clear a removed one).
+func TestLinearToTrackerIssueNoMilestoneEmitsNull(t *testing.T) {
+	ti := linearToTrackerIssue(&Issue{
+		ID:         "uuid-124",
+		Identifier: "TEAM-43",
+		Title:      "No milestone",
+		CreatedAt:  "2026-01-15T10:00:00Z",
+		UpdatedAt:  "2026-01-16T14:30:00Z",
+	})
+	if ti.Metadata == nil {
+		t.Fatal("Metadata is nil; want linear.project_milestone = null so pull can clear a removed milestone")
+	}
+	raw, err := json.Marshal(ti.Metadata)
+	if err != nil {
+		t.Fatalf("marshal metadata: %v", err)
+	}
+	if got, want := string(raw), `{"linear":{"project_milestone":null}}`; got != want {
+		t.Fatalf("metadata = %s, want %s", got, want)
+	}
+}
+
 // TestTrackerInitOAuthOnly verifies that Init() succeeds with only OAuth credentials
 // and no API key. This is the CI worker use case.
 func TestTrackerInitOAuthOnly(t *testing.T) {

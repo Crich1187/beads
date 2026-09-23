@@ -2,7 +2,6 @@ package tracker
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"sort"
@@ -515,7 +514,8 @@ func (e *Engine) doPull(ctx context.Context, opts SyncOptions, allowOverwriteIDs
 			dryRunIssues = append(dryRunIssues, &dryRunIssue)
 		}
 
-		if existing != nil && pullIssueEqual(existing, conv.Issue, ref, protected) {
+		metadataUpdate, metadataChanged := e.pulledIssueMetadata(existing, &extIssue)
+		if existing != nil && !metadataChanged && pullIssueEqual(existing, conv.Issue, ref, protected) {
 			stats.Skipped++
 			continue
 		}
@@ -533,8 +533,8 @@ func (e *Engine) doPull(ctx context.Context, opts SyncOptions, allowOverwriteIDs
 
 		if existing != nil {
 			updates := buildPullIssueUpdates(existing, conv.Issue, ref, protected)
-			if raw, ok := marshalTrackerMetadata(extIssue.Metadata); ok {
-				updates["metadata"] = raw
+			if metadataChanged {
+				updates["metadata"] = metadataUpdate
 			}
 
 			markPullIssueFields(updates)
@@ -559,8 +559,8 @@ func (e *Engine) doPull(ctx context.Context, opts SyncOptions, allowOverwriteIDs
 		} else {
 			// Create new issue
 			conv.Issue.ExternalRef = strPtr(ref)
-			if raw, ok := marshalTrackerMetadata(extIssue.Metadata); ok {
-				conv.Issue.Metadata = raw
+			if metadataChanged {
+				conv.Issue.Metadata = metadataUpdate
 			}
 			if err := e.Store.CreateIssue(ctx, conv.Issue, e.Actor); err != nil {
 				e.warn("Failed to create issue for %s: %v", extIssue.Identifier, err)
@@ -640,17 +640,6 @@ func buildPullIssueUpdates(existing *types.Issue, remote *types.Issue, ref strin
 		updates["external_ref"] = trimmedRef
 	}
 	return updates
-}
-
-func marshalTrackerMetadata(metadata interface{}) (json.RawMessage, bool) {
-	if metadata == nil {
-		return nil, false
-	}
-	raw, err := json.Marshal(metadata)
-	if err != nil {
-		return nil, false
-	}
-	return json.RawMessage(raw), true
 }
 
 func appendFilteredDependencies(dst []DependencyInfo, deps []DependencyInfo, allowedTypes []types.DependencyType, allowedSources []DependencySource) []DependencyInfo {
@@ -1317,8 +1306,10 @@ func (e *Engine) reimportIssue(ctx context.Context, c Conflict) {
 		"status":      string(conv.Issue.Status),
 	}
 	if extIssue.Metadata != nil {
-		if raw, err := json.Marshal(extIssue.Metadata); err == nil {
-			updates["metadata"] = json.RawMessage(raw)
+		if existingMetadata, err := e.localIssueMetadata(ctx, c.IssueID); err != nil {
+			e.warn("Keeping local metadata on %s unchanged during reimport: %v", c.IssueID, err)
+		} else if merged, changed := e.pulledMetadataUpdate(c.IssueID, existingMetadata, extIssue.Metadata); changed {
+			updates["metadata"] = merged
 		}
 	}
 
