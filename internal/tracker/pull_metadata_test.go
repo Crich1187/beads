@@ -531,3 +531,26 @@ func TestReimportIssueMissingLocalKeepsMetadataUnwritten(t *testing.T) {
 		t.Fatal("expected a warning when local metadata cannot be read")
 	}
 }
+
+// TestDoPullMilestoneRemovalKeepsMilestoneAssignedMarker pins the contract
+// the .29 milestone pass relies on: when a milestone is cleared in Linear, the
+// pull deletes only linear.project_milestone and the .29 marker
+// linear.milestone_assigned (a sibling inside the same "linear" object)
+// survives. A top-level-only merge (like issueops' key merge) would replace
+// the whole "linear" object and lose it.
+func TestDoPullMilestoneRemovalKeepsMilestoneAssignedMarker(t *testing.T) {
+	local := metaLocalIssue(`{"linear":{"project_milestone":{"id":"m1"},"milestone_assigned":"m1"}}`)
+	store := newMetaPullStore(local)
+	engine, _ := newMetaPullEngine(store, "same", milestoneMeta(nil))
+
+	stats, err := engine.doPull(context.Background(), SyncOptions{Pull: true}, nil, nil)
+	if err != nil {
+		t.Fatalf("doPull: %v", err)
+	}
+	if stats.Updated != 1 {
+		t.Fatalf("stats = %+v, want Updated=1 for a removed milestone", stats)
+	}
+	if got, want := string(local.Metadata), `{"linear":{"milestone_assigned":"m1"}}`; got != want {
+		t.Fatalf("metadata after milestone removal = %s, want %s", got, want)
+	}
+}
