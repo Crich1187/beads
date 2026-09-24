@@ -224,7 +224,11 @@ var configSetCmd = &cobra.Command{
 		if err != nil {
 			return HandleError("%v", err)
 		}
-		result, err := settings.SetSetting(rootCtx, issueops.SetSettingRequest{Key: key, Value: value})
+		writeCtx, err := directConfigWriteContext(rootCtx)
+		if err != nil {
+			return HandleError("%v", err)
+		}
+		result, err := settings.SetSetting(writeCtx, issueops.SetSettingRequest{Key: key, Value: value})
 		if err != nil {
 			return HandleError("setting config: %v", err)
 		}
@@ -617,7 +621,11 @@ var configUnsetCmd = &cobra.Command{
 		if err != nil {
 			return HandleError("%v", err)
 		}
-		result, err := settings.UnsetSetting(rootCtx, issueops.UnsetSettingRequest{Key: key})
+		writeCtx, err := directConfigWriteContext(rootCtx)
+		if err != nil {
+			return HandleError("%v", err)
+		}
+		result, err := settings.UnsetSetting(writeCtx, issueops.UnsetSettingRequest{Key: key})
 		if err != nil {
 			return HandleError("deleting config: %v", err)
 		}
@@ -915,10 +923,17 @@ Examples:
 				if err := ensureDirectMode("config set-many requires direct database access"); err != nil {
 					return HandleError("%v", err)
 				}
-				for _, p := range dbPairs {
-					if err := store.SetConfig(rootCtx, p.key, p.value); err != nil {
-						return HandleError("setting config %s: %v", p.key, err)
+				keys := make([]string, len(dbPairs))
+				values := make([]string, len(dbPairs))
+				for i, p := range dbPairs {
+					keys[i] = p.key
+					values[i] = p.value
+				}
+				if failedKey, err := setConfigManyDirect(rootCtx, store, keys, values); err != nil {
+					if failedKey != "" {
+						return HandleError("setting config %s: %v", failedKey, err)
 					}
+					return HandleError("committing config set-many: %v", err)
 				}
 				commandDidWrite.Store(true)
 			}

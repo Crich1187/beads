@@ -162,7 +162,11 @@ func maybeAutoImportJSONL(ctx context.Context, s storage.DoltStorage, beadsDir s
 	if result.Memories > 0 {
 		commitMsg = fmt.Sprintf("auto-import: %d issues, %d memories from %s (upgrade recovery, GH#2994)", result.Issues, result.Memories, filepath.Base(jsonlPath))
 	}
-	if err := s.Commit(ctx, commitMsg); err != nil {
+	// A memories-only (or empty) import can leave nothing for Commit to take:
+	// server-mode SetConfig publishes its own commit (config-LinearSync-001.30)
+	// and Commit excludes config anyway. Nothing-to-commit is success here
+	// (same guard as 262b162da, which this branch does not carry).
+	if err := s.Commit(ctx, commitMsg); err != nil && !isDoltNothingToCommit(err) {
 		writeAutoImportStamp(beadsDir, info)
 		fmt.Fprintf(os.Stderr, "warning: auto-import: dolt commit failed: %v\n", err)
 		return

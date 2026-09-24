@@ -92,6 +92,15 @@ func (t *doltServerTx) Commit(ctx context.Context, message string) error {
 			// DOLT_COMMIT('-Am') can return success while leaving config
 			// unstaged, silently stranding `bd config set` (root-c1q3p).
 			// Stage via DOLT_ADD then commit with '-m' only.
+			//
+			// RESIDUAL HAZARD (config-LinearSync-001.30 review, not changed
+			// here): this staging runs INSIDE the still-open transaction and
+			// stages every dirty table in dolt_status, so it is the in-tx
+			// ordering upstream #6040 moved the direct-store issue path away
+			// from (DOLT_ADD stages from the BEGIN-time root), and it can sweep
+			// a concurrent writer's tables (GH#2455). A failed
+			// DOLT_ADD('config') is also ignored. The direct-store config path
+			// (DoltStore.SetConfig) uses the post-tx, config-only ordering.
 			if _, err := t.conn.ExecContext(ctx, "CALL DOLT_ADD('config')"); err != nil {
 				// Config may already be clean — continue and stage others.
 				_ = err

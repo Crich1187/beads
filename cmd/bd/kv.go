@@ -195,7 +195,10 @@ Examples:
 
 		storageKey := kvPrefix + key
 
-		ctx := rootCtx
+		ctx, err := directConfigWriteContext(rootCtx)
+		if err != nil {
+			return HandleErrorRespectJSON("%v", err)
+		}
 		if err := store.SetConfig(ctx, storageKey, value); err != nil {
 			return HandleErrorRespectJSON("setting key: %v", err)
 		}
@@ -283,7 +286,10 @@ Examples:
 
 		storageKey := kvPrefix + key
 
-		ctx := rootCtx
+		ctx, err := directConfigWriteContext(rootCtx)
+		if err != nil {
+			return HandleErrorRespectJSON("%v", err)
+		}
 		if err := store.DeleteConfig(ctx, storageKey); err != nil {
 			return HandleErrorRespectJSON("deleting key: %v", err)
 		}

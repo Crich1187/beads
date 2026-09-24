@@ -443,6 +443,20 @@ func ParseTypesConfigValue(value string) []string {
 	return ParseCommaSeparatedList(value)
 }
 
+// ConfigProjectionTable names the normalized table that SyncConfigTables
+// keeps in step with key ("" when the key has no projection). Callers that
+// publish a config write as a Dolt commit stage this table alongside config,
+// so the pair lands in one commit. Keep in sync with SyncConfigTables.
+func ConfigProjectionTable(key string) string {
+	switch key {
+	case "status.custom":
+		return "custom_statuses"
+	case "types.custom":
+		return "custom_types"
+	}
+	return ""
+}
+
 // SyncConfigTables re-syncs the normalized lookup table backing a config
 // key, if any (status.custom → custom_statuses, types.custom →
 // custom_types). Reads of those sets are table-first, so every SetConfig

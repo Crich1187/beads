@@ -47,6 +47,13 @@ func (m *memories) Remember(ctx context.Context, req memoryops.RememberRequest) 
 	}); err != nil {
 		return memoryops.RememberResult{}, err
 	}
+	// Memories are kv.memory.* rows in the config table, so they share
+	// SetConfig's durability contract (config-LinearSync-001.30): publish the
+	// post-transaction Dolt commit here, or `bd remember` strands the row in
+	// the server working set exactly like `bd config set` did.
+	if err := m.store.publishConfigWrite(ctx, configWriteTables(), "bd: remember "+key); err != nil {
+		return memoryops.RememberResult{}, err
+	}
 	return memoryops.RememberResult{Key: key, Value: req.Content, Replaced: replaced}, nil
 }
 
@@ -83,6 +90,12 @@ func (m *memories) Forget(ctx context.Context, req memoryops.ForgetRequest) (mem
 		return err
 	}); err != nil {
 		return memoryops.ForgetResult{}, err
+	}
+	// Same contract as Remember/DeleteConfig; nothing staged means no commit.
+	if found {
+		if err := m.store.publishConfigWrite(ctx, configWriteTables(), "bd: forget "+key); err != nil {
+			return memoryops.ForgetResult{}, err
+		}
 	}
 	return memoryops.ForgetResult{Key: key, Value: previous, Found: found}, nil
 }
