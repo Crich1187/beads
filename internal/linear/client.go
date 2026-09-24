@@ -1226,13 +1226,34 @@ func (c *Client) BatchUpdateIssues(ctx context.Context, ids []string, updates ma
 }
 
 // FetchIssueByIdentifier retrieves a single issue from Linear by its identifier (e.g., "TEAM-123").
-// Returns nil if the issue is not found.
+// Returns nil if the issue is not found. Archived issues are not returned
+// (Linear's issues query hides them by default), so pull, hydration and
+// reconcile paths treat an archived issue as absent.
 func (c *Client) FetchIssueByIdentifier(ctx context.Context, identifier string) (*Issue, error) {
-	query := `
+	return c.fetchIssueByIdentifier(ctx, identifier, false)
+}
+
+// FetchIssueByIdentifierIncludingArchived is FetchIssueByIdentifier for push
+// paths: it passes includeArchived: true and selects archivedAt, so a caller
+// about to write can tell an archived issue (Issue.IsArchived) from a missing
+// one. Without it an archived issue looked "not found" and the push wrote to
+// it blind (acceptance run 1, finding F6: TEST-15).
+func (c *Client) FetchIssueByIdentifierIncludingArchived(ctx context.Context, identifier string) (*Issue, error) {
+	return c.fetchIssueByIdentifier(ctx, identifier, true)
+}
+
+func (c *Client) fetchIssueByIdentifier(ctx context.Context, identifier string, includeArchived bool) (*Issue, error) {
+	issuesArgs := "filter: $filter, first: 1"
+	archivedField := ""
+	if includeArchived {
+		issuesArgs += ", includeArchived: true"
+		archivedField = "\n\t\t\t\t\tarchivedAt"
+	}
+	query := fmt.Sprintf(`
 		query IssueByIdentifier($filter: IssueFilter!) {
-			issues(filter: $filter, first: 1) {
+			issues(%s) {
 				nodes {
-					id
+					id%s
 					identifier
 					title
 					description
@@ -1272,7 +1293,7 @@ func (c *Client) FetchIssueByIdentifier(ctx context.Context, identifier string) 
 				}
 			}
 		}
-	`
+	`, issuesArgs, archivedField)
 
 	// Build filter to search by identifier number and team prefix
 	// Linear identifiers look like "TEAM-123", we filter by number
