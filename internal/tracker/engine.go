@@ -1008,7 +1008,7 @@ func (e *Engine) doPush(ctx context.Context, opts SyncOptions, skipIDs, forceIDs
 			if err != nil {
 				return nil, fmt.Errorf("batch pushing issues: %w", err)
 			}
-			e.applyBatchPushResult(ctx, batchResult)
+			e.applyBatchPushResult(ctx, batchResult, pushIssues)
 			stats.Created += len(batchResult.Created)
 			stats.Updated += len(batchResult.Updated)
 			stats.Skipped += len(batchResult.Skipped)
@@ -1221,16 +1221,30 @@ func (e *Engine) formatPushIssue(issue *types.Issue) *types.Issue {
 	return &copy
 }
 
-func (e *Engine) applyBatchPushResult(ctx context.Context, result *BatchPushResult) {
+// applyBatchPushResult writes the external_ref a batch push reports for each
+// created or updated issue, skipping issues whose stored ref already equals
+// it. Rewriting an unchanged ref is a real issue update (updated_at moves and
+// a Dolt row changes), so it is done only when the ref actually differs.
+func (e *Engine) applyBatchPushResult(ctx context.Context, result *BatchPushResult, pushed []*types.Issue) {
 	if result == nil {
 		return
 	}
+	currentRefs := make(map[string]string, len(pushed))
+	for _, issue := range pushed {
+		if issue != nil && issue.ID != "" {
+			currentRefs[issue.ID] = strings.TrimSpace(derefStr(issue.ExternalRef))
+		}
+	}
 	items := append(append([]BatchPushItem(nil), result.Created...), result.Updated...)
 	for _, item := range items {
-		if item.LocalID == "" || strings.TrimSpace(item.ExternalRef) == "" {
+		ref := strings.TrimSpace(item.ExternalRef)
+		if item.LocalID == "" || ref == "" {
 			continue
 		}
-		updates := map[string]interface{}{"external_ref": strings.TrimSpace(item.ExternalRef)}
+		if current, ok := currentRefs[item.LocalID]; ok && current == ref {
+			continue
+		}
+		updates := map[string]interface{}{"external_ref": ref}
 		if err := e.Store.UpdateIssue(ctx, item.LocalID, updates, e.Actor); err != nil {
 			e.warn("Failed to update external_ref for %s: %v", item.LocalID, err)
 		}

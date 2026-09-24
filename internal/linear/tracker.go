@@ -402,7 +402,7 @@ func (t *Tracker) BatchPush(ctx context.Context, issues []*types.Issue, forceIDs
 			}
 			result.Created = append(result.Created, tracker.BatchPushItem{
 				LocalID:     issue.ID,
-				ExternalRef: created.URL,
+				ExternalRef: canonicalLinearIssueRef(created.URL),
 			})
 		}
 
@@ -460,7 +460,7 @@ func (t *Tracker) BatchPush(ctx context.Context, issues []*types.Issue, forceIDs
 				matched[li.Title] = true
 				result.Created = append(result.Created, tracker.BatchPushItem{
 					LocalID:     localIssue.ID,
-					ExternalRef: li.URL,
+					ExternalRef: canonicalLinearIssueRef(li.URL),
 				})
 			}
 			for title, localIssue := range titleToIssue {
@@ -572,7 +572,7 @@ func (t *Tracker) BatchPush(ctx context.Context, issues []*types.Issue, forceIDs
 
 		result.Updated = append(result.Updated, tracker.BatchPushItem{
 			LocalID:     issue.ID,
-			ExternalRef: updated.URL,
+			ExternalRef: canonicalLinearIssueRef(updated.URL),
 		})
 	}
 
@@ -598,12 +598,22 @@ func (t *Tracker) ExtractIdentifier(ref string) string {
 
 func (t *Tracker) BuildExternalRef(issue *tracker.TrackerIssue) string {
 	if issue.URL != "" {
-		if canonical, ok := CanonicalizeLinearExternalRef(issue.URL); ok {
-			return canonical
-		}
-		return issue.URL
+		return canonicalLinearIssueRef(issue.URL)
 	}
 	return fmt.Sprintf("https://linear.app/issue/%s", issue.Identifier)
+}
+
+// canonicalLinearIssueRef returns the one external_ref form bd stores for a
+// Linear issue URL: the workspace issue URL without the title slug
+// (https://linear.app/<workspace>/issue/TEAM-123). Linear returns the slug
+// form from mutations and the pull path already stored the slug-less form,
+// so writing mutation URLs verbatim made external_ref flip between the two
+// on every pull/push pair. Idempotent; non-Linear input is returned as-is.
+func canonicalLinearIssueRef(url string) string {
+	if canonical, ok := CanonicalizeLinearExternalRef(url); ok {
+		return canonical
+	}
+	return url
 }
 
 func skipOptionalPushStateMapping(status types.Status, err error, custom []types.CustomStatus) bool {
