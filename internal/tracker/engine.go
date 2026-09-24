@@ -122,6 +122,14 @@ type Engine struct {
 	OnMessage func(msg string)
 	OnWarning func(msg string)
 
+	// ThreeWayLabelMerge enables the per-issue label baseline: pull merges
+	// labels three-way (local changes since the last sync survive, tracker
+	// changes apply) instead of replacing them with the tracker's set, and
+	// pull and push record the baseline. See label_baseline.go. A tracker
+	// that enables it must report in BatchPushResult.Skipped only issues whose
+	// remote already matched, and policy refusals in Refused.
+	ThreeWayLabelMerge bool
+
 	// stateCache holds the opaque value from PushHooks.BuildStateCache during a push.
 	// Tracker adapters access it via ResolveState().
 	stateCache interface{}
@@ -483,6 +491,7 @@ func (e *Engine) doPull(ctx context.Context, opts SyncOptions, allowOverwriteIDs
 			}
 		}
 
+		labelTarget := e.labelBaselineTarget(ref)
 		if existing != nil {
 			// Conflict-aware pull: skip updating issues that were locally
 			// modified since last sync. Conflict detection (Phase 2) will
@@ -490,7 +499,10 @@ func (e *Engine) doPull(ctx context.Context, opts SyncOptions, allowOverwriteIDs
 			// Without this guard, pull silently overwrites local changes
 			// before conflict detection can compare timestamps.
 			if lastSync != nil && existing.UpdatedAt.After(*lastSync) && !allowOverwriteIDs[existing.ID] && !prelinkedHydrateIDs[existing.ID] {
-				stats.Skipped++
+				// Fields stay local (push sends them), but tracker-side
+				// label changes still merge in so the push that follows
+				// does not overwrite them.
+				e.pullMergeLabelsIntoEditedIssue(ctx, opts, existing, conv.Issue.Labels, labelTarget, &extIssue, stats)
 				continue
 			}
 		}
@@ -512,8 +524,22 @@ func (e *Engine) doPull(ctx context.Context, opts SyncOptions, allowOverwriteIDs
 			dryRunIssues = append(dryRunIssues, &dryRunIssue)
 		}
 
+		// Three-way label merge (ThreeWayLabelMerge with a recorded
+		// baseline): labels the bead gained or lost since the last sync
+		// survive the pull. Label writes do not move updated_at, so the
+		// guard above cannot see them.
+		remoteLabels := conv.Issue.Labels
+		labelsPendingPush := false
+		if merged, ok := e.mergePulledLabels(ctx, existing, remoteLabels, labelTarget); ok {
+			conv.Issue.Labels = merged
+			labelsPendingPush = !equalNormalizedStrings(merged, remoteLabels)
+		}
+
 		metadataUpdate, metadataChanged := e.pulledIssueMetadata(existing, &extIssue)
 		if existing != nil && !metadataChanged && pullIssueEqual(existing, conv.Issue, ref, protected) {
+			if !opts.DryRun {
+				e.recordLabelBaseline(ctx, existing.ID, labelTarget, remoteLabels)
+			}
 			stats.Skipped++
 			continue
 		}
@@ -551,7 +577,10 @@ func (e *Engine) doPull(ctx context.Context, opts SyncOptions, allowOverwriteIDs
 				continue
 			}
 			stats.Updated++
-			if pulledIDs != nil {
+			e.recordLabelBaseline(ctx, existing.ID, labelTarget, remoteLabels)
+			// A bead that kept local label changes still has something to
+			// push, so a bidirectional sync must not suppress its push.
+			if pulledIDs != nil && !labelsPendingPush {
 				pulledIDs[existing.ID] = true
 			}
 		} else {
@@ -565,6 +594,7 @@ func (e *Engine) doPull(ctx context.Context, opts SyncOptions, allowOverwriteIDs
 				continue
 			}
 			stats.Created++
+			e.recordLabelBaseline(ctx, conv.Issue.ID, labelTarget, remoteLabels)
 			if pulledIDs != nil {
 				pulledIDs[conv.Issue.ID] = true
 			}
@@ -991,7 +1021,7 @@ func (e *Engine) doPush(ctx context.Context, opts SyncOptions, skipIDs, forceIDs
 				e.renderBatchDryRun(pushIssues, batchResult)
 				stats.Created += len(batchResult.Created)
 				stats.Updated += len(batchResult.Updated)
-				stats.Skipped += len(batchResult.Skipped)
+				stats.Skipped += len(batchResult.Skipped) + len(batchResult.Refused)
 				stats.Errors += len(batchResult.Errors)
 				stats.Warnings = append(stats.Warnings, batchResult.Warnings...)
 				for _, item := range batchResult.Errors {
@@ -1009,9 +1039,10 @@ func (e *Engine) doPush(ctx context.Context, opts SyncOptions, skipIDs, forceIDs
 				return nil, fmt.Errorf("batch pushing issues: %w", err)
 			}
 			e.applyBatchPushResult(ctx, batchResult, pushIssues)
+			e.recordBatchPushLabelBaselines(ctx, batchResult, pushIssues)
 			stats.Created += len(batchResult.Created)
 			stats.Updated += len(batchResult.Updated)
-			stats.Skipped += len(batchResult.Skipped)
+			stats.Skipped += len(batchResult.Skipped) + len(batchResult.Refused)
 			stats.Errors += len(batchResult.Errors)
 			stats.Warnings = append(stats.Warnings, batchResult.Warnings...)
 			for _, item := range batchResult.Errors {
@@ -1110,6 +1141,7 @@ func (e *Engine) doPush(ctx context.Context, opts SyncOptions, skipIDs, forceIDs
 			}
 			// Remember what we just pushed so the next sync can skip the fetch.
 			e.recordPushHash(ctx, issue, ref)
+			e.recordPushedLabelBaseline(ctx, issue, ref)
 			stats.Created++
 		} else if !opts.CreateOnly || forceIDs[issue.ID] {
 			// Update existing external issue
@@ -1141,6 +1173,7 @@ func (e *Engine) doPush(ctx context.Context, opts SyncOptions, skipIDs, forceIDs
 							// Remote already matches: record the hash so future
 							// runs skip the fetch above, not just the update.
 							e.recordPushHash(ctx, issue, extRef)
+							e.recordPushedLabelBaseline(ctx, issue, extRef)
 							stats.Skipped++
 							continue
 						}
@@ -1165,6 +1198,7 @@ func (e *Engine) doPush(ctx context.Context, opts SyncOptions, skipIDs, forceIDs
 			}
 			// Remember what we just pushed so the next sync can skip the fetch.
 			e.recordPushHash(ctx, issue, extRef)
+			e.recordPushedLabelBaseline(ctx, issue, extRef)
 			stats.Updated++
 		} else {
 			stats.Skipped++
@@ -1249,6 +1283,65 @@ func (e *Engine) applyBatchPushResult(ctx context.Context, result *BatchPushResu
 			e.warn("Failed to update external_ref for %s: %v", item.LocalID, err)
 		}
 	}
+}
+
+// recordBatchPushLabelBaselines records the pushed labels as the baseline for
+// every issue a batch push created, updated, or skipped because the tracker
+// already matched. Errors and Refused issues keep their previous baseline.
+func (e *Engine) recordBatchPushLabelBaselines(ctx context.Context, result *BatchPushResult, pushed []*types.Issue) {
+	if !e.ThreeWayLabelMerge || result == nil {
+		return
+	}
+	byID := make(map[string]*types.Issue, len(pushed))
+	for _, issue := range pushed {
+		if issue != nil && issue.ID != "" {
+			byID[issue.ID] = issue
+		}
+	}
+	for _, item := range append(append([]BatchPushItem(nil), result.Created...), result.Updated...) {
+		if issue := byID[item.LocalID]; issue != nil {
+			e.recordPushedLabelBaseline(ctx, issue, item.ExternalRef)
+		}
+	}
+	for _, id := range result.Skipped {
+		if issue := byID[id]; issue != nil {
+			e.recordPushedLabelBaseline(ctx, issue, derefStr(issue.ExternalRef))
+		}
+	}
+}
+
+// pullMergeLabelsIntoEditedIssue handles a pulled issue whose bead was edited
+// locally since the last sync. Its fields are left alone, as before; only the
+// three-way label merge is applied, so a tracker-side label change is not
+// lost when the following push sends the bead. Without a baseline nothing is
+// written (previous behavior).
+func (e *Engine) pullMergeLabelsIntoEditedIssue(ctx context.Context, opts SyncOptions, existing *types.Issue, remoteLabels []string, target string, extIssue *TrackerIssue, stats *PullStats) {
+	merged, ok := e.mergePulledLabels(ctx, existing, remoteLabels, target)
+	if !ok || equalNormalizedStrings(merged, existing.Labels) {
+		if ok && !opts.DryRun {
+			e.recordLabelBaseline(ctx, existing.ID, target, remoteLabels)
+		}
+		stats.Skipped++
+		return
+	}
+	if opts.DryRun {
+		e.msg("[dry-run] Would merge labels into locally edited issue: %s - %s", extIssue.Identifier, ui.SanitizeForTerminal(extIssue.Title))
+		stats.Updated++
+		return
+	}
+	updater, ok := e.Store.(IssueUpdater)
+	if !ok {
+		e.warn("tracker store does not support atomic issue updates")
+		stats.Errors++
+		return
+	}
+	if err := updater.ApplyIssueUpdate(ctx, existing.ID, map[string]interface{}{}, merged, e.Actor); err != nil {
+		e.warn("Failed to merge labels into %s: %v", existing.ID, err)
+		stats.Errors++
+		return
+	}
+	e.recordLabelBaseline(ctx, existing.ID, target, remoteLabels)
+	stats.Updated++
 }
 
 func (e *Engine) renderBatchDryRun(issues []*types.Issue, result *BatchPushResult) {

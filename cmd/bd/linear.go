@@ -347,6 +347,7 @@ func runLinearSync(cmd *cobra.Command, args []string) error {
 	}
 
 	engine := tracker.NewEngine(lt, trackerStore, actor)
+	configureLinearEngine(engine)
 	engine.OnMessage = func(msg string) { fmt.Println("  " + msg) }
 	engine.OnWarning = func(msg string) { fmt.Fprintf(os.Stderr, "Warning: %s\n", msg) }
 
@@ -761,6 +762,14 @@ func isLinearMilestoneIssue(issue *types.Issue) bool {
 		return false
 	}
 	return data.Linear.Kind == "project_milestone"
+}
+
+// configureLinearEngine applies the engine options every Linear sync uses.
+// ThreeWayLabelMerge keeps a label an agent added (or removed) since the last
+// sync from being overwritten by a pull when Carl also changed the issue's
+// labels in Linear (acceptance run 1, finding F3).
+func configureLinearEngine(engine *tracker.Engine) {
+	engine.ThreeWayLabelMerge = true
 }
 
 // buildLinearPushHooks creates PushHooks for Linear-specific push behavior.

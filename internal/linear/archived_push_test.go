@@ -41,8 +41,8 @@ func TestBatchPush_RefusesArchivedIssue(t *testing.T) {
 			if fake.includeArchivedSeen == 0 || fake.archivedFieldSeen == 0 {
 				t.Fatalf("push fetch did not ask for archived issues (includeArchived=%d, archivedAt=%d)", fake.includeArchivedSeen, fake.archivedFieldSeen)
 			}
-			if len(result.Updated) != 0 || len(result.Errors) != 0 || len(result.Skipped) != 1 || result.Skipped[0] != local.ID {
-				t.Fatalf("result updated=%v errors=%v skipped=%v, want the bead skipped", result.Updated, result.Errors, result.Skipped)
+			if len(result.Updated) != 0 || len(result.Errors) != 0 || len(result.Skipped) != 0 || len(result.Refused) != 1 || result.Refused[0] != local.ID {
+				t.Fatalf("result updated=%v errors=%v skipped=%v refused=%v, want the bead refused", result.Updated, result.Errors, result.Skipped, result.Refused)
 			}
 			if len(result.Warnings) != 1 || !strings.Contains(result.Warnings[0], local.ID) || !strings.Contains(result.Warnings[0], "TEST-15 is archived") {
 				t.Fatalf("warnings = %q, want one per-issue archived warning", result.Warnings)

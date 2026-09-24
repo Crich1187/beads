@@ -622,12 +622,13 @@ func archivedIssueError(externalID string, remote *Issue) error {
 }
 
 // refuseArchivedPush records a refused push to an archived Linear issue: no
-// mutation is sent, the bead is counted as skipped, and a per-issue warning
+// mutation is sent, the bead is listed in Refused (counted as skipped by the
+// engine, and never treated as "remote matches"), and a per-issue warning
 // names it. It is a warning rather than an error because the link cannot heal
 // by retrying; an archived target needs a human decision (unarchive in Linear,
 // or relink/unlink the bead), and an unscoped push may see many such links.
 func refuseArchivedPush(result *tracker.BatchPushResult, localID, externalID string, remote *Issue) {
-	result.Skipped = append(result.Skipped, localID)
+	result.Refused = append(result.Refused, localID)
 	result.Warnings = append(result.Warnings, fmt.Sprintf("linear: bead %s: %v", localID, archivedIssueError(externalID, remote)))
 }
 
