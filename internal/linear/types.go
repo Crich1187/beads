@@ -8,6 +8,7 @@ package linear
 import (
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -136,6 +137,15 @@ type Issue struct {
 	CreatedAt        string            `json:"createdAt"`
 	UpdatedAt        string            `json:"updatedAt"`
 	CompletedAt      string            `json:"completedAt,omitempty"`
+	// ArchivedAt is set for archived (and trashed) issues. It is only
+	// selected by queries that include archived issues
+	// (FetchIssueByIdentifierIncludingArchived); elsewhere it stays empty.
+	ArchivedAt string `json:"archivedAt,omitempty"`
+}
+
+// IsArchived reports whether Linear returned the issue as archived.
+func (i *Issue) IsArchived() bool {
+	return i != nil && strings.TrimSpace(i.ArchivedAt) != ""
 }
 
 // State represents a workflow state in Linear.

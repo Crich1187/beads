@@ -254,6 +254,12 @@ func (s *pureTestStore) UpdateIssue(_ context.Context, id string, updates map[st
 	return storage.ErrNotFound
 }
 
+// GetConfig answers with an empty config table. The embedded storage.Storage
+// is nil, and the engine reads config (ReadLastSync's legacy fallback).
+func (s *pureTestStore) GetConfig(context.Context, string) (string, error) {
+	return "", nil
+}
+
 func (s *pureTestStore) GetLocalMetadata(_ context.Context, key string) (string, error) {
 	return s.localMetadata[key], nil
 }

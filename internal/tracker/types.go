@@ -177,9 +177,14 @@ type BatchPushError struct {
 
 // BatchPushResult is the normalized result of a tracker batch push.
 type BatchPushResult struct {
-	Created  []BatchPushItem
-	Updated  []BatchPushItem
-	Skipped  []string
+	Created []BatchPushItem
+	Updated []BatchPushItem
+	Skipped []string
+	// Refused lists issues the tracker deliberately did not write (for
+	// example a Linear issue that is archived). They count as skipped, carry
+	// a warning, and, unlike Skipped, say nothing about the remote matching
+	// the local issue.
+	Refused  []string
 	Errors   []BatchPushError
 	Warnings []string
 }

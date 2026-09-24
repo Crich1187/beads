@@ -258,7 +258,10 @@ func (t *Tracker) UpdateIssue(ctx context.Context, externalID string, issue *typ
 	// missing issue leaves the remote state unknown, which pushes state as
 	// before rather than failing the update.
 	var remoteState *State
-	if remote, fetchErr := client.FetchIssueByIdentifier(ctx, externalID); fetchErr == nil && remote != nil {
+	if remote, fetchErr := client.FetchIssueByIdentifierIncludingArchived(ctx, externalID); fetchErr == nil && remote != nil {
+		if remote.IsArchived() {
+			return nil, archivedIssueError(externalID, remote)
+		}
 		remoteState = remote.State
 	}
 	if shouldPushStateID(remoteState, issue.Status, t.config) {
@@ -402,7 +405,7 @@ func (t *Tracker) BatchPush(ctx context.Context, issues []*types.Issue, forceIDs
 			}
 			result.Created = append(result.Created, tracker.BatchPushItem{
 				LocalID:     issue.ID,
-				ExternalRef: created.URL,
+				ExternalRef: canonicalLinearIssueRef(created.URL),
 			})
 		}
 
@@ -460,7 +463,7 @@ func (t *Tracker) BatchPush(ctx context.Context, issues []*types.Issue, forceIDs
 				matched[li.Title] = true
 				result.Created = append(result.Created, tracker.BatchPushItem{
 					LocalID:     localIssue.ID,
-					ExternalRef: li.URL,
+					ExternalRef: canonicalLinearIssueRef(li.URL),
 				})
 			}
 			for title, localIssue := range titleToIssue {
@@ -508,9 +511,13 @@ func (t *Tracker) BatchPush(ctx context.Context, issues []*types.Issue, forceIDs
 		// push path (engine.go doPush) to avoid redundant API writes.
 		var remoteIssue *Issue
 		if !forceIDs[issue.ID] {
-			fetched, lookupErr := routeClient.FetchIssueByIdentifier(ctx, externalID)
+			fetched, lookupErr := routeClient.FetchIssueByIdentifierIncludingArchived(ctx, externalID)
 			if lookupErr == nil && fetched != nil {
 				remoteIssue = fetched
+				if remoteIssue.IsArchived() {
+					refuseArchivedPush(result, issue.ID, externalID, remoteIssue)
+					continue
+				}
 				// BatchPush receives pre-formatted descriptions from the sync
 				// engine (FormatDescription hook). Clear structured fields before
 				// comparison so PushFieldsEqual does not re-append them.
@@ -533,9 +540,14 @@ func (t *Tracker) BatchPush(ctx context.Context, issues []*types.Issue, forceIDs
 		// skip-check fetch failed. The fetched issue supplies both the UUID and
 		// the current remote state used by the stateId decision below.
 		if remoteIssue == nil {
-			if li, lookupErr := routeClient.FetchIssueByIdentifier(ctx, externalID); lookupErr == nil && li != nil {
+			if li, lookupErr := routeClient.FetchIssueByIdentifierIncludingArchived(ctx, externalID); lookupErr == nil && li != nil {
 				remoteIssue = li
 			}
+		}
+		// Force bypasses the content skip, never the archive refusal.
+		if remoteIssue.IsArchived() {
+			refuseArchivedPush(result, issue.ID, externalID, remoteIssue)
+			continue
 		}
 		issueUUID := externalID
 		var remoteState *State
@@ -572,7 +584,7 @@ func (t *Tracker) BatchPush(ctx context.Context, issues []*types.Issue, forceIDs
 
 		result.Updated = append(result.Updated, tracker.BatchPushItem{
 			LocalID:     issue.ID,
-			ExternalRef: updated.URL,
+			ExternalRef: canonicalLinearIssueRef(updated.URL),
 		})
 	}
 
@@ -598,12 +610,39 @@ func (t *Tracker) ExtractIdentifier(ref string) string {
 
 func (t *Tracker) BuildExternalRef(issue *tracker.TrackerIssue) string {
 	if issue.URL != "" {
-		if canonical, ok := CanonicalizeLinearExternalRef(issue.URL); ok {
-			return canonical
-		}
-		return issue.URL
+		return canonicalLinearIssueRef(issue.URL)
 	}
 	return fmt.Sprintf("https://linear.app/issue/%s", issue.Identifier)
+}
+
+// archivedIssueError is the per-issue refusal for a push that targets an
+// archived Linear issue.
+func archivedIssueError(externalID string, remote *Issue) error {
+	return fmt.Errorf("Linear issue %s is archived (archivedAt %s); refusing to update it", externalID, strings.TrimSpace(remote.ArchivedAt))
+}
+
+// refuseArchivedPush records a refused push to an archived Linear issue: no
+// mutation is sent, the bead is listed in Refused (counted as skipped by the
+// engine, and never treated as "remote matches"), and a per-issue warning
+// names it. It is a warning rather than an error because the link cannot heal
+// by retrying; an archived target needs a human decision (unarchive in Linear,
+// or relink/unlink the bead), and an unscoped push may see many such links.
+func refuseArchivedPush(result *tracker.BatchPushResult, localID, externalID string, remote *Issue) {
+	result.Refused = append(result.Refused, localID)
+	result.Warnings = append(result.Warnings, fmt.Sprintf("linear: bead %s: %v", localID, archivedIssueError(externalID, remote)))
+}
+
+// canonicalLinearIssueRef returns the one external_ref form bd stores for a
+// Linear issue URL: the workspace issue URL without the title slug
+// (https://linear.app/<workspace>/issue/TEAM-123). Linear returns the slug
+// form from mutations and the pull path already stored the slug-less form,
+// so writing mutation URLs verbatim made external_ref flip between the two
+// on every pull/push pair. Idempotent; non-Linear input is returned as-is.
+func canonicalLinearIssueRef(url string) string {
+	if canonical, ok := CanonicalizeLinearExternalRef(url); ok {
+		return canonical
+	}
+	return url
 }
 
 func skipOptionalPushStateMapping(status types.Status, err error, custom []types.CustomStatus) bool {
@@ -719,7 +758,9 @@ func (t *Tracker) clientForExternalID(ctx context.Context, externalID string) *C
 		if client == nil {
 			continue
 		}
-		li, err := client.FetchIssueByIdentifier(ctx, externalID)
+		// Include archived issues so an archived issue routes to its own
+		// team, where the push path can see it is archived and refuse.
+		li, err := client.FetchIssueByIdentifierIncludingArchived(ctx, externalID)
 		if err == nil && li != nil {
 			return client
 		}
