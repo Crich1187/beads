@@ -619,7 +619,7 @@ func PushFieldsEqual(local *types.Issue, remote *Issue, config *MappingConfig, l
 	if local.Title != remote.Title {
 		return false
 	}
-	if BuildLinearDescription(local) != remote.Description {
+	if !linearDescriptionsEqual(BuildLinearDescription(local), remote.Description) {
 		return false
 	}
 	if PriorityToLinear(local.Priority, config) != remote.Priority {
@@ -649,7 +649,7 @@ func PushFieldsEqualToBeads(local, remote *types.Issue) bool {
 	if local.Title != remote.Title {
 		return false
 	}
-	if BuildLinearDescription(local) != remote.Description {
+	if !linearDescriptionsEqual(BuildLinearDescription(local), remote.Description) {
 		return false
 	}
 	if local.Priority != remote.Priority {
