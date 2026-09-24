@@ -227,6 +227,14 @@ func buildJiraPushHooksForStore(ctx context.Context, st tracker.Store) *tracker.
 	}
 }
 
+// jiraStatusLastSync returns the last_sync `bd jira status` reports. The
+// sync engine records it in local_metadata; a config-only read (the old
+// behavior) always reported it empty. tracker.ReadLastSync falls back to
+// config for stores synced by older builds.
+func jiraStatusLastSync(ctx context.Context, trackerStore tracker.Store) string {
+	return tracker.ReadLastSync(ctx, trackerStore, "jira")
+}
+
 func runJiraStatus(cmd *cobra.Command, args []string) error {
 	evt := metrics.NewCommandEvent("jira-status")
 	defer func() {
@@ -243,7 +251,7 @@ func runJiraStatus(cmd *cobra.Command, args []string) error {
 	}
 
 	jiraURL, _ := trackerStore.GetConfig(ctx, "jira.url")
-	lastSync, _ := trackerStore.GetConfig(ctx, "jira.last_sync")
+	lastSync := jiraStatusLastSync(ctx, trackerStore)
 
 	pluralProjects, _ := trackerStore.GetConfig(ctx, "jira.projects")
 	singularProject, _ := trackerStore.GetConfig(ctx, "jira.project")

@@ -837,6 +837,75 @@ func buildLinearPushHooksForStore(ctx context.Context, st tracker.Store, lt *lin
 	}
 }
 
+// linearStatusInfo is what `bd linear status` reports, gathered from one
+// tracker store so the status contract can be tested without a CLI harness.
+type linearStatusInfo struct {
+	apiKey        string
+	hasOAuth      bool
+	teamIDs       []string
+	lastSync      string
+	configured    bool
+	allIssues     []*types.Issue
+	withLinearRef int
+	pendingPush   int
+}
+
+// collectLinearStatus gathers the status fields. last_sync is read with
+// tracker.ReadLastSync: the sync engine records it in local_metadata, so a
+// config-only read always reported it empty (acceptance run 1, finding F1).
+func collectLinearStatus(ctx context.Context, trackerStore tracker.Store) (*linearStatusInfo, error) {
+	apiKey, _ := getLinearConfigForStore(ctx, trackerStore, "linear.api_key")
+	oauthClientID, _ := getLinearConfigForStore(ctx, trackerStore, "linear.oauth_client_id")
+	oauthClientSecret, _ := getLinearConfigForStore(ctx, trackerStore, "linear.oauth_client_secret")
+	info := &linearStatusInfo{
+		apiKey:   apiKey,
+		hasOAuth: oauthClientID != "" && oauthClientSecret != "",
+		teamIDs:  getLinearTeamIDsForStore(ctx, trackerStore, nil),
+		lastSync: tracker.ReadLastSync(ctx, trackerStore, "linear"),
+	}
+	info.configured = (info.apiKey != "" || info.hasOAuth) && len(info.teamIDs) > 0
+
+	allIssues, err := trackerStore.SearchIssues(ctx, "", types.IssueFilter{})
+	if err != nil {
+		return nil, err
+	}
+	info.allIssues = allIssues
+	for _, issue := range allIssues {
+		if issue.ExternalRef != nil && linear.IsLinearExternalRef(*issue.ExternalRef) {
+			info.withLinearRef++
+		} else if issue.ExternalRef == nil {
+			info.pendingPush++
+		}
+	}
+	return info, nil
+}
+
+func (info *linearStatusInfo) jsonMap() map[string]interface{} {
+	hasAPIKey := info.apiKey != ""
+	teamID := ""
+	if len(info.teamIDs) > 0 {
+		teamID = info.teamIDs[0]
+	}
+	authMode := "none"
+	if info.hasOAuth {
+		authMode = "oauth"
+	} else if hasAPIKey {
+		authMode = "api_key"
+	}
+	return map[string]interface{}{
+		"configured":      info.configured,
+		"has_api_key":     hasAPIKey,
+		"has_oauth":       info.hasOAuth,
+		"auth_mode":       authMode,
+		"team_id":         teamID,
+		"team_ids":        info.teamIDs,
+		"last_sync":       info.lastSync,
+		"total_issues":    len(info.allIssues),
+		"with_linear_ref": info.withLinearRef,
+		"pending_push":    info.pendingPush,
+	}
+}
+
 func runLinearStatus(cmd *cobra.Command, args []string) error {
 	evt := metrics.NewCommandEvent("linear-status")
 	defer func() {
@@ -852,54 +921,21 @@ func runLinearStatus(cmd *cobra.Command, args []string) error {
 		return HandleErrorRespectJSON("%v", err)
 	}
 
-	apiKey, _ := getLinearConfigForStore(ctx, trackerStore, "linear.api_key")
-	oauthClientID, _ := getLinearConfigForStore(ctx, trackerStore, "linear.oauth_client_id")
-	oauthClientSecret, _ := getLinearConfigForStore(ctx, trackerStore, "linear.oauth_client_secret")
-	teamIDs := getLinearTeamIDsForStore(ctx, trackerStore, nil)
-	lastSync, _ := trackerStore.GetConfig(ctx, "linear.last_sync")
-
-	hasOAuth := oauthClientID != "" && oauthClientSecret != ""
-	configured := (apiKey != "" || hasOAuth) && len(teamIDs) > 0
-
-	allIssues, err := trackerStore.SearchIssues(ctx, "", types.IssueFilter{})
+	status, err := collectLinearStatus(ctx, trackerStore)
 	if err != nil {
 		return HandleErrorRespectJSON("%v", err)
 	}
-
-	withLinearRef := 0
-	pendingPush := 0
-	for _, issue := range allIssues {
-		if issue.ExternalRef != nil && linear.IsLinearExternalRef(*issue.ExternalRef) {
-			withLinearRef++
-		} else if issue.ExternalRef == nil {
-			pendingPush++
-		}
-	}
+	apiKey := status.apiKey
+	hasOAuth := status.hasOAuth
+	teamIDs := status.teamIDs
+	lastSync := status.lastSync
+	configured := status.configured
+	allIssues := status.allIssues
+	withLinearRef := status.withLinearRef
+	pendingPush := status.pendingPush
 
 	if jsonOutput {
-		hasAPIKey := apiKey != ""
-		teamID := ""
-		if len(teamIDs) > 0 {
-			teamID = teamIDs[0]
-		}
-		authMode := "none"
-		if hasOAuth {
-			authMode = "oauth"
-		} else if hasAPIKey {
-			authMode = "api_key"
-		}
-		return outputJSON(map[string]interface{}{
-			"configured":      configured,
-			"has_api_key":     hasAPIKey,
-			"has_oauth":       hasOAuth,
-			"auth_mode":       authMode,
-			"team_id":         teamID,
-			"team_ids":        teamIDs,
-			"last_sync":       lastSync,
-			"total_issues":    len(allIssues),
-			"with_linear_ref": withLinearRef,
-			"pending_push":    pendingPush,
-		})
+		return outputJSON(status.jsonMap())
 	}
 
 	fmt.Println("Linear Sync Status")
