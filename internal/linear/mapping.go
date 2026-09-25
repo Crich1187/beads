@@ -776,9 +776,23 @@ func IssueToBeads(li *Issue, config *MappingConfig) *IssueConversion {
 		}
 	}
 
-	// Copy labels (bidirectional sync preserves all labels)
+	// Copy labels (bidirectional sync preserves all labels) except the one
+	// type label bd manages: the push adds the label_type_map key for the
+	// bead's issue_type (ResolveLabelIDs) and the pull turns it back into
+	// issue_type above, so it is not a bead label. Importing it made every
+	// pulled bead gain "task" and fed it into the three-way label baseline
+	// as a Carl-side addition (acceptance run 2, finding N1).
+	// An issue whose only label is the type label has a known, empty label
+	// set ([]string{}); zero label nodes keep the previous nil.
 	if li.Labels != nil {
+		typeLabel := IssueTypeToLinearLabelLookupKey(issue.IssueType, config)
+		if len(li.Labels.Nodes) > 0 {
+			issue.Labels = []string{}
+		}
 		for _, label := range li.Labels.Nodes {
+			if typeLabel != "" && strings.EqualFold(strings.TrimSpace(label.Name), typeLabel) {
+				continue
+			}
 			issue.Labels = append(issue.Labels, label.Name)
 		}
 	}

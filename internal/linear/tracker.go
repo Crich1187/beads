@@ -182,6 +182,9 @@ func (t *Tracker) FetchIssue(ctx context.Context, identifier string) (*tracker.T
 }
 
 func (t *Tracker) CreateIssue(ctx context.Context, issue *types.Issue) (*tracker.TrackerIssue, error) {
+	if issue != nil && issue.ExternalRef != nil && refPointsAtLinear(*issue.ExternalRef) {
+		return nil, fmt.Errorf("bead %s is already linked to Linear (%s); refusing to create another Linear issue for it", issue.ID, strings.TrimSpace(*issue.ExternalRef))
+	}
 	client := t.primaryClient()
 	if client == nil {
 		return nil, fmt.Errorf("no Linear client available")
@@ -348,13 +351,63 @@ func (t *Tracker) BatchPush(ctx context.Context, issues []*types.Issue, forceIDs
 	for _, issue := range issues {
 		extRef := ""
 		if issue.ExternalRef != nil {
-			extRef = *issue.ExternalRef
+			extRef = strings.TrimSpace(*issue.ExternalRef)
 		}
-		if extRef == "" || !IsLinearExternalRef(extRef) {
+		switch {
+		case extRef == "":
 			toCreate = append(toCreate, issue)
-		} else {
+		case IsLinearExternalRef(extRef):
 			toUpdate = append(toUpdate, issue)
+		case refPointsAtLinear(extRef):
+			// Linked to Linear, but not by an issue link bd can resolve. A
+			// linked bead is never created again (see refPointsAtLinear).
+			result.Refused = append(result.Refused, issue.ID)
+			result.Warnings = append(result.Warnings, fmt.Sprintf("linear: bead %s: external_ref %q points at Linear but is not an issue link bd can resolve; refusing to create another Linear issue for it", issue.ID, extRef))
+		default:
+			// A ref into another tracker: created in Linear as before.
+			toCreate = append(toCreate, issue)
 		}
+	}
+
+	// Before creating, look each bead's idempotency marker up in Linear. A
+	// create whose outcome was unknown (timed out, never confirmed) can land
+	// in Linear after bd gave up on it, so creating again would duplicate it
+	// (acceptance run 2, finding N2). A bead whose marker is found is linked
+	// to that issue and updated through the update path below, never created
+	// and never counted as created. A failed lookup leaves the bead uncreated
+	// this run: without it bd cannot rule out a duplicate.
+	linkIDs := make(map[string]bool)
+	if len(toCreate) > 0 {
+		var remaining []*types.Issue
+		for _, issue := range toCreate {
+			marker := GenerateIdempotencyMarker(issue.ID, issue.CreatedBy, issue.CreatedAt.UnixNano())
+			existing, lookupErr := client.FindIssueByDescriptionContains(ctx, marker)
+			if lookupErr != nil {
+				result.Errors = append(result.Errors, tracker.BatchPushError{
+					LocalID: issue.ID,
+					Message: fmt.Sprintf("looking up its idempotency marker before create: %v; not created this run", lookupErr),
+				})
+				continue
+			}
+			if existing == nil {
+				remaining = append(remaining, issue)
+				continue
+			}
+			ref := canonicalLinearIssueRef(existing.URL)
+			if !IsLinearExternalRef(ref) {
+				result.Errors = append(result.Errors, tracker.BatchPushError{
+					LocalID: issue.ID,
+					Message: fmt.Sprintf("Linear issue %s carries its idempotency marker but has no usable URL (%q); not created this run", existing.Identifier, existing.URL),
+				})
+				continue
+			}
+			linked := *issue
+			linked.ExternalRef = &ref
+			linkIDs[issue.ID] = true
+			toUpdate = append(toUpdate, &linked)
+			result.Warnings = append(result.Warnings, fmt.Sprintf("linear: bead %s: Linear issue %s already carries its idempotency marker (an earlier create landed); linking the bead to it instead of creating another", issue.ID, existing.Identifier))
+		}
+		toCreate = remaining
 	}
 
 	// Batch create new issues.
@@ -468,9 +521,13 @@ func (t *Tracker) BatchPush(ctx context.Context, issues []*types.Issue, forceIDs
 			}
 			for title, localIssue := range titleToIssue {
 				if !matched[title] {
+					msg := fmt.Sprintf("not returned in batch create response (title: %q)", title)
+					if createErr != nil {
+						msg = fmt.Sprintf("create outcome unknown (title: %q): %v; no Linear issue carrying its idempotency marker was found, so the bead stays unlinked and the next push looks the marker up again before creating", title, createErr)
+					}
 					result.Errors = append(result.Errors, tracker.BatchPushError{
 						LocalID: localIssue.ID,
-						Message: fmt.Sprintf("not returned in batch create response (title: %q)", title),
+						Message: msg,
 					})
 				}
 			}
@@ -508,9 +565,11 @@ func (t *Tracker) BatchPush(ctx context.Context, issues []*types.Issue, forceIDs
 
 		// Skip issues that haven't changed since the last push, unless forced.
 		// This mirrors the ContentEqual / UpdatedAt skip logic in the single-issue
-		// push path (engine.go doPush) to avoid redundant API writes.
+		// push path (engine.go doPush) to avoid redundant API writes. A bead
+		// just linked by its marker is never skipped: the engine writes the
+		// new external_ref only for Created and Updated items.
 		var remoteIssue *Issue
-		if !forceIDs[issue.ID] {
+		if !forceIDs[issue.ID] && !linkIDs[issue.ID] {
 			fetched, lookupErr := routeClient.FetchIssueByIdentifierIncludingArchived(ctx, externalID)
 			if lookupErr == nil && fetched != nil {
 				remoteIssue = fetched
@@ -602,6 +661,19 @@ func (t *Tracker) MappingConfig() *MappingConfig {
 
 func (t *Tracker) IsExternalRef(ref string) bool {
 	return IsLinearExternalRef(ref)
+}
+
+// refPointsAtLinear reports whether an external_ref names something in Linear:
+// an issue URL, another linear.app URL, or a "linear:" reference. bd never
+// creates a Linear issue for a bead carrying such a ref. When the link cannot
+// be resolved or its issue cannot be fetched, that is a per-bead error or
+// refusal for the bead, never a reason to create a second issue.
+func refPointsAtLinear(ref string) bool {
+	r := strings.ToLower(strings.TrimSpace(ref))
+	if r == "" {
+		return false
+	}
+	return IsLinearExternalRef(ref) || strings.Contains(r, "linear.app/") || strings.HasPrefix(r, "linear:")
 }
 
 func (t *Tracker) ExtractIdentifier(ref string) string {

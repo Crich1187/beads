@@ -316,6 +316,9 @@ func TestBatchPush_BatchCreateMappingByTitle(t *testing.T) {
 			json.NewEncoder(w).Encode(teamStatesResp("team-1", "state-open", "Backlog", "backlog"))
 		case strings.Contains(req.Query, "TeamLabels"):
 			json.NewEncoder(w).Encode(teamLabelsEmptyResp("team-1"))
+		case strings.Contains(req.Query, "FindByDescription"):
+			// Pre-create idempotency-marker lookup: nothing exists yet.
+			json.NewEncoder(w).Encode(map[string]interface{}{"data": map[string]interface{}{"issues": map[string]interface{}{"nodes": []interface{}{}}}})
 		case strings.Contains(req.Query, "issueBatchCreate"):
 			// Return the two issues in REVERSE order to expose index-based mapping bugs.
 			json.NewEncoder(w).Encode(map[string]interface{}{
@@ -605,7 +608,8 @@ func TestBatchPush_DuplicateTitlesFallbackToSingleCreate(t *testing.T) {
 // mutation returns an ambiguous error, the system searches for idempotency markers
 // to find partially-created issues instead of blindly retrying the entire chunk.
 func TestBatchPush_AmbiguousBatchFailureSearchesMarkers(t *testing.T) {
-	var searchCount int
+	var searchCount, preCreateSearches int
+	createAttempted := false
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
@@ -619,6 +623,7 @@ func TestBatchPush_AmbiguousBatchFailureSearchesMarkers(t *testing.T) {
 		case strings.Contains(req.Query, "TeamLabels"):
 			json.NewEncoder(w).Encode(teamLabelsEmptyResp("team-1"))
 		case strings.Contains(req.Query, "issueBatchCreate"):
+			createAttempted = true
 			json.NewEncoder(w).Encode(map[string]interface{}{
 				"data": map[string]interface{}{
 					"issueBatchCreate": map[string]interface{}{
@@ -627,6 +632,10 @@ func TestBatchPush_AmbiguousBatchFailureSearchesMarkers(t *testing.T) {
 					},
 				},
 			})
+		case strings.Contains(req.Query, "FindByDescription") && !createAttempted:
+			// Pre-create marker lookup: neither issue exists yet.
+			preCreateSearches++
+			json.NewEncoder(w).Encode(map[string]interface{}{"data": map[string]interface{}{"issues": map[string]interface{}{"nodes": []interface{}{}}}})
 		case strings.Contains(req.Query, "FindByDescription"):
 			searchCount++
 			filter := req.Variables["filter"].(map[string]interface{})
@@ -699,6 +708,9 @@ func TestBatchPush_AmbiguousBatchFailureSearchesMarkers(t *testing.T) {
 
 	if searchCount != 2 {
 		t.Errorf("marker searches = %d, want 2 (one per issue in the failed batch)", searchCount)
+	}
+	if preCreateSearches != 2 {
+		t.Errorf("pre-create marker lookups = %d, want 2 (one per issue to create)", preCreateSearches)
 	}
 
 	// Issue A was found via marker search → should appear in Created.

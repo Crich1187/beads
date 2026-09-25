@@ -55,16 +55,22 @@ func (h *labelMergeHarness) beadLabels() []string {
 	return sortedLabels(h.store.issue(h.beadID).Labels)
 }
 
+// agentLabels sets the bead's labels. "task" is bd's own type label (the push
+// adds it from issue_type, the pull never imports it), so a bead never holds
+// it as a label.
 func (h *labelMergeHarness) agentLabels(labels ...string) {
+	labels = without(labels, "task")
 	h.store.localEdit(h.beadID, func(i *types.Issue) { i.Labels = labels }, false)
 }
 
+// wantBoth checks Linear holds want and the bead holds want minus the type
+// label "task", which lives in the bead's issue_type.
 func (h *labelMergeHarness) wantBoth(want ...string) {
 	h.t.Helper()
-	want = sortedLabels(want)
-	if got := h.beadLabels(); !reflect.DeepEqual(got, want) {
-		h.t.Fatalf("bead labels = %v, want %v", got, want)
+	if got, wantBead := h.beadLabels(), sortedLabels(without(want, "task")); !reflect.DeepEqual(got, wantBead) {
+		h.t.Fatalf("bead labels = %v, want %v", got, wantBead)
 	}
+	want = sortedLabels(want)
 	if got := h.fake.labelNames("TEST-17"); !reflect.DeepEqual(got, want) {
 		h.t.Fatalf("Linear labels = %v, want %v", got, want)
 	}
@@ -115,7 +121,7 @@ func TestLabelMerge_LocallyEditedIssueStillMergesLinearLabels(t *testing.T) {
 	h.cycle()
 
 	h.store.localEdit(h.beadID, func(i *types.Issue) {
-		i.Labels = with(t09Base, "stage:build")
+		i.Labels = without(with(t09Base, "stage:build"), "task")
 		i.Description = "agent notes"
 	}, true)
 	h.fake.setLabels("TEST-17", with(t09Base, "Governor")...)

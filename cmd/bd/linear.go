@@ -346,8 +346,7 @@ func runLinearSync(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	engine := tracker.NewEngine(lt, trackerStore, actor)
-	configureLinearEngine(engine)
+	engine := newLinearSyncEngine(lt, trackerStore, actor)
 	engine.OnMessage = func(msg string) { fmt.Println("  " + msg) }
 	engine.OnWarning = func(msg string) { fmt.Fprintf(os.Stderr, "Warning: %s\n", msg) }
 
@@ -429,17 +428,23 @@ func runLinearSync(cmd *cobra.Command, args []string) error {
 	// preview). We can't read opts.Push after engine.Sync because Sync
 	// receives opts by value.
 	effectivePush := push || (!push && !pull)
-	if effectivePush && result.Success && !syncIsScoped(&opts) {
-		reconcileLinearParentsForStore(ctx, trackerStore, lt, dryRun, jsonOutput, &result.Warnings)
-		if err := reconcileLinearRelationsForStore(ctx, trackerStore, lt, dryRun, jsonOutput, &result.Warnings); err != nil {
-			return HandleErrorRespectJSON("relation reconcile: %v", err)
+	passErr := finishLinearSyncLastSync(ctx, engine, result, dryRun, func() error {
+		if effectivePush && result.Success && !syncIsScoped(&opts) {
+			reconcileLinearParentsForStore(ctx, trackerStore, lt, dryRun, jsonOutput, &result.Warnings)
+			if err := reconcileLinearRelationsForStore(ctx, trackerStore, lt, dryRun, jsonOutput, &result.Warnings); err != nil {
+				return err
+			}
+			reconcileLinearMilestonesForStore(ctx, trackerStore, lt, &opts, dryRun, jsonOutput, &result.Warnings)
 		}
-		reconcileLinearMilestonesForStore(ctx, trackerStore, lt, &opts, dryRun, jsonOutput, &result.Warnings)
-	}
-	// Post-sync: pull new Linear comments into bead comments (read-only
-	// toward Linear). Pull direction only; skipped on scoped syncs.
-	if (pull || !push) && result.Success && !syncIsScoped(&opts) {
-		pullLinearCommentsForStore(ctx, trackerStore, store, lt, dryRun, jsonOutput, &result.Warnings)
+		// Post-sync: pull new Linear comments into bead comments (read-only
+		// toward Linear). Pull direction only; skipped on scoped syncs.
+		if (pull || !push) && result.Success && !syncIsScoped(&opts) {
+			pullLinearCommentsForStore(ctx, trackerStore, store, lt, dryRun, jsonOutput, &result.Warnings)
+		}
+		return nil
+	})
+	if passErr != nil {
+		return HandleErrorRespectJSON("relation reconcile: %v", passErr)
 	}
 
 	// Record successful pull timestamp
@@ -482,6 +487,38 @@ func runLinearSync(cmd *cobra.Command, args []string) error {
 		}
 	}
 	return nil
+}
+
+// newLinearSyncEngine builds the engine for `bd linear sync`. It defers
+// last_sync, so its caller must finish with finishLinearSyncLastSync.
+func newLinearSyncEngine(lt *linear.Tracker, st tracker.Store, actor string) *tracker.Engine {
+	engine := tracker.NewEngine(lt, st, actor)
+	configureLinearEngine(engine)
+	engine.DeferLastSync = true
+	return engine
+}
+
+// finishLinearSyncLastSync runs the post-sync passes, then records last_sync
+// (the engine was told to defer it). The parent, relation and milestone
+// passes write to Linear issues and to beads (the relation ledger in bead
+// metadata), and the comment pull writes bead comments. Recorded before them,
+// as engine.Sync used to, last_sync fell before those writes, so the next
+// pull re-fetched every issue a pass touched, the runner flagged each as
+// edited both locally and in Linear, and its labels were merged again
+// (acceptance run 2, finding N1). last_sync is recorded even when a pass
+// fails: the sync itself completed, and every write the passes made is
+// bd's own. Dry runs record nothing.
+func finishLinearSyncLastSync(ctx context.Context, engine *tracker.Engine, result *tracker.SyncResult, dryRun bool, passes func() error) error {
+	passErr := passes()
+	if !dryRun && result != nil {
+		lastSync, err := engine.RecordLastSync(ctx)
+		if err != nil {
+			result.Warnings = append(result.Warnings, fmt.Sprintf("Failed to update last_sync: %v", err))
+		} else {
+			result.LastSync = lastSync
+		}
+	}
+	return passErr
 }
 
 func linearPullDependencySources(includeRelations bool) []tracker.DependencySource {
