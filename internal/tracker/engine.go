@@ -130,6 +130,14 @@ type Engine struct {
 	// remote already matched, and policy refusals in Refused.
 	ThreeWayLabelMerge bool
 
+	// DeferLastSync leaves last_sync unrecorded at the end of Sync; the
+	// caller records it with RecordLastSync once its own post-sync passes
+	// (which also write to the tracker and the store) have finished. Without
+	// it those passes' writes land after last_sync and the next pull reads
+	// them as changes made in the tracker and locally (acceptance run 2,
+	// finding N1).
+	DeferLastSync bool
+
 	// stateCache holds the opaque value from PushHooks.BuildStateCache during a push.
 	// Tracker adapters access it via ResolveState().
 	stateCache interface{}
@@ -241,15 +249,11 @@ func (e *Engine) Sync(ctx context.Context, opts SyncOptions) (*SyncResult, error
 		attribute.Int("sync.errors", result.Stats.Errors),
 	)
 
-	// Update last_sync timestamp. Dolt DATETIME columns round sub-second
-	// values, so rows this sync just wrote can carry updated_at values up
-	// to half a second in the future of wall clock. Record last_sync at
-	// the next whole second so the engine's own writes are never misread
-	// as local edits by the next pull's conflict guard.
-	if !opts.DryRun {
-		lastSync := time.Now().UTC().Truncate(time.Second).Add(time.Second).Format(time.RFC3339Nano)
-		key := LastSyncKey(e.Tracker.ConfigPrefix())
-		if err := e.Store.SetLocalMetadata(ctx, key, lastSync); err != nil {
+	// Update last_sync timestamp, unless the caller records it after its
+	// own post-sync passes (DeferLastSync).
+	if !opts.DryRun && !e.DeferLastSync {
+		lastSync, err := e.RecordLastSync(ctx)
+		if err != nil {
 			e.warn("Failed to update last_sync: %v", err)
 		}
 		result.LastSync = lastSync
@@ -259,6 +263,20 @@ func (e *Engine) Sync(ctx context.Context, opts SyncOptions) (*SyncResult, error
 	// warnings join them rather than replacing them.
 	result.Warnings = append(result.Warnings, e.warnings...)
 	return result, nil
+}
+
+// RecordLastSync records last_sync as of now and returns it. Dolt DATETIME
+// columns round sub-second values, so rows this sync just wrote can carry
+// updated_at values up to half a second in the future of wall clock. Record
+// last_sync at the next whole second so the sync's own writes are never
+// misread as local edits by the next pull's conflict guard. Call it after
+// the sync's last write, tracker-side or local.
+func (e *Engine) RecordLastSync(ctx context.Context) (string, error) {
+	lastSync := time.Now().UTC().Truncate(time.Second).Add(time.Second).Format(time.RFC3339Nano)
+	if err := e.Store.SetLocalMetadata(ctx, LastSyncKey(e.Tracker.ConfigPrefix()), lastSync); err != nil {
+		return lastSync, err
+	}
+	return lastSync, nil
 }
 
 // DetectConflicts identifies issues that were modified both locally and externally

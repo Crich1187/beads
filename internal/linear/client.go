@@ -327,7 +327,23 @@ func parseRateLimitHeaders(h http.Header) RateLimitInfo {
 // remaining quota drops below the configured floor (linear.rate_limit_floor).
 // OAuth clients also invalidate and retry once on 401 responses.
 func (c *Client) Execute(ctx context.Context, req *GraphQLRequest) (json.RawMessage, error) {
-	data, statusCode, err := c.executeOnce(ctx, req)
+	return c.execute(ctx, req, true)
+}
+
+// executeAtMostOnce is Execute for mutations that create Linear issues. It
+// resends the request only when Linear answered that it did not process it
+// (429, or 401 under OAuth). A transport failure (client timeout, dropped
+// connection) or an unreadable response is returned to the caller instead of
+// resent: the request may already have reached Linear and may still complete
+// there, so a blind resend can create the issue twice (acceptance run 2,
+// finding N2: TEST-56 and TEST-57 for one bead). Callers resolve that
+// ambiguity with the idempotency marker, never by resending.
+func (c *Client) executeAtMostOnce(ctx context.Context, req *GraphQLRequest) (json.RawMessage, error) {
+	return c.execute(ctx, req, false)
+}
+
+func (c *Client) execute(ctx context.Context, req *GraphQLRequest, resendOnTransportError bool) (json.RawMessage, error) {
+	data, statusCode, err := c.executeOnce(ctx, req, resendOnTransportError)
 	if err == nil {
 		return data, nil
 	}
@@ -336,7 +352,7 @@ func (c *Client) Execute(ctx context.Context, req *GraphQLRequest) (json.RawMess
 	if statusCode == http.StatusUnauthorized && c.AuthMode == AuthModeOAuth {
 		debug.Logf("oauth: received 401, invalidating token and retrying")
 		c.TokenManager.Invalidate()
-		data, _, retryErr := c.executeOnce(ctx, req)
+		data, _, retryErr := c.executeOnce(ctx, req, resendOnTransportError)
 		if retryErr != nil {
 			return nil, retryErr
 		}
@@ -348,7 +364,9 @@ func (c *Client) Execute(ctx context.Context, req *GraphQLRequest) (json.RawMess
 
 // executeOnce performs the actual HTTP request loop with rate-limit retries.
 // Returns the response data, the last HTTP status code encountered, and any error.
-func (c *Client) executeOnce(ctx context.Context, req *GraphQLRequest) (json.RawMessage, int, error) {
+// With resendOnTransportError false, a transport or response-read failure
+// ends the loop at once (see executeAtMostOnce).
+func (c *Client) executeOnce(ctx context.Context, req *GraphQLRequest, resendOnTransportError bool) (json.RawMessage, int, error) {
 	body, err := json.Marshal(req)
 	if err != nil {
 		return nil, 0, fmt.Errorf("failed to marshal request: %w", err)
@@ -376,6 +394,9 @@ func (c *Client) executeOnce(ctx context.Context, req *GraphQLRequest) (json.Raw
 		resp, err := c.HTTPClient.Do(httpReq)
 		if err != nil {
 			lastErr = fmt.Errorf("request failed (attempt %d/%d): %w", attempt+1, MaxRetries+1, err)
+			if !resendOnTransportError {
+				return nil, lastStatus, fmt.Errorf("%w (not resent: the request may have reached Linear)", lastErr)
+			}
 			continue
 		}
 
@@ -383,6 +404,9 @@ func (c *Client) executeOnce(ctx context.Context, req *GraphQLRequest) (json.Raw
 		_ = resp.Body.Close() // Best effort: HTTP body close; connection may be reused regardless
 		if err != nil {
 			lastErr = fmt.Errorf("failed to read response (attempt %d/%d): %w", attempt+1, MaxRetries+1, err)
+			if !resendOnTransportError {
+				return nil, resp.StatusCode, fmt.Errorf("%w (not resent: the request may have reached Linear)", lastErr)
+			}
 			continue
 		}
 
@@ -845,7 +869,7 @@ func (c *Client) CreateIssue(ctx context.Context, title, description string, pri
 		Variables: map[string]interface{}{"input": c.buildIssueCreateInput(title, description, priority, stateID, labelIDs)},
 	}
 
-	data, err := c.Execute(ctx, req)
+	data, err := c.executeAtMostOnce(ctx, req)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create issue: %w", err)
 	}
@@ -1073,7 +1097,10 @@ func (c *Client) BatchCreateIssues(ctx context.Context, inputs []IssueCreateInpu
 			},
 		}
 
-		data, err := c.Execute(ctx, req)
+		// At most once: a timed-out batch create may still land in Linear,
+		// so it is never resent; recoverAfterAmbiguousBatch looks for the
+		// markers instead.
+		data, err := c.executeAtMostOnce(ctx, req)
 		if err != nil {
 			found, recoverErr := c.recoverAfterAmbiguousBatch(ctx, chunk)
 			if recoverErr != nil {

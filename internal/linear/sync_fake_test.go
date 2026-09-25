@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -32,6 +33,19 @@ type fakeLinear struct {
 	includeArchivedSeen int // IssueByIdentifier queries that passed includeArchived: true
 	archivedFieldSeen   int // IssueByIdentifier queries that selected archivedAt
 	server              *httptest.Server
+
+	// Create mutations (issueCreate / issueBatchCreate), counted as received.
+	// firstCreateDelay models Linear finishing the first create late: the
+	// handler waits before creating, so a client with a shorter timeout gives
+	// up on a request that still lands.
+	createRequests   atomic.Int32
+	firstCreateDelay time.Duration
+	createdTitles    []string // title of every issue a create made, in order
+
+	// honorSince applies an incremental fetch's updatedAt >= since filter.
+	// Off by default: tests that edit within the second after last_sync
+	// would otherwise not see their own edits.
+	honorSince bool
 }
 
 type fakeLinearIssue struct {
@@ -146,6 +160,10 @@ func (f *fakeLinear) serve(w http.ResponseWriter, r *http.Request) {
 		f.t.Errorf("fake linear: bad request body: %v", err)
 	}
 	w.Header().Set("Content-Type", "application/json")
+	isCreate := strings.Contains(req.Query, "issueCreate(") || strings.Contains(req.Query, "issueBatchCreate(")
+	if isCreate && f.createRequests.Add(1) == 1 && f.firstCreateDelay > 0 {
+		time.Sleep(f.firstCreateDelay) // outside f.mu: other requests proceed meanwhile
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	reply := func(data map[string]interface{}) {
@@ -185,11 +203,47 @@ func (f *fakeLinear) serve(w http.ResponseWriter, r *http.Request) {
 			nodes = append(nodes, f.nodeLocked(issue, true))
 		}
 		reply(map[string]interface{}{"issues": map[string]interface{}{"nodes": nodes}})
-	case strings.Contains(req.Query, "query Issues("):
-		// The default issues query hides archived issues.
+	case strings.Contains(req.Query, "issueBatchCreate("):
+		input, _ := req.Variables["input"].(map[string]interface{})
+		raw, _ := input["issues"].([]interface{})
+		nodes := []interface{}{}
+		for _, item := range raw {
+			in, _ := item.(map[string]interface{})
+			nodes = append(nodes, f.nodeLocked(f.createLocked(in), false))
+		}
+		reply(map[string]interface{}{"issueBatchCreate": map[string]interface{}{"success": true, "issues": nodes}})
+	case strings.Contains(req.Query, "issueCreate("):
+		input, _ := req.Variables["input"].(map[string]interface{})
+		reply(map[string]interface{}{"issueCreate": map[string]interface{}{"success": true, "issue": f.nodeLocked(f.createLocked(input), false)}})
+	case strings.Contains(req.Query, "FindByDescription"):
+		filter, _ := req.Variables["filter"].(map[string]interface{})
+		desc, _ := filter["description"].(map[string]interface{})
+		text, _ := desc["contains"].(string)
 		var ids []string
 		for id, issue := range f.issues {
-			if issue.archivedAt == "" {
+			if issue.archivedAt == "" && text != "" && strings.Contains(issue.description, text) {
+				ids = append(ids, id)
+			}
+		}
+		sort.Strings(ids)
+		nodes := []interface{}{}
+		if len(ids) > 0 {
+			nodes = append(nodes, f.nodeLocked(f.issues[ids[0]], false))
+		}
+		reply(map[string]interface{}{"issues": map[string]interface{}{"nodes": nodes}})
+	case strings.Contains(req.Query, "query Issues("):
+		// The default issues query hides archived issues. An incremental
+		// fetch (FetchIssuesSince) filters on updatedAt >= since when
+		// honorSince is set.
+		var since time.Time
+		if filter, ok := req.Variables["filter"].(map[string]interface{}); ok && f.honorSince {
+			if updated, ok := filter["updatedAt"].(map[string]interface{}); ok {
+				since, _ = time.Parse(time.RFC3339, fmt.Sprint(updated["gte"]))
+			}
+		}
+		var ids []string
+		for id, issue := range f.issues {
+			if issue.archivedAt == "" && !issue.updatedAt.Before(since) {
 				ids = append(ids, id)
 			}
 		}
@@ -234,6 +288,73 @@ func (f *fakeLinear) serve(w http.ResponseWriter, r *http.Request) {
 		f.t.Errorf("fake linear: unexpected query: %s", req.Query)
 		reply(map[string]interface{}{})
 	}
+}
+
+// createLocked makes a new issue from an IssueCreateInput, numbered after the
+// highest existing TEST-N.
+func (f *fakeLinear) createLocked(input map[string]interface{}) *fakeLinearIssue {
+	next := 1
+	for identifier := range f.issues {
+		var n int
+		if _, err := fmt.Sscanf(identifier, "TEST-%d", &n); err == nil && n >= next {
+			next = n + 1
+		}
+	}
+	identifier := fmt.Sprintf("TEST-%d", next)
+	issue := &fakeLinearIssue{id: "uuid-" + identifier, identifier: identifier, priority: 3, updatedAt: time.Now().UTC()}
+	issue.title, _ = input["title"].(string)
+	issue.description, _ = input["description"].(string)
+	switch ids := input["labelIds"].(type) {
+	case []interface{}:
+		for _, v := range ids {
+			issue.labelIDs = append(issue.labelIDs, fmt.Sprint(v))
+		}
+	case []string:
+		issue.labelIDs = append(issue.labelIDs, ids...)
+	}
+	f.issues[identifier] = issue
+	f.createdTitles = append(f.createdTitles, issue.title)
+	return issue
+}
+
+// issuesWithDescription returns the identifiers of issues whose description
+// contains text, sorted.
+func (f *fakeLinear) issuesWithDescription(text string) []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var ids []string
+	for id, issue := range f.issues {
+		if strings.Contains(issue.description, text) {
+			ids = append(ids, id)
+		}
+	}
+	sort.Strings(ids)
+	return ids
+}
+
+func (f *fakeLinear) issueIdentifiers() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var ids []string
+	for id := range f.issues {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	return ids
+}
+
+// touch is a write to a Linear issue that changes only updatedAt, like the
+// relation pass creating a relation on it.
+func (f *fakeLinear) touch(identifier string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.issues[identifier].updatedAt = time.Now().UTC()
+}
+
+func (f *fakeLinear) updatedAtOf(identifier string) time.Time {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.issues[identifier].updatedAt
 }
 
 func (f *fakeLinear) tracker() *Tracker {

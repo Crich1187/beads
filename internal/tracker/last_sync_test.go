@@ -103,3 +103,28 @@ func TestEnginePullUsesLegacyConfigLastSync(t *testing.T) {
 		t.Fatalf("pull incremental=%v since=%q, want incremental from the legacy config value", result.PullStats.Incremental, since)
 	}
 }
+
+// With DeferLastSync, Sync leaves last_sync to the caller, which records it
+// with RecordLastSync after its own post-sync passes (acceptance run 2,
+// finding N1). An early stamp would stand if the passes never finished.
+func TestEngineDeferLastSyncLeavesItToRecordLastSync(t *testing.T) {
+	ctx := context.Background()
+	st := newLastSyncTestStore()
+	st.localMetadata["linear.last_sync"] = "2026-09-24T16:25:48Z"
+	engine := NewEngine(newMockTracker("linear"), st, "sync")
+	engine.DeferLastSync = true
+	result, err := engine.Sync(ctx, SyncOptions{Pull: true})
+	if err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+	if result.LastSync != "" || ReadLastSync(ctx, st, "linear") != "2026-09-24T16:25:48Z" {
+		t.Fatalf("deferred Sync recorded last_sync (result %q, stored %q)", result.LastSync, ReadLastSync(ctx, st, "linear"))
+	}
+	recorded, err := engine.RecordLastSync(ctx)
+	if err != nil {
+		t.Fatalf("RecordLastSync: %v", err)
+	}
+	if got := ReadLastSync(ctx, st, "linear"); got == "" || got != recorded {
+		t.Fatalf("ReadLastSync = %q, want the recorded %q", got, recorded)
+	}
+}
